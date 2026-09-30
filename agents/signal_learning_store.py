@@ -70,7 +70,7 @@ def _timestamp(value=None) -> str:
 class SignalLearningStore:
     """Thread-safe ledger for non-executed GALA10 signal outcomes."""
 
-    VERSION = "3.3.7"
+    VERSION = "3.3.9"
 
     def __init__(
         self,
@@ -283,41 +283,136 @@ class SignalLearningStore:
                             state.update(row)
             except Exception:
                 by_id = {}
-        stats: Dict[str, dict] = {}
-        for row in by_id.values():
-            tk = str(row.get("ticker", "") or "").upper()
-            item = stats.setdefault(tk, {
+        def empty_stats(tk: str) -> dict:
+            return {
                 "ticker": tk, "learning_total": 0, "learning_open": 0,
                 "learning_resolved": 0, "learning_trainable": 0,
                 "learning_winners": 0, "learning_losers": 0,
                 "learning_ai_veto": 0, "learning_execution_missed": 0,
-            })
+                "learning_blocked": 0, "learning_missed": 0,
+                "learning_tp": 0, "learning_sl": 0,
+                "learning_ambiguous": 0, "learning_timeout": 0,
+                "learning_excluded": 0, "learning_avoided_losses": 0,
+                "learning_blocked_winners": 0, "learning_real": 0,
+                "learning_paper": 0, "learning_usefulness_pct": None,
+                "learning_last_update": "", "learning_last_resolution": "",
+            }
+
+        stats: Dict[str, dict] = {}
+        for row in by_id.values():
+            tk = str(row.get("ticker", "") or "").upper()
+            item = stats.setdefault(tk, empty_stats(tk))
             item["learning_total"] += 1
             event = str(row.get("event", "") or "").upper()
-            if event != "RESOLVED":
-                item["learning_open"] += 1
-            else:
-                item["learning_resolved"] += 1
-                if str(row.get("training_eligible", "")) == "1":
-                    item["learning_trainable"] += 1
-                    if str(row.get("ganadora", "")) == "1":
-                        item["learning_winners"] += 1
-                    elif str(row.get("ganadora", "")) == "0":
-                        item["learning_losers"] += 1
             src = str(row.get("source_kind", "") or "").upper()
-            if "VETO" in src or "MODEL" in src:
+            disposition = str(row.get("disposition", "") or "").upper()
+            resolution = str(row.get("resolution", "") or "").upper()
+            mode = str(row.get("execution_mode", "") or "").upper()
+            update_ts = str(row.get("resolved_utc", "") or row.get("timestamp", "") or "")
+            if update_ts and update_ts > str(item.get("learning_last_update", "") or ""):
+                item["learning_last_update"] = update_ts
+            if mode == "REAL":
+                item["learning_real"] += 1
+            elif mode == "PAPER":
+                item["learning_paper"] += 1
+            if disposition == "BLOCKED":
+                item["learning_blocked"] += 1
+            if disposition == "MISSED":
+                item["learning_missed"] += 1
+            is_veto = ("VETO" in src or "MODEL" in src)
+            if is_veto:
                 item["learning_ai_veto"] += 1
             if "EXECUTION" in src or "MISSED" in src:
                 item["learning_execution_missed"] += 1
+
+            if event != "RESOLVED":
+                item["learning_open"] += 1
+                continue
+
+            item["learning_resolved"] += 1
+            item["learning_last_resolution"] = max(
+                str(item.get("learning_last_resolution", "") or ""),
+                str(row.get("resolved_utc", "") or ""),
+            )
+            if resolution == "TP":
+                item["learning_tp"] += 1
+            elif resolution == "SL":
+                item["learning_sl"] += 1
+            elif resolution == "AMBIGUOUS_SAME_BAR":
+                item["learning_ambiguous"] += 1
+            elif resolution == "TIMEOUT":
+                item["learning_timeout"] += 1
+
+            eligible = str(row.get("training_eligible", "")) == "1"
+            if eligible:
+                item["learning_trainable"] += 1
+                if str(row.get("ganadora", "")) == "1":
+                    item["learning_winners"] += 1
+                    if is_veto:
+                        item["learning_blocked_winners"] += 1
+                elif str(row.get("ganadora", "")) == "0":
+                    item["learning_losers"] += 1
+                    if is_veto:
+                        item["learning_avoided_losses"] += 1
+            else:
+                item["learning_excluded"] += 1
+
+        for item in stats.values():
+            denom = int(item.get("learning_avoided_losses", 0) or 0) + int(item.get("learning_blocked_winners", 0) or 0)
+            item["learning_usefulness_pct"] = (
+                round(100.0 * float(item.get("learning_avoided_losses", 0) or 0) / denom, 1)
+                if denom else None
+            )
         if requested is not None:
             for tk in requested:
-                stats.setdefault(tk, {
-                    "ticker": tk, "learning_total": 0, "learning_open": 0,
-                    "learning_resolved": 0, "learning_trainable": 0,
-                    "learning_winners": 0, "learning_losers": 0,
-                    "learning_ai_veto": 0, "learning_execution_missed": 0,
-                })
+                stats.setdefault(tk, empty_stats(tk))
         return [stats[tk] for tk in sorted(stats)]
+
+    def recent_observations(self, ticker: Optional[str] = None, limit: int = 50) -> List[dict]:
+        """Return the latest state of recent learning observations for dashboard visibility.
+
+        This is read-only observability.  It intentionally omits the full feature
+        vector and exposes only signal/outcome fields that are safe and useful to
+        an operator.
+        """
+        wanted = str(ticker or "").strip().upper() or None
+        try:
+            limit = max(1, min(200, int(limit or 50)))
+        except (TypeError, ValueError):
+            limit = 50
+        by_id: Dict[str, dict] = {}
+        if self.path.exists():
+            try:
+                with self.path.open("r", newline="", encoding="utf-8-sig") as fh:
+                    for row in csv.DictReader(fh):
+                        tk = str(row.get("ticker", "") or "").upper()
+                        if wanted and tk != wanted:
+                            continue
+                        oid = str(row.get("observation_id", "") or "")
+                        if not oid:
+                            continue
+                        state = by_id.setdefault(oid, dict(row))
+                        if str(row.get("event", "") or "").upper() == "RESOLVED":
+                            state.update(row)
+            except Exception:
+                return []
+        fields = [
+            "observation_id", "signal_id", "timestamp", "resolved_utc",
+            "ticker", "execution_mode", "tipo", "source_kind", "disposition",
+            "reason", "ai_probability", "ai_threshold", "market_regime",
+            "market_regime_confidence", "market_regime_would_block",
+            "precio_entrada", "stop_loss", "take_profit", "bars_seen",
+            "resolution", "precio_salida", "r_multiple", "ganadora",
+            "training_eligible", "label_quality", "notes",
+        ]
+        rows = []
+        for row in by_id.values():
+            item = {key: row.get(key, "") for key in fields}
+            item["status"] = "RESOLVED" if str(row.get("event", "") or "").upper() == "RESOLVED" else "OBSERVING"
+            item["last_update"] = str(row.get("resolved_utc", "") or row.get("timestamp", "") or "")
+            rows.append(item)
+        rows.sort(key=lambda x: str(x.get("last_update", "") or ""), reverse=True)
+        return rows[:limit]
 
     def _append(self, row: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
