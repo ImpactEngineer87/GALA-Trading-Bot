@@ -41,6 +41,7 @@ def test_visibility_summary_distinguishes_avoided_loss_and_blocked_winner(tmp_pa
         _decision("loss"), execution_mode="REAL", source_kind="AI_VETO",
         disposition="BLOCKED", reason="AI_THRESHOLD", training_candidate=True,
     )
+    # SL means the veto avoided a losing trade.
     store.update_bar("META", high=101.0, low=97.5, close=98.0,
                      bar_timestamp="2026-09-29T14:01:00Z")
 
@@ -48,6 +49,7 @@ def test_visibility_summary_distinguishes_avoided_loss_and_blocked_winner(tmp_pa
         _decision("winner"), execution_mode="PAPER", source_kind="AI_VETO",
         disposition="BLOCKED", reason="AI_THRESHOLD", training_candidate=True,
     )
+    # TP means the veto incorrectly blocked a would-be winner.
     store.update_bar("META", high=104.5, low=99.0, close=104.0,
                      bar_timestamp="2026-09-29T14:02:00Z")
 
@@ -111,6 +113,7 @@ def test_recent_visibility_collapses_open_and_resolved_rows(tmp_path):
     assert rows[0]["status"] == "RESOLVED"
     assert rows[0]["resolution"] == "TP"
     assert rows[0]["training_eligible"] in (1, "1")
+    # Full feature vectors are intentionally not exposed by the visibility API.
     assert "atr_relativo" not in rows[0]
 
 
