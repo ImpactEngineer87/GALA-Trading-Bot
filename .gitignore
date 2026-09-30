@@ -1,0 +1,79 @@
+.env
+__pycache__/
+*.py[cod]
+*.log
+logs/
+engine/logs/
+ai_filter/logs/
+data/modelos/*.pkl
+data/modelos/*.tmp
+data/*.pkl
+data/*.tmp
+
+data/daily_kill_switch_state.json
+data/daily_kill_switch_state.json.tmp
+data/retraining_state.json
+data/retraining_state.json.tmp
+data/historial_senales.jsonl
+data/historial_velas.sqlite3
+data/historial_velas.sqlite3-shm
+data/historial_velas.sqlite3-wal
+data/modelos_shadow/*.pkl
+data/modelos_shadow/*.tmp
+data/modelos_shadow/*.meta.json
+data/agentes_feedback.csv
+data/shadow_decisions.csv
+data/reportes/
+data/reportes_shadow/
+# Local Python environment
+.venv/
+venv/
+# Test/cache files
+.pytest_cache/
+# Additional environment files
+!.env.example
+.env.*
+# Local backups
+
+# ==========================================
+# Local Python / cache
+# ==========================================
+.venv/
+venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# ==========================================
+# Local project backups
+# ==========================================
+backups/
+
+# ==========================================
+# Runtime / generated trading data
+# ==========================================
+data/historico/
+data/modelos_shadow/archive/
+
+data/*.csv
+data/*.jsonl
+data/*.sqlite3
+data/*.sqlite3-shm
+data/*.sqlite3-wal
+data/*.open.json
+
+data/execution_pending.json
+data/broker_reconciliation_state.json
+data/retraining_state*.json
+data/shadow_decisions*
+data/reportes/
+data/reportes_shadow/
+
+# Temporary files
+*.tmp
+config.yaml
+config.yaml
+config.yaml
+config.yaml
+*.before_retrain_fix
+*.before_*

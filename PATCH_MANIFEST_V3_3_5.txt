@@ -1,0 +1,12 @@
+VERSION
+api/hybrid_order_executor.py
+core/execution_v2.py
+engine/bot_engine.py
+dashboard/index.html
+tests/test_v3_3_2_kill_switch_recovery.py
+tests/test_v3_3_5_auto_exit_recovery.py
+CHANGELOG_V3_3_5.md
+UPGRADE_V3_3_4_TO_V3_3_5.md
+V3_3_5_VALIDATION.md
+docs/INCIDENT_2026_09_23_AUTO_EXIT.md
+PATCH_MANIFEST_V3_3_5.txt

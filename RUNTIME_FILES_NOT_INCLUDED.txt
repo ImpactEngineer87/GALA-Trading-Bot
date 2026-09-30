@@ -1,0 +1,4 @@
+GALA10 v3.3.8 clean source package intentionally excludes runtime secrets and state.
+Not included: .env, logs/, data/, OAuth tokens, account data, live order state.
+For an existing v3.3.7 installation, use the v3.3.7_to_v3.3.8 patch so your
+models, histories, configuration, and runtime data stay in place.

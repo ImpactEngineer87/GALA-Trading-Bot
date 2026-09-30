@@ -1,0 +1,39 @@
+# =============================================================
+# Dependencias del proyecto GALA6 Chocoletra Bot
+# Instalar con: pip install -r requirements.txt
+# =============================================================
+
+# Análisis de datos financieros
+pandas>=2.0.0
+numpy>=1.24.0
+# pandas-ta was removed because of Python version mismatch
+
+# Base de datos de zonas horarias IANA. CRÍTICO: el veto de horario (RTH) del
+# Agente 3, la ventana GSCO y la feature 'hora' del modelo dependen de resolver
+# "America/New_York". En Windows/entornos mínimos zoneinfo NO trae la base de
+# datos del sistema; sin tzdata, ZoneInfo falla y el código cae al reloj LOCAL
+# del servidor (hora de mercado equivocada). Se fija explícito para garantizar ET.
+tzdata>=2024.1
+
+# Configuración
+pyyaml>=6.0
+python-dotenv>=1.0.0
+flask>=3.0.0
+
+# API Charles Schwab (OAuth2 + REST + WebSocket)
+requests>=2.31.0
+websocket-client>=1.6.0
+authlib>=1.2.0
+
+# Machine Learning / IA (Fase 3)
+xgboost>=2.0.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# Visualización y backtesting
+matplotlib>=3.7.0
+
+# Utilidades
+schedule>=1.2.0             # Programación de tareas
+colorlog>=6.7.0             # Logs con colores en consola
+tabulate>=0.9.0             # Tablas en consola

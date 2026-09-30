@@ -1,0 +1,30 @@
+Files copied from v3.2.0 because they differ from v3.1.0:
+CHANGELOG_V3_1_1.md
+CHANGELOG_V3_2_0.md
+DEPLOY_V3_2_0.md
+LIVE_TRADING_SETUP.md
+REPORTAR_SHADOW.py
+RUNTIME_FILES_NOT_INCLUDED.txt
+V3_1_1_VALIDATION.md
+V3_2_0_VALIDATION.md
+VERSION
+agents/contracts.py
+agents/market_regime.py
+agents/orchestrator.py
+agents/retraining_lifecycle.py
+agents/shadow_store.py
+agents/training.py
+agents/veto_observation_store.py
+core/live_guard.py
+core/model_promotion.py
+dashboard/index.html
+docs/V3_2_AI_METRIC_AND_LIVE_RESILIENCE.md
+engine/bot_engine.py
+server.py
+tests/test_v3_0_0_guarded_model_promotion.py
+tests/test_v3_1_market_regime.py
+tests/test_v3_2_ai_consistency_resilience.py
+
+Generated for safe upgrade:
+MIGRATE_CONFIG_V3_2_0.py
+UPGRADE_V3_1_0_TO_V3_2_0.md
