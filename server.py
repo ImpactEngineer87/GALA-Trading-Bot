@@ -4338,7 +4338,7 @@ def ai_signal_learning_visibility():
             counterfactual_weight = 0.35
         return jsonify({
             "status": "ok",
-            "version": "3.3.9",
+            "version": "3.3.10",
             "ticker": wanted or None,
             "summary": totals,
             "tickers": rows,
