@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.8</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.9</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -782,10 +782,10 @@
         .exec-row-actions .btn{flex:1;justify-content:center;min-height:42px}.exec-mode-select,.exec-shares-input{width:100%;font-size:16px;min-height:44px}
       }
     </style>
-    <div class="card" id="tickerExecutionCard" data-editor-build="v3.3.8-ui1">
+    <div class="card" id="tickerExecutionCard" data-editor-build="v3.3.9-ui1">
       <div class="ticker-exec-head">
         <div>
-          <div class="exec-eyebrow">Control de ejecución · v3.3.8 · Editor 5</div>
+          <div class="exec-eyebrow">Control de ejecución · v3.3.9 · Editor 5</div>
           <h2 class="exec-heading">Tickers y tamaño de las órdenes</h2>
           <p class="exec-muted">Defina los límites de REAL y guarde la cantidad de cada ticker.</p>
         </div>
@@ -875,6 +875,31 @@
       .ai-delta.zero{color:var(--txt2)}
       .ai-accepted-score{display:inline-flex;align-items:center;gap:4px;color:var(--green);font-family:var(--mono);font-weight:800}
       .ai-accepted-score.missing{color:var(--txt3);font-weight:600}
+      .learning-kpis{display:grid;grid-template-columns:repeat(7,minmax(118px,1fr));gap:8px;margin:12px 0}
+      .learning-kpi{background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:10px 11px;min-width:0}
+      .learning-kpi .v{font-family:var(--mono);font-size:1.08rem;font-weight:800;color:var(--txt)}
+      .learning-kpi .l{margin-top:4px;font-size:.67rem;color:var(--txt3);line-height:1.25}
+      .learning-kpi.good .v{color:var(--green)}
+      .learning-kpi.warn .v{color:var(--orange)}
+      .learning-kpi.bad .v{color:var(--red)}
+      .learning-controls{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+      .learning-select{background:var(--bg3);border:1px solid var(--border);color:var(--txt);border-radius:8px;padding:7px 9px;font-size:.76rem}
+      .learning-detail-grid{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:12px}
+      .learning-table-wrap{overflow:auto;max-height:420px;border:1px solid var(--border);border-radius:10px}
+      .learning-table{width:100%;border-collapse:collapse;font-size:.72rem}
+      .learning-table th,.learning-table td{padding:7px 8px;border-bottom:1px solid var(--border);text-align:left;white-space:nowrap}
+      .learning-table th{position:sticky;top:0;background:var(--bg2);z-index:2;color:var(--txt3);font-weight:650}
+      .learning-table tr[data-ticker]{cursor:pointer}
+      .learning-table tr[data-ticker]:hover td{background:rgba(59,130,246,.06)}
+      .learning-outcome{display:inline-flex;padding:2px 7px;border-radius:999px;border:1px solid var(--border);font-size:.65rem;font-weight:750}
+      .learning-outcome.TP{color:var(--green);background:rgba(34,197,94,.10)}
+      .learning-outcome.SL{color:var(--red);background:rgba(239,68,68,.10)}
+      .learning-outcome.OBSERVING{color:var(--blue);background:rgba(59,130,246,.10)}
+      .learning-outcome.AMBIGUOUS_SAME_BAR,.learning-outcome.TIMEOUT{color:var(--orange);background:rgba(245,158,11,.10)}
+      .learning-eligible{color:var(--green);font-weight:750}
+      .learning-excluded{color:var(--txt3)}
+      @media(max-width:1100px){.learning-kpis{grid-template-columns:repeat(4,1fr)}.learning-detail-grid{grid-template-columns:1fr}}
+      @media(max-width:680px){.learning-kpis{grid-template-columns:repeat(2,1fr)}}
     </style>
     <div class="card" style="margin-bottom:16px">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px">
@@ -893,8 +918,56 @@
           <tbody id="aiLifecycleRows"><tr><td colspan="17">Cargando estado IA…</td></tr></tbody>
         </table>
       </div>
-      <div class="section-note" style="margin-top:8px"><strong>v3.3.8:</strong> x/50 sigue contando únicamente operaciones ejecutadas y cerradas con integridad válida. <strong>Aprendizaje señales</strong> muestra vetos/señales no ejecutadas cuyo resultado hipotético se sigue con velas confirmadas; solo TP/SL no ambiguos pueden complementar el bloque FIT con peso reducido. VALIDACIÓN y TEST continúan usando exclusivamente operaciones reales/PAPER ejecutadas válidas. <span style="color:var(--green)">BA aceptada SHADOW</span> sigue siendo la puntuación histórica del modelo instalado; un reentrenamiento posterior REJECTED no la reemplaza ni degrada el modelo aceptado.</div>
+      <div class="section-note" style="margin-top:8px"><strong>v3.3.9:</strong> x/50 sigue contando únicamente operaciones ejecutadas y cerradas con integridad válida. <strong>Aprendizaje señales</strong> muestra vetos/señales no ejecutadas cuyo resultado hipotético se sigue con velas confirmadas; solo TP/SL no ambiguos pueden complementar el bloque FIT con peso reducido. VALIDACIÓN y TEST continúan usando exclusivamente operaciones reales/PAPER ejecutadas válidas. <span style="color:var(--green)">BA aceptada SHADOW</span> sigue siendo la puntuación histórica del modelo instalado; un reentrenamiento posterior REJECTED no la reemplaza ni degrada el modelo aceptado.</div>
     </div>
+
+    <div class="card" id="signalLearningVisibilityCard" style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+        <div>
+          <div class="card-title" style="margin:0">🔎 Visibilidad · Aprendizaje de señales</div>
+          <div class="section-note">v3.3.9 muestra qué evidencia adicional está observando cada modelo. Esta vista es auditoría/visibilidad: no cambia señales, órdenes, x/50 ni las puertas de VALIDACIÓN/TEST.</div>
+        </div>
+        <div class="learning-controls">
+          <label class="section-note" for="signalLearningTicker">Ticker</label>
+          <select id="signalLearningTicker" class="learning-select" onchange="fetchSignalLearningVisibility()">
+            <option value="">Todos</option>
+          </select>
+          <button class="btn btn-ghost btn-sm" onclick="fetchSignalLearningVisibility(true)">↻ Actualizar</button>
+          <span class="pill paper" id="signalLearningStatus">Cargando…</span>
+        </div>
+      </div>
+      <div class="learning-kpis">
+        <div class="learning-kpi"><div class="v" id="slExecuted">0</div><div class="l">Ejecutadas válidas (histórico)</div></div>
+        <div class="learning-kpi"><div class="v" id="slVetoed">0</div><div class="l">Bloqueadas por IA/modelo</div></div>
+        <div class="learning-kpi"><div class="v" id="slMissed">0</div><div class="l">No ejecutadas / ejecución perdida</div></div>
+        <div class="learning-kpi warn"><div class="v" id="slOpen">0</div><div class="l">En observación</div></div>
+        <div class="learning-kpi good"><div class="v" id="slTrainable">0</div><div class="l">Aptas para FIT suplementario</div></div>
+        <div class="learning-kpi good"><div class="v" id="slAvoidedLosses">0</div><div class="l">Pérdidas evitadas por veto</div></div>
+        <div class="learning-kpi bad"><div class="v" id="slBlockedWinners">0</div><div class="l">Ganadoras bloqueadas por veto</div></div>
+      </div>
+      <div class="section-note" id="signalLearningRuleNote" style="margin-bottom:10px">Los resultados TP/SL de señales no ejecutadas tienen peso reducido y solo pueden complementar FIT; nunca cuentan para x/50 ni entran en VALIDACIÓN/TEST.</div>
+      <div class="learning-detail-grid">
+        <div>
+          <div class="section-note" style="margin:0 0 6px"><strong>Resumen por ticker</strong> · haz clic en una fila para filtrar el historial reciente.</div>
+          <div class="learning-table-wrap">
+            <table class="learning-table">
+              <thead><tr><th>Ticker</th><th>x/50</th><th>Ejecutadas</th><th>Vetadas IA</th><th>No ejecutadas</th><th>Observando</th><th>TP</th><th>SL</th><th>Evitó pérdida</th><th>Bloqueó ganadora</th><th>Aptas</th><th>Excluidas</th><th>Utilidad veto</th><th>Última actualización</th></tr></thead>
+              <tbody id="signalLearningTickerRows"><tr><td colspan="14">Cargando…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div>
+          <div class="section-note" style="margin:0 0 6px"><strong>Observaciones recientes</strong> · resultado hipotético seguido con velas confirmadas.</div>
+          <div class="learning-table-wrap">
+            <table class="learning-table">
+              <thead><tr><th>Hora</th><th>Ticker</th><th>Modo</th><th>Señal</th><th>Origen</th><th>Resultado</th><th>FIT</th><th>R</th><th>Razón</th></tr></thead>
+              <tbody id="signalLearningRecentRows"><tr><td colspan="9">Cargando…</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="card signal-chart-card" id="signalChartCard">
       <div class="signal-chart-head">
         <div>
@@ -1397,6 +1470,8 @@ const S = {
   tradeEvents: [],
   trades: [], // compatibility alias
   aiStatus: [],
+  signalLearning: {tickers:[], recent:[], summary:{}},
+  signalLearningTicker: '',
   tickerExecution: [],
   tickerExecutionMeta: {},
   execDrafts: {},
@@ -1541,6 +1616,7 @@ function afterLogin(){
   fetchStatus();
   fetchSignals();
   fetchAIStatus();
+  fetchSignalLearningVisibility();
   fetchTickerExecution();
   fetchTrades();
   fetchTickerPerformance();
@@ -3003,6 +3079,123 @@ async function fetchAIStatus(){
   } catch(e){}
 }
 
+function learningTs(v){
+  const raw=String(v||'');
+  if(!raw) return '—';
+  return raw.replace('T',' ').replace('Z','').slice(0,16);
+}
+function learningOutcome(row){
+  const resolution=String(row.resolution||'').toUpperCase();
+  if(String(row.status||'').toUpperCase()==='OBSERVING' || !resolution || resolution==='OPEN') return 'OBSERVING';
+  return resolution;
+}
+function learningSourceLabel(src){
+  const s=String(src||'').toUpperCase();
+  if(s.includes('VETO') || s.includes('MODEL')) return 'AI VETO';
+  if(s.includes('EXECUTION') || s.includes('MISSED')) return 'NO EJEC.';
+  if(s.includes('POLICY')) return 'POLICY';
+  return s || '—';
+}
+function selectSignalLearningTicker(ticker){
+  const select=el('signalLearningTicker');
+  if(select) select.value=ticker||'';
+  S.signalLearningTicker=ticker||'';
+  fetchSignalLearningVisibility();
+}
+async function fetchSignalLearningVisibility(showToast=false){
+  const select=el('signalLearningTicker');
+  const ticker=(select?.value || S.signalLearningTicker || '').trim().toUpperCase();
+  S.signalLearningTicker=ticker;
+  try{
+    const qs=new URLSearchParams({limit:'80'});
+    if(ticker) qs.set('ticker',ticker);
+    const r=await api('/api/ai/signal-learning?'+qs.toString());
+    const d=await r.json();
+    if(d.status!=='ok') throw new Error(d.message||'No disponible');
+    S.signalLearning=d;
+    const sum=d.summary||{};
+    const set=(id,val)=>{const n=el(id); if(n)n.textContent=String(val??0);};
+    set('slExecuted',sum.executed_valid||0);
+    set('slVetoed',sum.learning_ai_veto||0);
+    set('slMissed',sum.learning_execution_missed||0);
+    set('slOpen',sum.learning_open||0);
+    set('slTrainable',sum.learning_trainable||0);
+    set('slAvoidedLosses',sum.learning_avoided_losses||0);
+    set('slBlockedWinners',sum.learning_blocked_winners||0);
+    const status=el('signalLearningStatus');
+    if(status){
+      const usefulness=sum.learning_usefulness_pct;
+      status.textContent=`${sum.learning_resolved||0} resueltas${usefulness==null?'':` · veto útil ${Number(usefulness).toFixed(0)}%`}`;
+      status.className='pill '+((sum.learning_open||0)?'real':'paper');
+    }
+    const rules=d.rules||{};
+    const note=el('signalLearningRuleNote');
+    if(note){
+      const weight=Number(rules.counterfactual_fit_weight||0.35)*100;
+      note.textContent=`Regla de seguridad: señales suplementarias pesan ${weight.toFixed(0)}% en FIT; x/50 = solo cierres ejecutados válidos; VALIDACIÓN/TEST = solo datos ejecutados válidos.`;
+    }
+    const tickerOptions=(S.tickers||[]).map(x=>String(x).toUpperCase()).filter(Boolean).sort();
+    if(select){
+      const current=ticker;
+      const signature=tickerOptions.join('|');
+      if(select.dataset.signature!==signature){
+        select.innerHTML='<option value="">Todos</option>'+tickerOptions.map(t=>`<option value="${escHtml(t)}">${escHtml(t)}</option>`).join('');
+        select.dataset.signature=signature;
+      }
+      select.value=current;
+    }
+    const body=el('signalLearningTickerRows');
+    const rows=d.tickers||[];
+    if(body){
+      body.innerHTML=rows.map(row=>{
+        const usefulness=row.learning_usefulness_pct==null?'—':`${Number(row.learning_usefulness_pct).toFixed(0)}%`;
+        return `<tr data-ticker="${escHtml(row.ticker||'')}" onclick="selectSignalLearningTicker('${escHtml(row.ticker||'')}')">
+          <td class="notranslate"><strong>${escHtml(row.ticker||'—')}</strong></td>
+          <td>${Number(row.x50_progress||0)}/${Number(row.x50_target||50)}</td>
+          <td>${Number(row.executed_valid||0)}</td>
+          <td>${Number(row.learning_ai_veto||0)}</td>
+          <td>${Number(row.learning_execution_missed||0)}</td>
+          <td>${Number(row.learning_open||0)}</td>
+          <td style="color:var(--green)">${Number(row.learning_tp||0)}</td>
+          <td style="color:var(--red)">${Number(row.learning_sl||0)}</td>
+          <td style="color:var(--green);font-weight:700">${Number(row.learning_avoided_losses||0)}</td>
+          <td style="color:var(--red);font-weight:700">${Number(row.learning_blocked_winners||0)}</td>
+          <td>${Number(row.learning_trainable||0)}</td>
+          <td title="Ambiguas, timeout o no candidatas a entrenamiento">${Number(row.learning_excluded||0)}</td>
+          <td>${usefulness}</td>
+          <td>${escHtml(learningTs(row.learning_last_update))}</td>
+        </tr>`;
+      }).join('') || '<tr><td colspan="14">Todavía no hay observaciones suplementarias registradas.</td></tr>';
+    }
+    const recentBody=el('signalLearningRecentRows');
+    const recent=d.recent||[];
+    if(recentBody){
+      recentBody.innerHTML=recent.map(row=>{
+        const outcome=learningOutcome(row);
+        const eligible=String(row.training_eligible||'')==='1';
+        const rval=row.r_multiple==null||row.r_multiple===''?'—':Number(row.r_multiple).toFixed(2);
+        const prob=row.ai_probability==null||row.ai_probability===''?'':` · IA ${(Number(row.ai_probability)*100).toFixed(0)}%`;
+        const reason=String(row.reason||'—');
+        return `<tr>
+          <td title="${escHtml(row.last_update||'')}">${escHtml(learningTs(row.last_update))}</td>
+          <td class="notranslate"><strong>${escHtml(row.ticker||'—')}</strong></td>
+          <td>${escHtml(row.execution_mode||'—')}</td>
+          <td>${escHtml(row.tipo||'—')}${prob}</td>
+          <td>${escHtml(learningSourceLabel(row.source_kind))}</td>
+          <td><span class="learning-outcome ${escHtml(outcome)}">${escHtml(outcome)}</span></td>
+          <td class="${eligible?'learning-eligible':'learning-excluded'}">${eligible?'✓ Sí':'— No'}</td>
+          <td>${escHtml(rval)}</td>
+          <td title="${escHtml(reason)}" style="max-width:260px;overflow:hidden;text-overflow:ellipsis">${escHtml(reason)}</td>
+        </tr>`;
+      }).join('') || '<tr><td colspan="9">Sin observaciones recientes para este filtro.</td></tr>';
+    }
+    if(showToast) toast('ok','Aprendizaje actualizado',ticker?`Visibilidad actualizada para ${ticker}`:'Visibilidad actualizada');
+  }catch(e){
+    const status=el('signalLearningStatus'); if(status){status.textContent='No disponible';status.className='pill real';}
+    if(showToast) toast('err','Aprendizaje',String(e));
+  }
+}
+
 // ─────────────────────────────────────────────────────────
 // AI TRAINING
 // ─────────────────────────────────────────────────────────
@@ -3148,7 +3341,7 @@ async function showExecutionDiagnostics(){
     const d=await (await api('/api/execution-diagnostics')).json();
     if(d.status!=='ok') throw new Error(d.message || 'No hay datos');
     const sum=d.summary||{};
-    showV330Dialog(`<h2>Calidad de ejecución · v3.3.8</h2><p>${escHtml(d.scope)}</p>
+    showV330Dialog(`<h2>Calidad de ejecución · v3.3.9</h2><p>${escHtml(d.scope)}</p>
       <p>PnL de señales: ${metricV330(sum.strategy_pnl_usd,' USD')} · PnL real comparable: ${metricV330(sum.actual_pnl_matched_usd,' USD')} · Coste de ejecución medido: ${metricV330(sum.execution_loss_usd,' USD')} · Spread medio: ${metricV330(sum.average_spread,' USD')}</p>
       <p>${escHtml(d.attribution_note)}</p><table class="ai-life-table"><thead><tr><th>Ticker</th><th>Modo / etapa</th><th>Señal</th><th>Solicitado</th><th>Límite</th><th>Fill</th><th>Spread</th><th>Slippage USD</th><th>Motivo</th></tr></thead><tbody>${(d.orders||[]).slice(-50).reverse().map(o=>`<tr><td>${escHtml(o.ticker)}</td><td>${escHtml(o.mode)} / ${escHtml(o.role)}</td><td>${metricV330(o.signal_price)}</td><td>${metricV330(o.requested_price)}</td><td>${metricV330(o.limit_price)}</td><td>${metricV330(o.fill_price)}</td><td>${metricV330(o.spread)}</td><td>${metricV330(o.slippage_usd)}</td><td>${escHtml(o.exit_reason||'—')}</td></tr>`).join('')}</tbody></table>`);
   } catch(e){ toast('err','Ejecución',String(e)); }
@@ -3733,6 +3926,7 @@ window.addEventListener('orientationchange',scheduleSignalChartResize,{passive:t
 setInterval(fetchStatus,  4000);
 setInterval(fetchSignals, 5000);
 setInterval(fetchAIStatus, 10000);
+setInterval(fetchSignalLearningVisibility, 10000);
 setInterval(fetchTickerExecution, 7000);
 setInterval(fetchTrades,  6000);
 setInterval(fetchTickerPerformance, 8000);
