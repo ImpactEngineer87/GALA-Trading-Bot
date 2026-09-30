@@ -4261,7 +4261,7 @@ def _veto_summary_rows(tickers):
     return store.summary_by_ticker(tickers)
 
 
-def _learning_summary_rows(tickers):
+def _signal_learning_store():
     global _LEARNING_STATUS_STORE
     cfg = _read_config_runtime()
     learning_cfg = ((cfg.get("agents", {}) or {}).get("signal_learning", {}) or {})
@@ -4275,7 +4275,82 @@ def _learning_summary_rows(tickers):
                 max_bars=max(1, int(learning_cfg.get("max_bars", 120) or 120)),
             )
         store = _LEARNING_STATUS_STORE
-    return store.summary_by_ticker(tickers)
+    return store
+
+
+def _learning_summary_rows(tickers):
+    return _signal_learning_store().summary_by_ticker(tickers)
+
+
+@app.route('/api/ai/signal-learning')
+def ai_signal_learning_visibility():
+    """Read-only v3.3.9 visibility for the supplemental signal-learning layer."""
+    try:
+        tickers = list(BOT_STATE.get("tickers") or [])
+        wanted = str(request.args.get("ticker", "") or "").strip().upper()
+        if wanted and wanted not in tickers:
+            return jsonify({"status": "error", "message": "Ticker no configurado"}), 400
+        try:
+            limit = max(1, min(200, int(request.args.get("limit", 60) or 60)))
+        except (TypeError, ValueError):
+            limit = 60
+
+        store = _signal_learning_store()
+        summaries = store.summary_by_ticker(tickers)
+        trainer = _ai_trainer_for_status()
+        lifecycle = trainer.retraining_status(tickers)
+        lifecycle_by_ticker = {str(r.get("ticker", "") or "").upper(): r for r in lifecycle}
+        rows = []
+        for row in summaries:
+            ticker = str(row.get("ticker", "") or "").upper()
+            life = lifecycle_by_ticker.get(ticker, {})
+            item = dict(row)
+            item["executed_valid"] = int(life.get("eligible_observations", 0) or 0)
+            item["x50_progress"] = int(life.get("new_observations", 0) or 0)
+            item["x50_target"] = int(life.get("retrain_samples", 50) or 50)
+            rows.append(item)
+        if wanted:
+            rows = [r for r in rows if str(r.get("ticker", "") or "").upper() == wanted]
+
+        recent = store.recent_observations(wanted or None, limit=limit)
+        totals = {
+            "executed_valid": sum(int(r.get("executed_valid", 0) or 0) for r in rows),
+            "learning_total": sum(int(r.get("learning_total", 0) or 0) for r in rows),
+            "learning_open": sum(int(r.get("learning_open", 0) or 0) for r in rows),
+            "learning_resolved": sum(int(r.get("learning_resolved", 0) or 0) for r in rows),
+            "learning_trainable": sum(int(r.get("learning_trainable", 0) or 0) for r in rows),
+            "learning_ai_veto": sum(int(r.get("learning_ai_veto", 0) or 0) for r in rows),
+            "learning_execution_missed": sum(int(r.get("learning_execution_missed", 0) or 0) for r in rows),
+            "learning_avoided_losses": sum(int(r.get("learning_avoided_losses", 0) or 0) for r in rows),
+            "learning_blocked_winners": sum(int(r.get("learning_blocked_winners", 0) or 0) for r in rows),
+            "learning_excluded": sum(int(r.get("learning_excluded", 0) or 0) for r in rows),
+            "learning_ambiguous": sum(int(r.get("learning_ambiguous", 0) or 0) for r in rows),
+            "learning_timeout": sum(int(r.get("learning_timeout", 0) or 0) for r in rows),
+        }
+        useful_den = totals["learning_avoided_losses"] + totals["learning_blocked_winners"]
+        totals["learning_usefulness_pct"] = (
+            round(100.0 * totals["learning_avoided_losses"] / useful_den, 1) if useful_den else None
+        )
+        visibility_cfg = (((_read_config_runtime().get("agents", {}) or {}).get("signal_learning", {}) or {}))
+        try:
+            counterfactual_weight = float(visibility_cfg.get("counterfactual_weight", 0.35))
+        except (TypeError, ValueError):
+            counterfactual_weight = 0.35
+        return jsonify({
+            "status": "ok",
+            "version": "3.3.9",
+            "ticker": wanted or None,
+            "summary": totals,
+            "tickers": rows,
+            "recent": recent,
+            "rules": {
+                "counts_toward_x50": False,
+                "validation_test_actual_only": True,
+                "counterfactual_fit_weight": counterfactual_weight,
+            },
+        })
+    except Exception as exc:
+        return jsonify({"status": "error", "message": f"No se pudo leer aprendizaje de señales: {exc}"}), 500
 
 
 @app.route('/api/ai/status')
