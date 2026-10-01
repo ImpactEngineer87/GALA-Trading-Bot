@@ -11,8 +11,8 @@ def test_todos_option_clears_previous_ticker_filter():
     assert "select?.value || S.signalLearningTicker" not in html
 
 
-def test_v3310_version_is_visible():
+def test_current_version_keeps_todos_fix():
     html = Path("dashboard/index.html").read_text(encoding="utf-8")
     version = Path("VERSION").read_text(encoding="utf-8").strip()
-    assert version == "3.3.10"
-    assert "Trading Algorítmico v3.3.10" in html
+    assert version == "3.3.11"
+    assert "Trading Algorítmico v3.3.11" in html
