@@ -91,6 +91,8 @@ class SchwabClient:
         self._auth_warning_emitted = False
         self._oauth_transient_failure = False
         self._oauth_backoff_seconds = 30
+        self._oauth_edge_denial_count = 0
+        self._oauth_edge_circuit_until: Optional[datetime] = None
         # Todos los tokens aceptados por este cliente proceden del OAuth de usuario.
         # Arranca en False (fail-safe) hasta cargar o recibir uno.
         self.token_es_usuario = False
@@ -172,7 +174,7 @@ class SchwabClient:
         self.access_token  = access_token
         self.refresh_token = refresh_token
         self.token_expiry  = datetime.now() + timedelta(
-            seconds=max(30, int(expires_in) - 60)
+            seconds=max(30, int(expires_in) - 300)
         )
         self.token_es_usuario = True   # token de USUARIO → válido para trading
         self.reauthorization_required = False
@@ -181,6 +183,8 @@ class SchwabClient:
         self._auth_warning_emitted = False
         self._oauth_transient_failure = False
         self._oauth_backoff_seconds = 30
+        self._oauth_edge_denial_count = 0
+        self._oauth_edge_circuit_until = None
         self._paper = False
         self._session.headers.update({
             "Authorization": f"Bearer {self.access_token}",
@@ -224,6 +228,16 @@ class SchwabClient:
         """Devuelve True solo cuando existe un token OAuth utilizable."""
         with self._auth_lock:
             ahora = datetime.now()
+            if (
+                self._oauth_edge_circuit_until
+                and ahora < self._oauth_edge_circuit_until
+            ):
+                self._oauth_transient_failure = True
+                self.auth_error = (
+                    "Circuito Schwab/Akamai abierto por denegaciones 403 repetidas; "
+                    "cambie de red/IP pública o espere antes de reintentar."
+                )
+                return False
             if (
                 not forzar_refresh
                 and self.access_token
@@ -271,6 +285,8 @@ class SchwabClient:
             self._auth_retry_after = None
             self._oauth_transient_failure = False
             self._oauth_backoff_seconds = 30
+            self._oauth_edge_denial_count = 0
+            self._oauth_edge_circuit_until = None
             self._session.headers.update({
                 "Authorization": f"Bearer {self.access_token}",
                 "Accept": "application/json",
@@ -303,7 +319,7 @@ class SchwabClient:
                 self.refresh_token = d.get("refresh_token", self.refresh_token)
                 expires_in = int(d.get("expires_in", 1800))
                 self.token_expiry = datetime.now() + timedelta(
-                    seconds=max(30, expires_in - 60)
+                    seconds=max(30, expires_in - 300)
                 )
                 self._session.headers.update({
                     "Authorization": f"Bearer {self.access_token}",
@@ -316,6 +332,8 @@ class SchwabClient:
                 self._auth_warning_emitted = False
                 self._oauth_transient_failure = False
                 self._oauth_backoff_seconds = 30
+                self._oauth_edge_denial_count = 0
+                self._oauth_edge_circuit_until = None
 
                 env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
                 self._save_env_token(env_path)
@@ -325,13 +343,29 @@ class SchwabClient:
                 diag = exc.diagnostic or {}
                 oauth_error = str(diag.get("oauth_error") or "").lower()
                 if bool(diag.get("transient")):
-                    backoff = max(30, min(300, int(self._oauth_backoff_seconds or 30)))
-                    self._oauth_backoff_seconds = min(300, backoff * 2)
-                    self._marcar_degradado(
-                        "Schwab rechazó temporalmente el refresh en su capa de acceso; "
-                        f"reintento automático en {backoff}s.",
-                        cooldown_seconds=backoff,
-                    )
+                    if bool(diag.get("edge_access_denied")):
+                        self._oauth_edge_denial_count += 1
+                    else:
+                        self._oauth_edge_denial_count = 0
+                    if self._oauth_edge_denial_count >= 3:
+                        backoff = 900
+                        self._oauth_edge_circuit_until = (
+                            datetime.now() + timedelta(seconds=backoff)
+                        )
+                        self._marcar_degradado(
+                            "Schwab/Akamai devolvió Access Denied repetidamente. "
+                            "El circuito OAuth se pausa 15 min; si persiste, cambie "
+                            "la red/IP pública antes de generar un código OAuth nuevo.",
+                            cooldown_seconds=backoff,
+                        )
+                    else:
+                        backoff = max(30, min(300, int(self._oauth_backoff_seconds or 30)))
+                        self._oauth_backoff_seconds = min(300, backoff * 2)
+                        self._marcar_degradado(
+                            "Schwab rechazó temporalmente el refresh en su capa de acceso; "
+                            f"reintento automático en {backoff}s.",
+                            cooldown_seconds=backoff,
+                        )
                 elif oauth_error == "invalid_client":
                     self._marcar_reautorizacion(
                         "Schwab rechazó Client ID/Client Secret; complete OAuth con credenciales válidas.",
@@ -396,6 +430,15 @@ class SchwabClient:
             "expires_in_seconds": segundos,
             "reauthorization_required": bool(self.reauthorization_required),
             "degraded": bool(self._oauth_transient_failure),
+            "edge_denial_count": int(self._oauth_edge_denial_count or 0),
+            "edge_circuit_open": bool(
+                self._oauth_edge_circuit_until
+                and ahora < self._oauth_edge_circuit_until
+            ),
+            "edge_circuit_remaining_seconds": (
+                max(0, int((self._oauth_edge_circuit_until - ahora).total_seconds()))
+                if self._oauth_edge_circuit_until else 0
+            ),
             "retry_in_seconds": (
                 max(0, int((self._auth_retry_after - ahora).total_seconds()))
                 if self._auth_retry_after else 0
