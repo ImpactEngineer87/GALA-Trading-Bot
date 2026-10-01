@@ -59,6 +59,7 @@ from agents.signal_learning_store import SignalLearningStore
 from api.schwab_oauth import (
     DEFAULT_REDIRECT_URI as SCHWAB_REDIRECT_URI,
     OAUTH_ROTATION_LOCK,
+    OAUTH_USER_AGENT,
     SchwabOAuthFailure,
     build_safe_diagnostic,
     code_fingerprint,
@@ -126,6 +127,7 @@ BOT_STATE = {
     "schwab_edge_circuit_until_monotonic": 0.0,
     "schwab_edge_last_reference": "",
     "schwab_network_diagnostic": None,
+    "schwab_rejected_access_token": "",
     "account_number":       os.getenv("SCHWAB_ACCOUNT_NUMBER", ""),
 }
 
@@ -997,12 +999,13 @@ def _persist_schwab_credentials(access_token: str, refresh_token: str,
             expiry.isoformat(timespec="seconds") if expiry else ""
         ),
     }
+    # Publish under OAUTH_ROTATION_LOCK even if disk persistence fails.
+    os.environ.update(updates)
     env_d = read_env_dict()
     env_d.update(updates)
     write_env_dict(env_d)
     # load_dotenv() does not overwrite an already-running process. Keeping these
     # values aligned prevents a later engine start from reusing the old token.
-    os.environ.update(updates)
 
 
 _load_schwab_auth_from_env()
@@ -1126,17 +1129,59 @@ def _schwab_auth_snapshot() -> dict:
         ),
         "edge_last_reference": BOT_STATE.get("schwab_edge_last_reference") or "",
         "network_diagnostic": BOT_STATE.get("schwab_network_diagnostic"),
+        "request_origin": "bot_server",
+        "execution_host": socket.gethostname(),
+        "retry_after_seconds": _schwab_retry_remaining(),
     }
+
+
+def _schwab_retry_remaining() -> int:
+    until = max(
+        float(BOT_STATE.get("schwab_edge_circuit_until_monotonic") or 0.0),
+        float(BOT_STATE.get("schwab_refresh_retry_after_monotonic") or 0.0),
+    )
+    remaining = until - time.monotonic()
+    return max(0, int(remaining) + (1 if remaining > 0 else 0))
+
+
+def _adopt_schwab_process_tokens() -> bool:
+    """Adopt a rotation published by another component, never a rejected token.
+
+    Caller holds the server auth lock. Shared rotation lock also covers reading
+    the generation so access/refresh/expiry always describe the same exchange.
+    """
+    with OAUTH_ROTATION_LOCK:
+        access = get_env("SCHWAB_ACCESS_TOKEN").strip()
+        expiry = _parse_schwab_token_expiry(get_env("SCHWAB_TOKEN_EXPIRES_AT"))
+        if (not access or access == BOT_STATE.get("schwab_token")
+                or access == BOT_STATE.get("schwab_rejected_access_token")
+                or not expiry or datetime.now() >= expiry):
+            return False
+        BOT_STATE["schwab_token"] = access
+        BOT_STATE["schwab_refresh_token"] = get_env("SCHWAB_REFRESH_TOKEN").strip()
+        BOT_STATE["schwab_token_expiry"] = expiry
+        BOT_STATE["schwab_reauthorization_required"] = False
+        BOT_STATE["schwab_rejected_access_token"] = ""
+        BOT_STATE["schwab_oauth_diagnostic"] = None
+        _reset_schwab_edge_state()
+        # Token issuance alone does not prove a successful market/trader call.
+        _set_schwab_auth_state("unknown", "Token renovado; pendiente de verificación.",
+                              verified=False, cache_seconds=0)
+        return True
 
 
 def _current_schwab_access_token() -> str:
     """Return a token only while reauthorization has not been confirmed."""
     if BOT_STATE.get("schwab_reauthorization_required"):
         return ""
-    return BOT_STATE.get("schwab_token") or get_env("SCHWAB_ACCESS_TOKEN")
+    token = BOT_STATE.get("schwab_token") or get_env("SCHWAB_ACCESS_TOKEN")
+    return "" if token == BOT_STATE.get("schwab_rejected_access_token") else token
 
 
 def _mark_schwab_expired(message: str):
+    rejected = BOT_STATE.get("schwab_token") or get_env("SCHWAB_ACCESS_TOKEN")
+    if rejected:
+        BOT_STATE["schwab_rejected_access_token"] = rejected
     BOT_STATE["schwab_token"] = None
     BOT_STATE["schwab_token_expiry"] = None
     _set_schwab_auth_state(
@@ -1182,16 +1227,16 @@ def _record_schwab_edge_denial(diag: dict, *, authorization_code: bool = False) 
     if authorization_code:
         message = (
             "Schwab/Akamai bloqueó el intercambio OAuth desde esta ruta de red. "
-            "Cambie la red/IP pública y después genere un código OAuth NUEVO."
+            "Revise la salida de red del servidor del bot; después genere un código OAuth NUEVO."
         )
     elif count >= 3:
         message = (
             "Schwab/Akamai bloqueó repetidamente la ruta OAuth. Circuito pausado "
-            "15 minutos; cambie la red/IP pública si persiste."
+            "15 minutos; revise la salida de red del servidor del bot si persiste."
         )
     else:
         message = (
-            f"Schwab/Akamai bloqueó temporalmente la ruta OAuth; reintento en {backoff}s."
+            f"Schwab devolvió una denegación de acceso; próximo intento en {backoff}s."
         )
     _set_schwab_auth_state(
         "unavailable", message, verified=False, cache_seconds=backoff
@@ -1201,6 +1246,12 @@ def _record_schwab_edge_denial(diag: dict, *, authorization_code: bool = False) 
 
 def schwab_ensure_token():
     """Refresh five minutes early while preserving a still-valid access token."""
+    with _SCHWAB_AUTH_LOCK:
+        _adopt_schwab_process_tokens()
+        return _schwab_ensure_token_locked()
+
+
+def _schwab_ensure_token_locked():
     if BOT_STATE.get("schwab_reauthorization_required"):
         return False
     expiry = BOT_STATE.get("schwab_token_expiry")
@@ -1262,6 +1313,10 @@ def _sync_schwab_token_to_engine(access_token: str, refresh_token: str,
 def schwab_refresh(refresh_token: str) -> bool:
     """Serialize refresh-token rotation across dashboard and bot threads."""
     with _SCHWAB_AUTH_LOCK:
+        if _adopt_schwab_process_tokens():
+            return True
+        if _schwab_retry_remaining():
+            return False
         return _schwab_refresh_locked(refresh_token)
 
 
@@ -1282,26 +1337,27 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
                 timeout=15,
                 http_post=requests.post,
             )
-        new_access_token = d.get("access_token", "")
-        expires_in = int(d.get("expires_in", 1800))
-        BOT_STATE["schwab_token"] = new_access_token
-        BOT_STATE["schwab_refresh_token"] = d.get("refresh_token", refresh_token)
-        BOT_STATE["schwab_token_expiry"] = datetime.now() + timedelta(
-            seconds=max(30, expires_in)
-        )
-        BOT_STATE["schwab_oauth_diagnostic"] = None
-        _reset_schwab_edge_state()
-        try:
-            _persist_schwab_credentials(
-                BOT_STATE["schwab_token"],
-                BOT_STATE["schwab_refresh_token"],
-                BOT_STATE["schwab_token_expiry"],
+            new_access_token = d.get("access_token", "")
+            expires_in = int(d.get("expires_in", 1800))
+            BOT_STATE["schwab_token"] = new_access_token
+            BOT_STATE["schwab_refresh_token"] = d.get("refresh_token", refresh_token)
+            BOT_STATE["schwab_token_expiry"] = datetime.now() + timedelta(
+                seconds=max(30, expires_in)
             )
-        except OSError as exc:
-            _log(
-                "WARN",
-                f"[Schwab] Token renovado pero no persistido: {type(exc).__name__}",
-            )
+            BOT_STATE["schwab_oauth_diagnostic"] = None
+            BOT_STATE["schwab_rejected_access_token"] = ""
+            _reset_schwab_edge_state()
+            try:
+                _persist_schwab_credentials(
+                    BOT_STATE["schwab_token"],
+                    BOT_STATE["schwab_refresh_token"],
+                    BOT_STATE["schwab_token_expiry"],
+                )
+            except OSError as exc:
+                _log(
+                    "WARN",
+                    f"[Schwab] Token renovado pero no persistido: {type(exc).__name__}",
+                )
         _sync_schwab_token_to_engine(
             BOT_STATE["schwab_token"],
             BOT_STATE["schwab_refresh_token"],
@@ -1316,6 +1372,7 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
         return True
     except SchwabOAuthFailure as exc:
         diag = dict(exc.diagnostic or {})
+        diag.update(request_origin="bot_server", execution_host=socket.gethostname())
         BOT_STATE["schwab_oauth_diagnostic"] = diag
         oauth_error = str(diag.get("oauth_error") or "").lower()
         if oauth_error in {"invalid_grant", "invalid_token", "invalid_client"}:
@@ -1382,11 +1439,36 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
         return False
 
 def schwab_headers() -> dict:
-    schwab_ensure_token()
+    if not schwab_ensure_token():
+        return {}
     token = _current_schwab_access_token()
     if not token:
         return {}
     return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+
+def _record_schwab_api_forbidden(response):
+    diag = build_safe_diagnostic(
+        response, phase="api_verification", client_id=get_env("SCHWAB_CLIENT_ID"),
+        redirect_uri=SCHWAB_REDIRECT_URI,
+        secrets_to_redact=(get_env("SCHWAB_CLIENT_SECRET"),
+                           BOT_STATE.get("schwab_token"),
+                           BOT_STATE.get("schwab_refresh_token")),
+    )
+    diag.update(request_origin="bot_server", execution_host=socket.gethostname())
+    if diag.get("edge_access_denied"):
+        diag["recommended_action"] = "REVIEW_BOT_SERVER_NETWORK"
+        if diag.get("edge_reference"):
+            BOT_STATE["schwab_edge_last_reference"] = diag["edge_reference"]
+        message = ("Schwab denegó la verificación desde la capa de acceso. "
+                   "Revise la red del servidor del bot y el Reference ID; "
+                   "no se ha confirmado que OAuth haya vencido.")
+    else:
+        diag["recommended_action"] = "CHECK_API_PERMISSIONS"
+        message = ("Schwab devolvió 403 al verificar datos. Revise permisos de la "
+                   "app; este resultado no confirma que OAuth haya vencido.")
+    BOT_STATE["schwab_oauth_diagnostic"] = diag
+    _set_schwab_auth_state("unavailable", message, verified=False)
 
 
 def _verify_schwab_connection(*, force: bool = False) -> dict:
@@ -1404,9 +1486,10 @@ def _verify_schwab_connection(*, force: bool = False) -> dict:
         ):
             return _schwab_auth_snapshot()
 
-        access_token = BOT_STATE.get("schwab_token") or get_env(
-            "SCHWAB_ACCESS_TOKEN"
-        )
+        _adopt_schwab_process_tokens()
+        if BOT_STATE.get("schwab_reauthorization_required"):
+            return _schwab_auth_snapshot()
+        access_token = _current_schwab_access_token()
         refresh_token = BOT_STATE.get("schwab_refresh_token") or get_env(
             "SCHWAB_REFRESH_TOKEN"
         )
@@ -1439,7 +1522,11 @@ def _verify_schwab_connection(*, force: bool = False) -> dict:
 
         try:
             response = verify_request(access_token)
-            if response.status_code in {401, 403}:
+            if response.status_code == 403:
+                _record_schwab_api_forbidden(response)
+                return _schwab_auth_snapshot()
+            if response.status_code == 401:
+                BOT_STATE["schwab_rejected_access_token"] = access_token
                 if refresh_token and schwab_refresh(refresh_token):
                     access_token = BOT_STATE.get("schwab_token") or ""
                     response = verify_request(access_token)
@@ -1467,7 +1554,10 @@ def _verify_schwab_connection(*, force: bool = False) -> dict:
                     "Conexión Schwab verificada.",
                     verified=True,
                 )
-            elif response.status_code in {401, 403}:
+            elif response.status_code == 403:
+                _record_schwab_api_forbidden(response)
+            elif response.status_code == 401:
+                BOT_STATE["schwab_rejected_access_token"] = access_token
                 _mark_schwab_expired(
                     "Schwab rechazó la autorización después del intento de renovación. "
                     "Vuelva a autorizar OAuth desde el dashboard."
@@ -1502,11 +1592,14 @@ def schwab_get_candles(ticker: str, cantidad: int = 200):
             headers=hdrs, timeout=15
         )
         if r.status_code == 401:
+            BOT_STATE["schwab_rejected_access_token"] = hdrs.get(
+                "Authorization", ""
+            ).removeprefix("Bearer ")
             refresh = BOT_STATE.get("schwab_refresh_token") or get_env(
                 "SCHWAB_REFRESH_TOKEN"
             )
-            if refresh:
-                schwab_refresh(refresh)
+            if not refresh or not schwab_refresh(refresh):
+                return _synthetic_candles(ticker, cantidad)
             hdrs = schwab_headers()
             if not hdrs:
                 return _synthetic_candles(ticker, cantidad)
@@ -2065,7 +2158,7 @@ def _probe_schwab_route(
             params=params,
             data=data,
             headers={
-                "User-Agent": "GALA10-Chocoletra/3.3.12",
+                "User-Agent": OAUTH_USER_AGENT,
                 "Accept": "*/*",
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Cache-Control": "no-cache",
@@ -2079,8 +2172,20 @@ def _probe_schwab_route(
             client_id=get_env("SCHWAB_CLIENT_ID"),
             redirect_uri=SCHWAB_REDIRECT_URI,
         )
+        payload = None
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            pass
+        oauth_response = bool(
+            int(response.status_code) in {400, 401}
+            and isinstance(payload, dict) and payload.get("error")
+        )
         return {
-            "ok": not bool(diag.get("edge_access_denied")),
+            "ok": bool(200 <= response.status_code < 500
+                       and response.status_code != 429
+                       and not diag.get("edge_access_denied")),
+            "oauth_response": oauth_response,
             "http_status": int(response.status_code or 0),
             "content_type": str(response.headers.get("Content-Type") or "")[:120],
             "edge_access_denied": bool(diag.get("edge_access_denied")),
@@ -2090,6 +2195,7 @@ def _probe_schwab_route(
     except requests.RequestException as exc:
         return {
             "ok": False,
+            "oauth_response": False,
             "http_status": 0,
             "network_error": type(exc).__name__,
             "edge_access_denied": False,
@@ -2125,9 +2231,9 @@ def schwab_network_diagnostics():
             "state": "network-diagnostic",
         },
     )
-    # Send an intentionally invalid, non-sensitive POST. Reaching OAuth should
-    # produce a normal JSON/auth error. An HTML Akamai Access Denied proves the
-    # request was blocked before Schwab evaluated credentials or token data.
+    # Invalid non-sensitive POST: a structured OAuth error shows that this
+    # probe reached OAuth. It does not validate the real app credentials or
+    # guarantee that a subsequent authenticated POST will be accepted.
     token_endpoint = _probe_schwab_route(
         SCHWAB_TOKEN_URL,
         method="POST",
@@ -2154,37 +2260,56 @@ def schwab_network_diagnostics():
         for row in edge_rows
         if row.get("edge_reference")
     ))
-    if dns_error or not addresses:
-        conclusion = "DNS_OR_NETWORK_FAILURE"
-        recommendation = (
-            "La máquina no resolvió correctamente api.schwabapi.com. "
-            "Revise DNS/Internet antes de OAuth."
-        )
-    elif edge_rows:
+    if edge_rows:
         conclusion = "EDGE_ROUTE_BLOCKED"
         recommendation = (
-            "La ruta/IP pública de esta máquina está siendo bloqueada por "
-            "Schwab/Akamai. Repetir OAuth desde la misma red probablemente fallará. "
-            "Cambie de red/IP pública (por ejemplo hotspot), ejecute este diagnóstico "
-            "otra vez y solo después genere un código OAuth nuevo. Si persiste, "
-            "contacte Schwab Trader API con el Reference ID."
+            "La capa de acceso de Schwab denegó una petición desde el servidor "
+            "del bot. La regla exacta no está identificada. Revise con su proveedor "
+            "la salida de red, proxy y DNS del VPS; contacte soporte Schwab Trader "
+            "API con hora UTC y Reference ID. Cambiar el Wi-Fi/hotspot del laptop "
+            "no cambia la ruta del VPS. Espere la pausa antes de una autorización nueva."
+        )
+    elif any(row.get("network_error") for row in probes.values()):
+        conclusion = "NETWORK_PROBE_FAILED"
+        recommendation = (
+            "Uno o más endpoints no respondieron por red/TLS desde el servidor "
+            "del bot. Revise Internet, proxy, certificados y DNS del VPS antes de OAuth."
+        )
+    elif dns_error or not addresses:
+        conclusion = "DNS_OR_NETWORK_FAILURE"
+        recommendation = (
+            "El servidor del bot no resolvió api.schwabapi.com. Revise DNS/Internet "
+            "del VPS. Este diagnóstico no valida credenciales."
+        )
+    elif token_endpoint.get("oauth_response") and all(row.get("ok") for row in probes.values()):
+        conclusion = "OAUTH_ENDPOINT_REACHABLE"
+        recommendation = (
+            "La prueba sin credenciales recibió un error OAuth estructurado desde "
+            "el servidor del bot. No valida Client ID/Secret ni garantiza que se "
+            "acepte un intercambio autenticado. Después de la pausa, abra una "
+            "autorización nueva y pruebe una vez; conserve el Reference ID si falla."
         )
     else:
-        conclusion = "ROUTE_REACHABLE"
+        conclusion = "ROUTE_INCONCLUSIVE"
         recommendation = (
-            "No se detectó un bloqueo HTML de Schwab/Akamai en este momento. "
-            "Genere un código OAuth nuevo e intente conectarlo una sola vez."
+            "Las respuestas no permiten confirmar acceso OAuth desde el servidor "
+            "del bot. Revise los estados HTTP; una redirección, HTML, 429 o 5xx no "
+            "confirma que se acepten credenciales. No repita códigos antiguos."
         )
 
     result = {
         "status": "ok",
-        "version": "3.3.12",
+        "version": "3.3.13",
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "host": host,
+        "execution_host": socket.gethostname(),
+        "request_origin": "bot_server",
+        "oauth_credentials_verified": False,
         "dns_addresses": addresses,
         "dns_error": dns_error or None,
         "conclusion": conclusion,
-        "same_network_retry_recommended": conclusion == "ROUTE_REACHABLE",
+        "same_network_retry_recommended": conclusion == "OAUTH_ENDPOINT_REACHABLE",
+        "retry_after_seconds": _schwab_retry_remaining(),
         "references": references,
         "recommendation": recommendation,
         "probes": probes,
@@ -2244,52 +2369,71 @@ def schwab_connect():
         }), 400
 
     fingerprint = code_fingerprint(auth_code)
-    if fingerprint and fingerprint == BOT_STATE.get("schwab_oauth_last_code_fingerprint"):
-        return jsonify({
-            "status": "error",
-            "message": "Este código OAuth ya fue utilizado. Abra Schwab OAuth y copie una URL nueva.",
-            "diagnostic": {
-                "phase": "authorization_code_exchange",
-                "oauth_error": "authorization_code_reused",
-                "recommended_action": "NEW_AUTHORIZATION_CODE",
-                "client_id_tail": cid[-4:],
-                "redirect_uri": SCHWAB_REDIRECT_URI,
-            },
-        }), 400
-
     with _SCHWAB_AUTH_LOCK:
-        try:
-            d = exchange_authorization_code(
-                cid,
-                csec,
-                auth_code,
-                redirect_uri=SCHWAB_REDIRECT_URI,
-                timeout=15,
-                http_post=requests.post,
-            )
-            BOT_STATE["schwab_token"] = d.get("access_token", "")
-            BOT_STATE["schwab_refresh_token"] = d.get("refresh_token", "")
-            expires_in = int(d.get("expires_in", 1800))
-            BOT_STATE["schwab_token_expiry"] = datetime.now() + timedelta(
-                seconds=max(30, expires_in)
-            )
-            BOT_STATE["schwab_reauthorization_required"] = False
-            BOT_STATE["schwab_oauth_diagnostic"] = None
-            BOT_STATE["schwab_oauth_last_code_fingerprint"] = fingerprint
-            _reset_schwab_edge_state()
-            session.pop("schwab_oauth_state", None)
-            session.pop("schwab_oauth_state_created_at", None)
-            _set_schwab_auth_state(
-                "connected",
-                "Autorización Schwab completada correctamente.",
-                verified=True,
-            )
+        retry_seconds = _schwab_retry_remaining()
+        if retry_seconds:
+            diag = dict(BOT_STATE.get("schwab_oauth_diagnostic") or {})
+            diag.update(phase="authorization_code_exchange",
+                        recommended_action="WAIT_FOR_RETRY_WINDOW",
+                        retry_after_seconds=retry_seconds,
+                        request_origin="bot_server", execution_host=socket.gethostname())
+            return jsonify({"status": "error", "message":
+                            f"OAuth en pausa en el servidor del bot; espere {retry_seconds}s y genere una URL nueva.",
+                            "diagnostic": diag, "retry_after_seconds": retry_seconds}), 503
+        if fingerprint and fingerprint == BOT_STATE.get("schwab_oauth_last_code_fingerprint"):
+            return jsonify({
+                "status": "error",
+                "message": "Este código OAuth ya fue utilizado. Abra Schwab OAuth y copie una URL nueva.",
+                "diagnostic": {
+                    "phase": "authorization_code_exchange",
+                    "oauth_error": "authorization_code_reused",
+                    "recommended_action": "NEW_AUTHORIZATION_CODE",
+                    "client_id_tail": cid[-4:],
+                    "redirect_uri": SCHWAB_REDIRECT_URI,
+                },
+            }), 400
 
-            _persist_schwab_credentials(
-                BOT_STATE["schwab_token"],
-                BOT_STATE["schwab_refresh_token"],
-                BOT_STATE["schwab_token_expiry"],
-            )
+        # Codes are single-use; after any attempted POST use a fresh code,
+        # including uncertain network failures where consumption is unknown.
+        BOT_STATE["schwab_oauth_last_code_fingerprint"] = fingerprint
+        try:
+            with OAUTH_ROTATION_LOCK:
+                d = exchange_authorization_code(
+                    cid,
+                    csec,
+                    auth_code,
+                    redirect_uri=SCHWAB_REDIRECT_URI,
+                    timeout=15,
+                    http_post=requests.post,
+                )
+                BOT_STATE["schwab_token"] = d.get("access_token", "")
+                BOT_STATE["schwab_refresh_token"] = d.get("refresh_token", "")
+                expires_in = int(d.get("expires_in", 1800))
+                BOT_STATE["schwab_token_expiry"] = datetime.now() + timedelta(
+                    seconds=max(30, expires_in)
+                )
+                BOT_STATE["schwab_reauthorization_required"] = False
+                BOT_STATE["schwab_rejected_access_token"] = ""
+                BOT_STATE["schwab_oauth_diagnostic"] = None
+                BOT_STATE["schwab_oauth_last_code_fingerprint"] = fingerprint
+                _reset_schwab_edge_state()
+                session.pop("schwab_oauth_state", None)
+                session.pop("schwab_oauth_state_created_at", None)
+                _set_schwab_auth_state(
+                    "connected",
+                    "Autorización Schwab completada correctamente.",
+                    verified=True,
+                )
+
+                try:
+                    _persist_schwab_credentials(
+                        BOT_STATE["schwab_token"],
+                        BOT_STATE["schwab_refresh_token"],
+                        BOT_STATE["schwab_token_expiry"],
+                    )
+                except OSError as exc:
+                    _log("WARN", "[Schwab] OAuth aceptado pero no persistido: "
+                         + type(exc).__name__)
             _sync_schwab_token_to_engine(
                 BOT_STATE["schwab_token"],
                 BOT_STATE["schwab_refresh_token"],
@@ -2325,21 +2469,22 @@ def schwab_connect():
             })
         except SchwabOAuthFailure as exc:
             diag = dict(exc.diagnostic or {})
+            diag.update(request_origin="bot_server", execution_host=socket.gethostname())
             BOT_STATE["schwab_oauth_diagnostic"] = diag
             oauth_error = str(diag.get("oauth_error") or "").lower()
             edge_block = bool(diag.get("edge_access_denied"))
             if edge_block:
-                # The request was rejected before OAuth evaluated the code.
-                # Preserve any still-valid existing token/app authorization and
-                # tell the operator to change the network path before creating
-                # another short-lived authorization code.
+                # Preserve existing authorization. An edge denial does not
+                # prove invalid credentials or that a code can safely be reused.
                 BOT_STATE["schwab_reauthorization_required"] = False
                 _record_schwab_edge_denial(diag, authorization_code=True)
                 message = (
-                    "Schwab/Akamai está bloqueando esta ruta de red. "
-                    "No cambie nuevamente Client ID/Secret. Cambie la red/IP pública "
-                    "(por ejemplo hotspot), luego abra OAuth y genere una URL NUEVA."
+                    "Schwab devolvió Access Denied desde el servidor del bot. "
+                    "Revise la salida de red del VPS y el Reference ID con soporte. "
+                    "Cambiar la red del laptop no cambia esta petición. "
+                    "Espere la pausa y después genere una URL OAuth NUEVA."
                 )
+                diag["retry_after_seconds"] = _schwab_retry_remaining()
                 status_code = 503
             elif oauth_error == "invalid_client":
                 BOT_STATE["schwab_reauthorization_required"] = True

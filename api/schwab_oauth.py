@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Shared Schwab OAuth helpers.
 
-v3.3.12 goals:
+v3.3.13 goals:
 - one process-wide lock for authorization-code / refresh token exchanges
 - safe diagnostics that never expose client secrets, auth codes, access tokens,
   or refresh tokens
@@ -16,6 +16,7 @@ import json
 import re
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
@@ -24,7 +25,7 @@ from requests.auth import HTTPBasicAuth
 
 TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token"
 DEFAULT_REDIRECT_URI = "https://127.0.0.1"
-OAUTH_USER_AGENT = "GALA10-Chocoletra/3.3.12"
+OAUTH_USER_AGENT = "GALA10-Chocoletra/3.3.13"
 OAUTH_FORM_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded",
     "User-Agent": OAUTH_USER_AGENT,
@@ -117,7 +118,7 @@ def _response_payload(response) -> Dict[str, Any]:
 
 
 def _clean_text(value: Any, secrets_to_redact) -> str:
-    text = str(value or "").strip()
+    text = html.unescape(str(value or "")).strip()
     if not text:
         return ""
     for secret in secrets_to_redact:
@@ -145,10 +146,12 @@ def build_safe_diagnostic(
         secrets_to_redact,
     )
     status = int(getattr(response, "status_code", 0) or 0)
-    desc_lower = description.lower()
-    # Schwab/Akamai occasionally returns an HTML Access Denied page instead of
-    # an OAuth JSON body.  That is an edge/network denial, not proof that the
-    # client credentials or refresh grant are invalid.
+    # Inspect a bounded body separately from the shorter UI description so a
+    # reference near the end of an HTML error page is still available.
+    raw_body = html.unescape(str(getattr(response, "text", "") or "")[:8192])
+    desc_lower = (description + " " + raw_body).lower()
+    # An HTML denial is not evidence that the OAuth grant has expired. The
+    # specific upstream rule (IP, rate, headers, etc.) is not exposed here.
     edge_access_denied = bool(
         status == 403
         and not oauth_error
@@ -160,7 +163,7 @@ def build_safe_diagnostic(
         )
     )
 
-    decoded_description = html.unescape(description or "")
+    decoded_description = raw_body or description
     edge_reference = ""
     edge_url = ""
     if edge_access_denied:
@@ -169,19 +172,20 @@ def build_safe_diagnostic(
             decoded_description,
         )
         if ref_match:
-            edge_reference = ref_match.group(1)[:160]
+            edge_reference = _clean_text(ref_match.group(1)[:160], secrets_to_redact)
         url_match = re.search(
             r"https?://errors\.edgesuite\.net/[^\s<>'\"]+",
             decoded_description,
         )
         if url_match:
-            edge_url = url_match.group(0)[:300]
+            edge_url = _clean_text(url_match.group(0)[:300], secrets_to_redact)
         # The HTML body itself adds noise and can mislead operators into
         # changing valid credentials. Preserve only an actionable description.
         description = (
-            "Schwab/Akamai bloqueó esta ruta de red antes de que OAuth "
-            "respondiera. Cambiar/recrear Client ID o Secret no resuelve este "
-            "tipo de 403 mientras se use la misma ruta/IP pública."
+            "Schwab devolvió una denegación HTML de su capa de acceso. "
+            "No confirma credenciales incorrectas ni que el bloqueo sea temporal. "
+            "Revise la salida de red del equipo que ejecuta el bot y facilite "
+            "el Reference ID a soporte Schwab si persiste."
         )
         action = (
             "CHANGE_NETWORK_THEN_NEW_CODE"
@@ -230,7 +234,7 @@ def build_safe_diagnostic(
 
 
 def _raise_for_oauth_failure(response, *, phase: str, client_id: str, redirect_uri: str, secrets_to_redact=()):
-    if getattr(response, "ok", False):
+    if 200 <= int(getattr(response, "status_code", 0) or 0) < 300:
         return
     diag = build_safe_diagnostic(
         response,
@@ -246,6 +250,38 @@ def _raise_for_oauth_failure(response, *, phase: str, client_id: str, redirect_u
     else:
         message = f"Schwab rechazó OAuth (HTTP {status})."
     raise SchwabOAuthFailure(message, diag)
+
+
+def _validated_token_payload(response, *, phase: str, client_id: str,
+                             redirect_uri: str) -> Dict[str, Any]:
+    """Validate the whole generation before callers publish any token field."""
+    try:
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("not an object")
+        access = payload.get("access_token")
+        if not isinstance(access, str) or not access.strip():
+            raise ValueError("missing access token")
+        if "refresh_token" in payload and (
+            not isinstance(payload["refresh_token"], str) or not payload["refresh_token"].strip()
+        ):
+            raise ValueError("invalid refresh token")
+        expires_in = int(payload.get("expires_in", 1800))
+        if expires_in <= 0:
+            raise ValueError("invalid expiry")
+        datetime.now() + timedelta(seconds=expires_in)
+    except (TypeError, ValueError, OverflowError):
+        raise SchwabOAuthFailure(
+            "Schwab devolvió una respuesta de tokens inválida; no se reemplazaron los tokens guardados.",
+            {"phase": phase, "http_status": int(getattr(response, "status_code", 0) or 0),
+             "oauth_error": "invalid_token_response", "description": None,
+             "recommended_action": "REVIEW_OAUTH_RESPONSE", "transient": True,
+             "client_id_tail": client_id_tail(client_id), "redirect_uri": redirect_uri,
+             "request_id": None},
+        ) from None
+    result = dict(payload)
+    result["expires_in"] = expires_in
+    return result
 
 
 def exchange_authorization_code(
@@ -277,6 +313,7 @@ def exchange_authorization_code(
                 "redirect_uri": redirect_uri,
             },
             timeout=timeout,
+            allow_redirects=False,
         )
         _raise_for_oauth_failure(
             response,
@@ -285,22 +322,8 @@ def exchange_authorization_code(
             redirect_uri=redirect_uri,
             secrets_to_redact=(secret, auth_code),
         )
-        payload = response.json()
-        if not isinstance(payload, dict) or not payload.get("access_token"):
-            raise SchwabOAuthFailure(
-                "Schwab respondió sin access_token.",
-                {
-                    "phase": "authorization_code_exchange",
-                    "http_status": int(getattr(response, "status_code", 0) or 0),
-                    "oauth_error": "missing_access_token",
-                    "description": None,
-                    "recommended_action": "REVIEW_OAUTH_RESPONSE",
-                    "client_id_tail": client_id_tail(cid),
-                    "redirect_uri": redirect_uri,
-                    "request_id": None,
-                },
-            )
-        return payload
+        return _validated_token_payload(response, phase="authorization_code_exchange",
+                                        client_id=cid, redirect_uri=redirect_uri)
 
 
 def refresh_oauth_token(
@@ -326,6 +349,7 @@ def refresh_oauth_token(
             headers=dict(OAUTH_FORM_HEADERS),
             data={"grant_type": "refresh_token", "refresh_token": refresh},
             timeout=timeout,
+            allow_redirects=False,
         )
         _raise_for_oauth_failure(
             response,
@@ -334,19 +358,5 @@ def refresh_oauth_token(
             redirect_uri=redirect_uri,
             secrets_to_redact=(secret, refresh),
         )
-        payload = response.json()
-        if not isinstance(payload, dict) or not payload.get("access_token"):
-            raise SchwabOAuthFailure(
-                "Schwab respondió al refresh sin access_token.",
-                {
-                    "phase": "refresh_token_exchange",
-                    "http_status": int(getattr(response, "status_code", 0) or 0),
-                    "oauth_error": "missing_access_token",
-                    "description": None,
-                    "recommended_action": "REVIEW_OAUTH_RESPONSE",
-                    "client_id_tail": client_id_tail(cid),
-                    "redirect_uri": redirect_uri,
-                    "request_id": None,
-                },
-            )
-        return payload
+        return _validated_token_payload(response, phase="refresh_token_exchange",
+                                        client_id=cid, redirect_uri=redirect_uri)

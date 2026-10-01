@@ -121,11 +121,11 @@ def test_signal_learning_visibility_api_and_dashboard_source():
     server_text = Path("server.py").read_text(encoding="utf-8")
     html = Path("dashboard/index.html").read_text(encoding="utf-8")
     assert "@app.route('/api/ai/signal-learning')" in server_text
-    assert '"version": "3.3.12"' in server_text
+    assert '"version": "3.3.13"' in server_text
     assert 'learning_avoided_losses' in server_text
     assert 'learning_blocked_winners' in server_text
     assert "Visibilidad · Aprendizaje de señales" in html
     assert "/api/ai/signal-learning" in html
     assert "Pérdidas evitadas por veto" in html
     assert "Ganadoras bloqueadas por veto" in html
-    assert "Trading Algorítmico v3.3.12" in html
+    assert "Trading Algorítmico v3.3.13" in html

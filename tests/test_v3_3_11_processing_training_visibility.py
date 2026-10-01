@@ -36,7 +36,7 @@ def test_html_access_denied_is_classified_as_transient_edge_failure():
     assert diag["oauth_error"] is None
     assert diag["edge_access_denied"] is True
     assert diag["transient"] is True
-    assert diag["recommended_action"] == "RETRY_EDGE_ACCESS"
+    assert diag["recommended_action"] == "EDGE_CIRCUIT_BREAKER"
 
 
 def test_client_transient_refresh_failure_does_not_force_reauthorization():
@@ -81,7 +81,7 @@ def test_processing_and_retraining_visibility_sources_exist():
     assert "def _set_ticker_processing(" in engine
     assert "def ticker_processing_snapshot(" in engine
     assert "@app.route('/api/ticker-processing')" in server
-    assert '"version": "3.3.12"' in server
+    assert '"version": "3.3.13"' in server
     assert "Estado de procesamiento por ticker" in dashboard
     assert "fetchTickerProcessing" in dashboard
     assert "last_supplemental_fit_samples" in lifecycle
@@ -89,6 +89,6 @@ def test_processing_and_retraining_visibility_sources_exist():
 
 
 def test_current_version_is_3311():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "3.3.12"
+    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "3.3.13"
     html = (ROOT / "dashboard" / "index.html").read_text(encoding="utf-8")
-    assert "Trading Algorítmico v3.3.12" in html
+    assert "Trading Algorítmico v3.3.13" in html

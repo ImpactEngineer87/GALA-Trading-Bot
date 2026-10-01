@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import types
 import unittest
 from datetime import datetime, timedelta
@@ -22,19 +23,11 @@ def response(status_code, payload=None):
 class SchwabAuthVerificationTests(unittest.TestCase):
     def setUp(self):
         self.saved = {
-            key: server.BOT_STATE.get(key)
-            for key in (
-                "schwab_token",
-                "schwab_token_expiry",
-                "schwab_refresh_token",
-                "schwab_auth_state",
-                "schwab_auth_message",
-                "schwab_auth_verified",
-                "schwab_auth_verified_at",
-                "schwab_auth_next_check_monotonic",
-                "schwab_reauthorization_required",
-            )
+            key: value for key, value in server.BOT_STATE.items()
+            if key.startswith("schwab_")
         }
+        for key in list(self.saved):
+            server.BOT_STATE.pop(key)
         server.BOT_STATE.update({
             "schwab_token": "expired-access",
             "schwab_token_expiry": None,
@@ -45,23 +38,43 @@ class SchwabAuthVerificationTests(unittest.TestCase):
             "schwab_auth_verified_at": None,
             "schwab_auth_next_check_monotonic": 0.0,
             "schwab_reauthorization_required": False,
+            "schwab_rejected_access_token": "",
+            "schwab_refresh_retry_after_monotonic": 0.0,
+            "schwab_refresh_backoff_seconds": 30,
+            "schwab_edge_denial_count": 0,
+            "schwab_edge_circuit_until_monotonic": 0.0,
+            "schwab_oauth_diagnostic": None,
         })
-        self.saved_env = {
-            key: os.environ.get(key)
-            for key in (
-                "SCHWAB_ACCESS_TOKEN",
-                "SCHWAB_REFRESH_TOKEN",
-                "SCHWAB_TOKEN_EXPIRES_AT",
-            )
-        }
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        env_path = Path(self.temp.name) / "regression.env"
+        env_path.write_text("# isolated auth-notification tests\n", encoding="utf-8")
+        patchers = [
+            patch.object(server, "ENV_PATH", str(env_path)),
+            patch.object(server, "_ENGINE", None),
+            patch.object(server, "_log", Mock()),
+            patch.dict(os.environ, {
+                "SCHWAB_ACCESS_TOKEN": "expired-access",
+                "SCHWAB_REFRESH_TOKEN": "saved-refresh",
+                "SCHWAB_TOKEN_EXPIRES_AT": "",
+                "SCHWAB_CLIENT_ID": "client-id",
+                "SCHWAB_CLIENT_SECRET": "client-secret",
+            }),
+        ]
+        for method in ("get", "post", "request"):
+            patchers.append(patch.object(
+                server.requests, method,
+                Mock(side_effect=AssertionError(f"unexpected HTTP {method}")),
+            ))
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
+        for key in list(server.BOT_STATE):
+            if key.startswith("schwab_"):
+                server.BOT_STATE.pop(key)
         server.BOT_STATE.update(self.saved)
-        for key, value in self.saved_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
     @staticmethod
     def env_value(key, default=""):
