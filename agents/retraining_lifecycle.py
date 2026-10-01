@@ -268,6 +268,12 @@ class RetrainingLifecycle:
                     metrics.get("muestras_validation", 0) or 0
                 )
                 record["last_fit_samples"] = int(metrics.get("muestras_fit", 0) or 0)
+                record["last_supplemental_fit_samples"] = int(
+                    metrics.get("muestras_fit_suplementarias", 0) or 0
+                )
+                record["last_signal_learning_weight"] = (
+                    float(metrics.get("signal_learning_weight", 0.0) or 0.0)
+                )
                 record["last_shadow_candidate_accepted"] = (
                     bool(metrics.get("shadow_candidate_accepted"))
                     if "shadow_candidate_accepted" in metrics else None
@@ -483,6 +489,8 @@ class RetrainingLifecycle:
                 "last_test_samples": 0,
                 "last_validation_samples": 0,
                 "last_fit_samples": 0,
+                "last_supplemental_fit_samples": 0,
+                "last_signal_learning_weight": 0.0,
                 "last_shadow_candidate_accepted": None,
                 "last_production_gate_passed": None,
                 "last_production_gate_reasons": [],
@@ -543,6 +551,8 @@ class RetrainingLifecycle:
             record.setdefault("last_test_samples", 0)
             record.setdefault("last_validation_samples", 0)
             record.setdefault("last_fit_samples", 0)
+            record.setdefault("last_supplemental_fit_samples", 0)
+            record.setdefault("last_signal_learning_weight", 0.0)
             record.setdefault("last_shadow_candidate_accepted", None)
             record.setdefault("last_production_gate_passed", None)
             record.setdefault("last_production_gate_reasons", [])
