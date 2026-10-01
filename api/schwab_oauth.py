@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Shared Schwab OAuth helpers.
 
-v3.3.13 goals:
+Shared OAuth goals:
 - one process-wide lock for authorization-code / refresh token exchanges
 - safe diagnostics that never expose client secrets, auth codes, access tokens,
   or refresh tokens
@@ -22,10 +22,12 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 from requests.auth import HTTPBasicAuth
+from api.schwab_transport import schwab_request, schwab_request_pause
 
 TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token"
 DEFAULT_REDIRECT_URI = "https://127.0.0.1"
 OAUTH_USER_AGENT = "GALA10-Chocoletra/3.3.13"
+# Keep the request identity stable across retries and subsequent upgrades.
 OAUTH_FORM_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded",
     "User-Agent": OAUTH_USER_AGENT,
@@ -183,9 +185,9 @@ def build_safe_diagnostic(
         # changing valid credentials. Preserve only an actionable description.
         description = (
             "Schwab devolvió una denegación HTML de su capa de acceso. "
-            "No confirma credenciales incorrectas ni que el bloqueo sea temporal. "
-            "Revise la salida de red del equipo que ejecuta el bot y facilite "
-            "el Reference ID a soporte Schwab si persiste."
+            "No confirma credenciales incorrectas. Soporte Schwab recomienda "
+            "esperar al menos 10 minutos sin reintentos y mantener estable la "
+            "ruta del VPS. Si persiste, facilite el Reference ID a soporte."
         )
         action = (
             "CHANGE_NETWORK_THEN_NEW_CODE"
@@ -227,6 +229,9 @@ def build_safe_diagnostic(
         "edge_reference": edge_reference or None,
         "edge_url": edge_url or None,
         "network_recovery_required": bool(edge_access_denied),
+        "retry_after_seconds": (
+            max(600, schwab_request_pause()["retry_after_seconds"]) if status == 403 else None
+        ),
         "transient": bool(
             edge_access_denied or status == 429 or status >= 500
         ),
@@ -303,7 +308,7 @@ def exchange_authorization_code(
 
     post = http_post or requests.post
     with OAUTH_ROTATION_LOCK:
-        response = post(
+        response = schwab_request(post,
             TOKEN_URL,
             auth=HTTPBasicAuth(cid, secret),
             headers=dict(OAUTH_FORM_HEADERS),
@@ -343,7 +348,7 @@ def refresh_oauth_token(
 
     post = http_post or requests.post
     with OAUTH_ROTATION_LOCK:
-        response = post(
+        response = schwab_request(post,
             TOKEN_URL,
             auth=HTTPBasicAuth(cid, secret),
             headers=dict(OAUTH_FORM_HEADERS),

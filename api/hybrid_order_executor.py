@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 from core.risk_manager import OrdenTradingCalculada
 from api.order_sync import AsyncOrderSynchronizer, normalize_status
+from api.schwab_transport import schwab_request
 
 load_dotenv()
 
@@ -687,8 +688,8 @@ class EjecutorHibridoDeOrdenes:
 
         url = f"{self.TRADER_URL}/accounts/{account_number}/orders"
         try:
-            resp = self._http_session().post(
-                url, json=cuerpo, timeout=self.request_timeout_s)
+            resp = schwab_request(self._http_session().post,
+                url, json=cuerpo, timeout=self.request_timeout_s, recovery_safe=False)
             resp.raise_for_status()
             order_id = resp.headers.get("Location", "").split("/")[-1]
             self._audit(
@@ -969,7 +970,7 @@ class EjecutorHibridoDeOrdenes:
             return None
         direct_url = f"{self.TRADER_URL}/accounts/{account_number}/orders/{order_id}"
         try:
-            direct = self._http_session().get(
+            direct = schwab_request(self._http_session().get,
                 direct_url, timeout=self.request_timeout_s)
             direct.raise_for_status()
             data = direct.json()
@@ -990,7 +991,7 @@ class EjecutorHibridoDeOrdenes:
         fmt = "%Y-%m-%dT%H:%M:%S.000Z"
         url = f"{self.TRADER_URL}/accounts/{account_number}/orders"
         try:
-            r = self._http_session().get(url, params={
+            r = schwab_request(self._http_session().get, url, params={
                 "fromEnteredTime": desde.strftime(fmt),
                 "toEnteredTime": hasta.strftime(fmt),
                 "maxResults": 500,
@@ -1036,7 +1037,7 @@ class EjecutorHibridoDeOrdenes:
         fmt = "%Y-%m-%dT%H:%M:%S.000Z"
         url = f"{self.TRADER_URL}/accounts/{account_number}/orders"
         try:
-            r = self._http_session().get(
+            r = schwab_request(self._http_session().get,
                 url,
                 params={
                     "status": "WORKING",
@@ -1258,8 +1259,8 @@ class EjecutorHibridoDeOrdenes:
 
         url = f"{self.TRADER_URL}/accounts/{account_number}/orders"
         try:
-            resp = self._http_session().post(
-                url, json=cuerpo, timeout=self.request_timeout_s)
+            resp = schwab_request(self._http_session().post,
+                url, json=cuerpo, timeout=self.request_timeout_s, recovery_safe=False)
             resp.raise_for_status()
             order_id = resp.headers.get("Location", "").split("/")[-1]
             event_prefix = "STOP" if tipo_orden == "STOP" else "TP1"
@@ -1536,8 +1537,8 @@ class EjecutorHibridoDeOrdenes:
         }
         url = f"{self.TRADER_URL}/accounts/{account_number}/orders"
         try:
-            resp = self._http_session().post(
-                url, json=cuerpo, timeout=self.request_timeout_s)
+            resp = schwab_request(self._http_session().post,
+                url, json=cuerpo, timeout=self.request_timeout_s, recovery_safe=False)
             resp.raise_for_status()
             order_id = resp.headers.get("Location", "").split("/")[-1]
             self._audit(
@@ -1670,7 +1671,7 @@ class EjecutorHibridoDeOrdenes:
                 return None
 
         try:
-            r = self._http_session().get(
+            r = schwab_request(self._http_session().get,
                 f"{self.TRADER_URL}/accounts/{account_number}",
                 params={"fields": "positions"}, timeout=self.request_timeout_s,
             )
@@ -1744,10 +1745,11 @@ class EjecutorHibridoDeOrdenes:
         try:
             # A DELETE has no JSON body.  Removing Content-Type avoids sending an
             # unnecessary entity header to strict broker gateways.
-            resp = self._http_session().delete(
+            resp = schwab_request(self._http_session().delete,
                 url,
                 headers={"Content-Type": None, "Accept": "application/json"},
                 timeout=self.request_timeout_s,
+                recovery_safe=False,
             )
             resp.raise_for_status()
             return {

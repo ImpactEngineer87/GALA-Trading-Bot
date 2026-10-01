@@ -11,6 +11,8 @@ data/*.pkl
 data/*.tmp
 
 data/daily_kill_switch_state.json
+data/schwab_request_cooldown.json
+data/.schwab-cooldown-*.tmp
 data/daily_kill_switch_state.json.tmp
 data/retraining_state.json
 data/retraining_state.json.tmp

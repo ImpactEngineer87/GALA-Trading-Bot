@@ -66,6 +66,12 @@ from api.schwab_oauth import (
     exchange_authorization_code,
     refresh_oauth_token,
 )
+from api.schwab_transport import (
+    MIN_FORBIDDEN_PAUSE_SECONDS,
+    SchwabRequestPaused,
+    schwab_request,
+    schwab_request_pause,
+)
 
 # Respect credentials injected by the operating system, service manager, or
 # tests. Values from .env are only used when the process environment does not
@@ -1085,6 +1091,14 @@ def _set_schwab_auth_state(state: str, message: str = "", *,
 def _schwab_auth_snapshot() -> dict:
     """Return the dashboard contract without exposing OAuth credentials."""
     state = str(BOT_STATE.get("schwab_auth_state") or "unknown")
+    pause = schwab_request_pause()
+    message = BOT_STATE.get("schwab_auth_message") or ""
+    if pause["paused"] and state != "expired":
+        state = "unavailable"
+        message = (
+            f"Schwab en pausa tras HTTP 403; espere {pause['retry_after_seconds']}s. "
+            "Se conservan los tokens. No repita conexiones ni sondas durante la espera."
+        )
     expiry = BOT_STATE.get("schwab_token_expiry")
     secs = None
     if expiry:
@@ -1104,9 +1118,9 @@ def _schwab_auth_snapshot() -> dict:
         "connected": state == "connected",
         "auth_state": state,
         "auth_expired": state == "expired",
-        "verified": bool(BOT_STATE.get("schwab_auth_verified")),
+        "verified": bool(BOT_STATE.get("schwab_auth_verified") and not pause["paused"]),
         "verified_at": BOT_STATE.get("schwab_auth_verified_at"),
-        "message": BOT_STATE.get("schwab_auth_message") or "",
+        "message": message,
         "account_number": BOT_STATE.get("account_number", ""),
         "expires_in_seconds": secs,
         "token_expires_at": (
@@ -1115,12 +1129,13 @@ def _schwab_auth_snapshot() -> dict:
         "next_verification_in_seconds": next_check,
         "notification_interval_seconds": SCHWAB_AUTH_NOTIFICATION_SECONDS,
         "oauth_diagnostic": BOT_STATE.get("schwab_oauth_diagnostic"),
-        "edge_denial_count": int(BOT_STATE.get("schwab_edge_denial_count") or 0),
-        "edge_circuit_open": bool(
+        "edge_denial_count": max(pause["denial_count"],
+                                 int(BOT_STATE.get("schwab_edge_denial_count") or 0)),
+        "edge_circuit_open": bool(pause["paused"] or
             time.monotonic()
             < float(BOT_STATE.get("schwab_edge_circuit_until_monotonic") or 0.0)
         ),
-        "edge_circuit_remaining_seconds": max(
+        "edge_circuit_remaining_seconds": max(pause["retry_after_seconds"],
             0,
             int(
                 float(BOT_STATE.get("schwab_edge_circuit_until_monotonic") or 0.0)
@@ -1132,6 +1147,7 @@ def _schwab_auth_snapshot() -> dict:
         "request_origin": "bot_server",
         "execution_host": socket.gethostname(),
         "retry_after_seconds": _schwab_retry_remaining(),
+        "request_pause": pause,
     }
 
 
@@ -1141,7 +1157,21 @@ def _schwab_retry_remaining() -> int:
         float(BOT_STATE.get("schwab_refresh_retry_after_monotonic") or 0.0),
     )
     remaining = until - time.monotonic()
-    return max(0, int(remaining) + (1 if remaining > 0 else 0))
+    return max(schwab_request_pause()["retry_after_seconds"],
+               max(0, int(remaining) + (1 if remaining > 0 else 0)))
+
+
+def _schwab_pause_response(seconds: int = 0):
+    seconds = max(1, seconds or _schwab_retry_remaining())
+    response = jsonify({
+        "status": "error", "request_sent": False,
+        "message": f"Schwab en pausa; espere {seconds}s antes de reintentar.",
+        "retry_after_seconds": seconds,
+        "request_pause": schwab_request_pause(),
+    })
+    response.status_code = 503
+    response.headers["Retry-After"] = str(seconds)
+    return response
 
 
 def _adopt_schwab_process_tokens() -> bool:
@@ -1216,11 +1246,11 @@ def _record_schwab_edge_denial(diag: dict, *, authorization_code: bool = False) 
     if ref:
         BOT_STATE["schwab_edge_last_reference"] = ref
     if count >= 3:
-        backoff = 15 * 60
+        backoff = max(15 * 60, schwab_request_pause()["retry_after_seconds"])
         BOT_STATE["schwab_edge_circuit_until_monotonic"] = time.monotonic() + backoff
     else:
         backoff = max(
-            30, min(300, int(BOT_STATE.get("schwab_refresh_backoff_seconds") or 30))
+            MIN_FORBIDDEN_PAUSE_SECONDS, schwab_request_pause()["retry_after_seconds"]
         )
         BOT_STATE["schwab_refresh_backoff_seconds"] = min(300, backoff * 2)
     BOT_STATE["schwab_refresh_retry_after_monotonic"] = time.monotonic() + backoff
@@ -1232,7 +1262,7 @@ def _record_schwab_edge_denial(diag: dict, *, authorization_code: bool = False) 
     elif count >= 3:
         message = (
             "Schwab/Akamai bloqueó repetidamente la ruta OAuth. Circuito pausado "
-            "15 minutos; revise la salida de red del servidor del bot si persiste."
+            f"{(backoff + 59) // 60} minutos; revise la red del servidor si persiste."
         )
     else:
         message = (
@@ -1252,6 +1282,8 @@ def schwab_ensure_token():
 
 
 def _schwab_ensure_token_locked():
+    if schwab_request_pause()["paused"]:
+        return False
     if BOT_STATE.get("schwab_reauthorization_required"):
         return False
     expiry = BOT_STATE.get("schwab_token_expiry")
@@ -1411,6 +1443,10 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
             f"client=****{diag.get('client_id_tail') or ''}",
         )
         return False
+    except SchwabRequestPaused as exc:
+        _set_schwab_auth_state("unavailable", str(exc), verified=False,
+                              cache_seconds=exc.retry_after_seconds)
+        return False
     except requests.RequestException as exc:
         backoff = max(
             30, min(300, int(
@@ -1468,7 +1504,9 @@ def _record_schwab_api_forbidden(response):
         message = ("Schwab devolvió 403 al verificar datos. Revise permisos de la "
                    "app; este resultado no confirma que OAuth haya vencido.")
     BOT_STATE["schwab_oauth_diagnostic"] = diag
-    _set_schwab_auth_state("unavailable", message, verified=False)
+    _set_schwab_auth_state("unavailable", message, verified=False,
+                          cache_seconds=max(SCHWAB_STATUS_CACHE_SECONDS,
+                                            _schwab_retry_remaining()))
 
 
 def _verify_schwab_connection(*, force: bool = False) -> dict:
@@ -1479,6 +1517,8 @@ def _verify_schwab_connection(*, force: bool = False) -> dict:
     never trigger the five-minute expiration notification.
     """
     with _SCHWAB_AUTH_LOCK:
+        if schwab_request_pause()["paused"]:
+            return _schwab_auth_snapshot()
         if (
             not force
             and time.monotonic()
@@ -1510,7 +1550,7 @@ def _verify_schwab_connection(*, force: bool = False) -> dict:
         params = {"symbols": "BA"}
 
         def verify_request(token: str):
-            return requests.get(
+            return schwab_request(requests.get,
                 url,
                 params=params,
                 headers={
@@ -1568,6 +1608,9 @@ def _verify_schwab_connection(*, force: bool = False) -> dict:
                     f"Schwab no pudo verificarse (HTTP {response.status_code}).",
                     verified=False,
                 )
+        except SchwabRequestPaused as exc:
+            _set_schwab_auth_state("unavailable", str(exc), verified=False,
+                                  cache_seconds=exc.retry_after_seconds)
         except requests.RequestException as exc:
             _set_schwab_auth_state(
                 "unavailable",
@@ -1584,7 +1627,7 @@ def schwab_get_candles(ticker: str, cantidad: int = 200):
     if not hdrs:
         return _synthetic_candles(ticker, cantidad)
     try:
-        r = requests.get(
+        r = schwab_request(requests.get,
             f"{SCHWAB_MKT_URL}/pricehistory",
             params={"symbol": ticker, "periodType": "day", "period": 5,
                     "frequencyType": "minute", "frequency": 1,
@@ -1603,7 +1646,7 @@ def schwab_get_candles(ticker: str, cantidad: int = 200):
             hdrs = schwab_headers()
             if not hdrs:
                 return _synthetic_candles(ticker, cantidad)
-            r = requests.get(
+            r = schwab_request(requests.get,
                 f"{SCHWAB_MKT_URL}/pricehistory",
                 params={"symbol": ticker, "periodType": "day", "period": 5,
                         "frequencyType": "minute", "frequency": 1,
@@ -1697,7 +1740,7 @@ def _fetch_chart_candles(
         "needPreviousClose": True,
     }
 
-    response = requests.get(
+    response = schwab_request(requests.get,
         f"{SCHWAB_MKT_URL}/pricehistory",
         params=params,
         headers=headers,
@@ -1712,7 +1755,7 @@ def _fetch_chart_candles(
         headers = schwab_headers()
         if not headers:
             raise RuntimeError("La sesión Schwab expiró; vuelva a autorizar OAuth")
-        response = requests.get(
+        response = schwab_request(requests.get,
             f"{SCHWAB_MKT_URL}/pricehistory",
             params=params,
             headers=headers,
@@ -2126,6 +2169,8 @@ def dashboard():
 # =============================================================
 @app.route('/api/schwab/auth-url')
 def schwab_auth_url_route():
+    if _schwab_retry_remaining():
+        return _schwab_pause_response()
     cid = get_env("SCHWAB_CLIENT_ID").strip()
     if not cid:
         return jsonify({"status": "error", "message": "Falta SCHWAB_CLIENT_ID"}), 400
@@ -2152,8 +2197,8 @@ def _probe_schwab_route(
 ) -> dict:
     """Read-only network-path probe; never sends account tokens or secrets."""
     try:
-        response = requests.request(
-            str(method or "GET").upper(),
+        response = schwab_request(
+            lambda target, **kwargs: requests.request(str(method or "GET").upper(), target, **kwargs),
             url,
             params=params,
             data=data,
@@ -2192,6 +2237,11 @@ def _probe_schwab_route(
             "edge_reference": diag.get("edge_reference"),
             "edge_url": diag.get("edge_url"),
         }
+    except SchwabRequestPaused as exc:
+        return {"ok": False, "oauth_response": False, "http_status": 0,
+                "request_sent": False, "paused": True,
+                "retry_after_seconds": exc.retry_after_seconds,
+                "edge_access_denied": False, "edge_reference": None, "edge_url": None}
     except requests.RequestException as exc:
         return {
             "ok": False,
@@ -2260,7 +2310,14 @@ def schwab_network_diagnostics():
         for row in edge_rows
         if row.get("edge_reference")
     ))
-    if edge_rows:
+    if all(row.get("paused") for row in probes.values()):
+        conclusion = "COOLDOWN_ACTIVE"
+        recommendation = (
+            "Sondas omitidas: Schwab recomienda esperar al menos 10 minutos tras "
+            "HTTP 403. El bot mantiene la pausa compartida sin enviar tráfico. "
+            "No repita conexiones, sondas ni curl durante la espera."
+        )
+    elif edge_rows:
         conclusion = "EDGE_ROUTE_BLOCKED"
         recommendation = (
             "La capa de acceso de Schwab denegó una petición desde el servidor "
@@ -2299,7 +2356,7 @@ def schwab_network_diagnostics():
 
     result = {
         "status": "ok",
-        "version": "3.3.13",
+        "version": "3.3.14",
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "host": host,
         "execution_host": socket.gethostname(),
@@ -2395,6 +2452,7 @@ def schwab_connect():
 
         # Codes are single-use; after any attempted POST use a fresh code,
         # including uncertain network failures where consumption is unknown.
+        previous_fingerprint = BOT_STATE.get("schwab_oauth_last_code_fingerprint", "")
         BOT_STATE["schwab_oauth_last_code_fingerprint"] = fingerprint
         try:
             with OAUTH_ROTATION_LOCK:
@@ -2443,7 +2501,7 @@ def schwab_connect():
             # Best-effort account discovery. This happens only after token exchange.
             try:
                 hdrs = schwab_headers()
-                ra = requests.get(f"{SCHWAB_TRADE_URL}/accounts", headers=hdrs, timeout=10)
+                ra = schwab_request(requests.get, f"{SCHWAB_TRADE_URL}/accounts", headers=hdrs, timeout=10)
                 if ra.ok:
                     accs = ra.json()
                     if accs and isinstance(accs, list):
@@ -2524,6 +2582,11 @@ def schwab_connect():
                 "diagnostic": diag,
                 "same_network_retry_recommended": False if edge_block else None,
             }), status_code
+        except SchwabRequestPaused as exc:
+            # The gate rejected this exchange before its HTTP POST. Do not
+            # mark the authorization code as consumed or replace saved tokens.
+            BOT_STATE["schwab_oauth_last_code_fingerprint"] = previous_fingerprint
+            return _schwab_pause_response(exc.retry_after_seconds)
         except requests.RequestException as exc:
             _set_schwab_auth_state(
                 "unavailable",
@@ -2564,14 +2627,20 @@ def schwab_status():
 def schwab_test():
     hdrs = schwab_headers()
     if not hdrs:
+        if _schwab_retry_remaining():
+            return _schwab_pause_response()
         return jsonify({"status":"error","message":"Sin token Schwab"}), 400
     try:
-        r = requests.get(f"{SCHWAB_MKT_URL}/quotes", params={"symbols":"BA"}, headers=hdrs, timeout=10)
+        r = schwab_request(requests.get, f"{SCHWAB_MKT_URL}/quotes", params={"symbols":"BA"}, headers=hdrs, timeout=10)
         if r.ok:
             price = r.json().get("BA",{}).get("quote",{}).get("lastPrice","N/A")
             _log("INFO", f"[Schwab] Test OK - BA: ${price}")
             return jsonify({"status":"ok","ticker":"BA","price":price})
-        return jsonify({"status":"error","message":f"HTTP {r.status_code}"}), 400
+        return jsonify({"status":"error","message":f"HTTP {r.status_code}",
+                        "retry_after_seconds":_schwab_retry_remaining(),
+                        "request_pause":schwab_request_pause()}), 400
+    except SchwabRequestPaused as exc:
+        return _schwab_pause_response(exc.retry_after_seconds)
     except Exception as e:
         return jsonify({"status":"error","message":str(e)}), 500
 
@@ -4626,12 +4695,18 @@ def market_quote():
     symbol = request.args.get("symbol","BA")
     hdrs   = schwab_headers()
     if not hdrs:
+        if _schwab_retry_remaining():
+            return _schwab_pause_response()
         return jsonify({"status":"error","message":"Sin token Schwab"}), 400
     try:
-        r = requests.get(f"{SCHWAB_MKT_URL}/quotes", params={"symbols":symbol},
+        r = schwab_request(requests.get, f"{SCHWAB_MKT_URL}/quotes", params={"symbols":symbol},
                          headers=hdrs, timeout=10)
         return jsonify({"status":"ok","data":r.json()}) if r.ok else \
-               jsonify({"status":"error","message":f"HTTP {r.status_code}"}), r.status_code
+               jsonify({"status":"error","message":f"HTTP {r.status_code}",
+                        "retry_after_seconds":_schwab_retry_remaining(),
+                        "request_pause":schwab_request_pause()}), r.status_code
+    except SchwabRequestPaused as exc:
+        return _schwab_pause_response(exc.retry_after_seconds)
     except Exception as e:
         return jsonify({"status":"error","message":str(e)}), 500
 

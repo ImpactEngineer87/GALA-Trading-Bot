@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.13</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.14</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -782,10 +782,10 @@
         .exec-row-actions .btn{flex:1;justify-content:center;min-height:42px}.exec-mode-select,.exec-shares-input{width:100%;font-size:16px;min-height:44px}
       }
     </style>
-    <div class="card" id="tickerExecutionCard" data-editor-build="v3.3.13-ui1">
+    <div class="card" id="tickerExecutionCard" data-editor-build="v3.3.14-ui1">
       <div class="ticker-exec-head">
         <div>
-          <div class="exec-eyebrow">Control de ejecución · v3.3.13 · Editor 5</div>
+          <div class="exec-eyebrow">Control de ejecución · v3.3.14 · Editor 5</div>
           <h2 class="exec-heading">Tickers y tamaño de las órdenes</h2>
           <p class="exec-muted">Defina los límites de REAL y guarde la cantidad de cada ticker.</p>
         </div>
@@ -923,14 +923,14 @@
           <tbody id="aiLifecycleRows"><tr><td colspan="17">Cargando estado IA…</td></tr></tbody>
         </table>
       </div>
-      <div class="section-note" style="margin-top:8px"><strong>v3.3.13:</strong> x/50 sigue contando únicamente operaciones ejecutadas y cerradas con integridad válida. <strong>Aprendizaje señales</strong> muestra vetos/señales no ejecutadas cuyo resultado hipotético se sigue con velas confirmadas; solo TP/SL no ambiguos pueden complementar el bloque FIT con peso reducido. VALIDACIÓN y TEST continúan usando exclusivamente operaciones reales/PAPER ejecutadas válidas. <span style="color:var(--green)">BA aceptada SHADOW</span> sigue siendo la puntuación histórica del modelo instalado; un reentrenamiento posterior REJECTED no la reemplaza ni degrada el modelo aceptado.</div>
+      <div class="section-note" style="margin-top:8px"><strong>v3.3.14:</strong> x/50 sigue contando únicamente operaciones ejecutadas y cerradas con integridad válida. <strong>Aprendizaje señales</strong> muestra vetos/señales no ejecutadas cuyo resultado hipotético se sigue con velas confirmadas; solo TP/SL no ambiguos pueden complementar el bloque FIT con peso reducido. VALIDACIÓN y TEST continúan usando exclusivamente operaciones reales/PAPER ejecutadas válidas. <span style="color:var(--green)">BA aceptada SHADOW</span> sigue siendo la puntuación histórica del modelo instalado; un reentrenamiento posterior REJECTED no la reemplaza ni degrada el modelo aceptado.</div>
     </div>
 
     <div class="card" id="signalLearningVisibilityCard" style="margin-bottom:16px">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
         <div>
           <div class="card-title" style="margin:0">🔎 Visibilidad · Aprendizaje de señales</div>
-          <div class="section-note">v3.3.13 muestra qué evidencia adicional está observando cada modelo. Esta vista es auditoría/visibilidad: no cambia señales, órdenes, x/50 ni las puertas de VALIDACIÓN/TEST.</div>
+          <div class="section-note">v3.3.14 muestra qué evidencia adicional está observando cada modelo. Esta vista es auditoría/visibilidad: no cambia señales, órdenes, x/50 ni las puertas de VALIDACIÓN/TEST.</div>
         </div>
         <div class="learning-controls">
           <label class="section-note" for="signalLearningTicker">Ticker</label>
@@ -1258,16 +1258,17 @@
         </div>
         <div style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">
           <button id="schwabNetworkDiagBtn" class="btn btn-ghost btn-sm" onclick="diagnoseSchwabNetwork()">🌐 Diagnosticar red</button>
-          <button class="btn btn-ghost btn-sm" onclick="testSchwab()">🧪 Test</button>
+          <button id="schwabTestBtn" class="btn btn-ghost btn-sm" onclick="testSchwab()">🧪 Test</button>
         </div>
       </div>
       <div class="section-note" style="margin-bottom:12px">El inicio de sesión se realiza en tu navegador. El intercambio del código y la renovación de tokens salen del <strong>servidor donde se ejecuta el bot</strong> (VPS, si está alojado allí). Entrar en Schwab desde el portátil no verifica esa conexión. «Diagnosticar red» comprueba la ruta del servidor; no valida tus credenciales.</div>
+      <div id="schwabRetryNotice" class="section-note" hidden style="margin-bottom:12px;color:var(--yellow)"></div>
       <div class="schwab-steps">
         <div class="schwab-step">
           <div class="step-num">1</div>
           <div>
             <div class="step-txt">Haz clic en el botón para abrir la página de autorización de Schwab en tu navegador.</div>
-            <button class="btn btn-blue btn-sm" style="margin-top:8px" onclick="openSchwabAuth()">Abrir Schwab OAuth →</button>
+            <button id="schwabAuthOpenBtn" class="btn btn-blue btn-sm" style="margin-top:8px" onclick="openSchwabAuth()">Abrir Schwab OAuth →</button>
           </div>
         </div>
         <div class="schwab-step">
@@ -2915,10 +2916,32 @@ function goToSchwabReconnect(){
   if(card) card.scrollIntoView({behavior:'smooth', block:'start'});
 }
 
+let schwabRetryUntil = 0;
+function setSchwabRetryPause(seconds, persistenceError){
+  const wait = Math.max(0, Number(seconds) || 0);
+  schwabRetryUntil = Date.now() + wait * 1000;
+  ['schwabAuthOpenBtn','schwabConnectBtn','schwabTestBtn','schwabNetworkDiagBtn'].forEach(id=>{
+    const button=el(id);
+    if(button) button.disabled=wait>0;
+  });
+  const notice=el('schwabRetryNotice');
+  if(notice){
+    notice.hidden=wait<=0;
+    notice.textContent=wait>0
+      ? 'Schwab en espera: '+Math.ceil(wait/60)+' min. Los tokens se conservan. No repitas conexiones, diagnósticos ni pruebas externas mientras termina la pausa.'
+      : '';
+    if(persistenceError){
+      notice.hidden=false;
+      notice.textContent+=' '+persistenceError;
+    }
+  }
+}
+
 async function checkSchwabStatus(){
   try {
     const r = await api('/api/schwab/status');
     const d = await r.json();
+    setSchwabRetryPause(d.retry_after_seconds, d.request_pause && d.request_pause.persistence_error);
     const state = d.auth_state || (d.connected ? 'connected' : 'not_connected');
     const ok = state === 'connected';
     const dotState = ok ? 'ok' : (state === 'unavailable' || state === 'unknown' ? 'warn' : 'err');
@@ -2927,11 +2950,11 @@ async function checkSchwabStatus(){
       if(dot){ dot.className='schwab-dot '+dotState; }
     });
     const edgeCircuit = Boolean(d.edge_circuit_open);
-    el('schwabLabel').textContent = ok ? 'Schwab ✓' : (edgeCircuit ? 'Schwab ruta bloqueada' : (state === 'expired' ? 'Schwab expirada' : 'Schwab ✗'));
+    el('schwabLabel').textContent = ok ? 'Schwab ✓' : (edgeCircuit ? 'Schwab en espera' : (state === 'expired' ? 'Schwab expirada' : 'Schwab ✗'));
     el('schwabStatusText').textContent = ok
       ? '✅ Conectado y verificado'
       : (edgeCircuit
-          ? '⚠️ Ruta Schwab/Akamai bloqueada · pausa '+Math.ceil(Number(d.edge_circuit_remaining_seconds||0)/60)+' min'
+          ? '⚠️ Solicitudes Schwab en pausa · '+Math.ceil(Number(d.edge_circuit_remaining_seconds||0)/60)+' min'
           : (state === 'expired' ? '⚠️ Autorización expirada' : (state === 'unavailable' ? '⚠️ Verificación no disponible' : '❌ Sin conectar')));
     el('schwabAccountText').textContent = state === 'expired'
       ? 'Vuelve a autorizar en los pasos 1–3 de abajo'
@@ -2946,6 +2969,11 @@ async function openSchwabAuth(){
   try {
     const r = await api('/api/schwab/auth-url');
     const d = await r.json();
+    if(!r.ok || !d.auth_url){
+      if(d.retry_after_seconds) setSchwabRetryPause(d.retry_after_seconds);
+      toast('info','Schwab en espera',d.message || 'No se pudo obtener la URL OAuth');
+      return;
+    }
     window.open(d.auth_url,'_blank');
   } catch(e){ toast('err','Error','No se pudo obtener URL de Schwab'); }
 }
@@ -2967,7 +2995,7 @@ function renderSchwabOAuthDiagnostic(diag){
   if(diag.transient) rows.push('Estado: fallo de acceso; el bot conserva los tokens guardados y limita los reintentos');
   const retrySeconds = Number(diag.retry_after_seconds);
   if(Number.isFinite(retrySeconds) && retrySeconds > 0) rows.push('Pausa de reintentos: '+Math.ceil(retrySeconds)+' s');
-  if(diag.network_recovery_required || diag.edge_access_denied) rows.push('Recuperación: revisar la salida de red, proxy y DNS del servidor del bot con el proveedor del VPS; enviar el Reference ID a soporte Schwab si persiste. El diagnóstico no confirma la causa del bloqueo ni garantiza que cambiar la IP lo resuelva. Cambiar la red del portátil no cambia la ruta del VPS');
+  if(diag.network_recovery_required || diag.edge_access_denied) rows.push('Recuperación: esperar al menos 10 minutos sin reintentos y mantener estable la ruta del VPS, según soporte Schwab. Si persiste, revisar la red con el proveedor y enviar el Reference ID a Schwab. No se ha identificado la regla exacta del bloqueo');
   if(diag.description) rows.push('Detalle: '+diag.description);
   if(diag.request_id) rows.push('Request ID: '+diag.request_id);
   box.textContent = rows.join(' · ');
@@ -2981,9 +3009,11 @@ async function diagnoseSchwabNetwork(){
   try{
     const r=await api('/api/schwab/network-diagnostics',{method:'POST'});
     const d=await r.json();
+    if(d.retry_after_seconds) setSchwabRetryPause(d.retry_after_seconds);
     if(!r.ok || d.status!=='ok') throw new Error(d.message||'Diagnóstico no disponible');
     const conclusion = d.conclusion || 'ROUTE_INCONCLUSIVE';
     const conclusions = {
+      COOLDOWN_ACTIVE:'Espera activa; no se enviaron sondas a Schwab',
       EDGE_ROUTE_BLOCKED:'Schwab/Akamai rechazó una sonda del servidor',
       DNS_OR_NETWORK_FAILURE:'Fallo de DNS o conexión desde el servidor',
       NETWORK_PROBE_FAILED:'No se pudo completar la prueba de red',
@@ -2991,7 +3021,8 @@ async function diagnoseSchwabNetwork(){
       OAUTH_ENDPOINT_REACHABLE:'Endpoint OAuth accesible en esta prueba; credenciales sin verificar'
     };
     const recoveries = {
-      EDGE_ROUTE_BLOCKED:'Revise la salida de red, proxy y DNS del servidor con el proveedor del VPS. Si persiste, contacte con soporte Schwab e incluya el Reference ID y la hora del bloqueo. No se ha confirmado que la IP sea la causa ni que cambiarla resuelva el problema.',
+      COOLDOWN_ACTIVE:'Espera a que termine la pausa. Schwab recomienda al menos 10 minutos tras un HTTP 403 y reducir reintentos. No reinicies el bot para acortar la espera.',
+      EDGE_ROUTE_BLOCKED:'Espere al menos 10 minutos sin repetir conexiones ni sondas. Mantenga estable la ruta del VPS. Si persiste, contacte con soporte Schwab y el proveedor del VPS e incluya el Reference ID y la hora del bloqueo.',
       DNS_OR_NETWORK_FAILURE:'Revise DNS, conectividad HTTPS, firewall y proxy en el servidor del bot con el proveedor del VPS; repita el diagnóstico después de corregir el fallo.',
       NETWORK_PROBE_FAILED:'Revise el error de las sondas y los registros del servidor. Repita la prueba cuando el servicio de diagnóstico esté disponible.',
       ROUTE_INCONCLUSIVE:'Revise las respuestas de las sondas y los registros del servidor. Este resultado no demuestra que el intercambio OAuth vaya a funcionar.',
@@ -3000,6 +3031,7 @@ async function diagnoseSchwabNetwork(){
     const probes=d.probes||{};
     const fmt=(name,row)=>{
       row=row||{};
+      if(row.paused) return name+': no enviada · espera activa';
       const edge=row.edge_access_denied?' · acceso rechazado por Schwab/Akamai':'';
       const net=row.network_error?' · '+row.network_error:'';
       return name+': HTTP '+(row.http_status||'—')+edge+net;
@@ -3022,7 +3054,7 @@ async function diagnoseSchwabNetwork(){
     if(box){box.textContent='Diagnóstico falló: '+String(e.message||e);box.style.display='block';box.style.borderColor='rgba(239,68,68,.45)';}
     toast('err','Diagnóstico Schwab',String(e.message||e));
   }finally{
-    if(btn){btn.disabled=false;btn.textContent='🌐 Diagnosticar red';}
+    if(btn){btn.disabled=Date.now()<schwabRetryUntil;btn.textContent='🌐 Diagnosticar red';}
   }
 }
 
@@ -3045,13 +3077,14 @@ async function connectSchwab(){
       renderSchwabOAuthDiagnostic(null);
       checkSchwabStatus();
     } else {
+      if(d.retry_after_seconds) setSchwabRetryPause(d.retry_after_seconds);
       renderSchwabOAuthDiagnostic(d.diagnostic || null);
       toast('err','Error Schwab',d.message || 'OAuth rechazado');
     }
   } catch(e){
     toast('err','Error','No se pudo conectar');
   } finally {
-    if(btn){ btn.disabled=false; btn.textContent='✅ Conectar Schwab'; }
+    if(btn){ btn.disabled=Date.now()<schwabRetryUntil; btn.textContent='✅ Conectar Schwab'; }
   }
 }
 
@@ -3059,6 +3092,7 @@ async function testSchwab(){
   try {
     const r = await api('/api/schwab/test');
     const d = await r.json();
+    if(d.retry_after_seconds) setSchwabRetryPause(d.retry_after_seconds, d.request_pause && d.request_pause.persistence_error);
     if(d.status==='ok') toast('ok','Test OK ✅','BA: $'+d.price);
     else toast('err','Test Schwab',d.message);
   } catch(e){ toast('err','Error',String(e)); }
@@ -3488,7 +3522,7 @@ async function showExecutionDiagnostics(){
     const d=await (await api('/api/execution-diagnostics')).json();
     if(d.status!=='ok') throw new Error(d.message || 'No hay datos');
     const sum=d.summary||{};
-    showV330Dialog(`<h2>Calidad de ejecución · v3.3.13</h2><p>${escHtml(d.scope)}</p>
+    showV330Dialog(`<h2>Calidad de ejecución · v3.3.14</h2><p>${escHtml(d.scope)}</p>
       <p>PnL de señales: ${metricV330(sum.strategy_pnl_usd,' USD')} · PnL real comparable: ${metricV330(sum.actual_pnl_matched_usd,' USD')} · Coste de ejecución medido: ${metricV330(sum.execution_loss_usd,' USD')} · Spread medio: ${metricV330(sum.average_spread,' USD')}</p>
       <p>${escHtml(d.attribution_note)}</p><table class="ai-life-table"><thead><tr><th>Ticker</th><th>Modo / etapa</th><th>Señal</th><th>Solicitado</th><th>Límite</th><th>Fill</th><th>Spread</th><th>Slippage USD</th><th>Motivo</th></tr></thead><tbody>${(d.orders||[]).slice(-50).reverse().map(o=>`<tr><td>${escHtml(o.ticker)}</td><td>${escHtml(o.mode)} / ${escHtml(o.role)}</td><td>${metricV330(o.signal_price)}</td><td>${metricV330(o.requested_price)}</td><td>${metricV330(o.limit_price)}</td><td>${metricV330(o.fill_price)}</td><td>${metricV330(o.spread)}</td><td>${metricV330(o.slippage_usd)}</td><td>${escHtml(o.exit_reason||'—')}</td></tr>`).join('')}</tbody></table>`);
   } catch(e){ toast('err','Ejecución',String(e)); }

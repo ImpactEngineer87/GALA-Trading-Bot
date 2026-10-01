@@ -20,6 +20,12 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
+from api.schwab_transport import (
+    MIN_FORBIDDEN_PAUSE_SECONDS,
+    SchwabRequestPaused,
+    schwab_request,
+    schwab_request_pause,
+)
 from api.schwab_oauth import (
     DEFAULT_REDIRECT_URI,
     OAUTH_ROTATION_LOCK,
@@ -417,18 +423,19 @@ class SchwabClient:
                     else:
                         self._oauth_edge_denial_count = 0
                     if self._oauth_edge_denial_count >= 3:
-                        backoff = 900
+                        backoff = max(900, schwab_request_pause()["retry_after_seconds"])
                         self._oauth_edge_circuit_until = (
                             datetime.now() + timedelta(seconds=backoff)
                         )
                         self._marcar_degradado(
                             "Schwab/Akamai devolvió Access Denied repetidamente. "
-                            "El circuito OAuth se pausa 15 min; si persiste, revise "
+                            f"El circuito OAuth se pausa {(backoff + 59) // 60} min; si persiste, revise "
                             "la salida de red del servidor del bot con soporte Schwab.",
                             cooldown_seconds=backoff,
                         )
                     else:
-                        backoff = max(30, min(300, int(self._oauth_backoff_seconds or 30)))
+                        backoff = max(MIN_FORBIDDEN_PAUSE_SECONDS,
+                                      schwab_request_pause()["retry_after_seconds"])
                         self._oauth_backoff_seconds = min(300, backoff * 2)
                         self._marcar_degradado(
                             "Schwab rechazó el refresh en su capa de acceso; "
@@ -450,6 +457,9 @@ class SchwabClient:
                         f"No se pudo renovar OAuth (HTTP {diag.get('http_status') or '?'}); reconecte Schwab.",
                         cooldown_seconds=60,
                     )
+                return False
+            except SchwabRequestPaused as exc:
+                self._marcar_degradado(str(exc), cooldown_seconds=exc.retry_after_seconds)
                 return False
             except requests.RequestException as exc:
                 backoff = max(30, min(300, int(self._oauth_backoff_seconds or 30)))
@@ -504,9 +514,10 @@ class SchwabClient:
         segundos = None
         if self.token_expiry:
             segundos = max(0, int((self.token_expiry - ahora).total_seconds()))
+        pause = schwab_request_pause()
         return {
             "connected": bool(
-                self.access_token
+                not pause["paused"] and self.access_token
                 and self.token_expiry
                 and ahora < self.token_expiry
                 and self.token_es_usuario
@@ -517,7 +528,7 @@ class SchwabClient:
             "token_is_user_oauth": bool(self.token_es_usuario),
             "expires_in_seconds": segundos,
             "reauthorization_required": bool(self.reauthorization_required),
-            "degraded": bool(self._oauth_transient_failure),
+            "degraded": bool(self._oauth_transient_failure or pause["paused"]),
             "edge_denial_count": int(self._oauth_edge_denial_count or 0),
             "edge_circuit_open": bool(
                 self._oauth_edge_circuit_until
@@ -527,11 +538,13 @@ class SchwabClient:
                 max(0, int((self._oauth_edge_circuit_until - ahora).total_seconds()))
                 if self._oauth_edge_circuit_until else 0
             ),
-            "retry_in_seconds": (
+            "retry_in_seconds": max(pause["retry_after_seconds"], (
                 max(0, int((self._auth_retry_after - ahora).total_seconds()))
                 if self._auth_retry_after else 0
-            ),
-            "error": self.auth_error,
+            )),
+            "request_pause": pause,
+            "error": (str(SchwabRequestPaused(pause["retry_after_seconds"]))
+                      if pause["paused"] else self.auth_error),
         }
 
     def _save_env_token(self, env_path: str):
@@ -611,7 +624,7 @@ class SchwabClient:
             return None
         headers = self._headers()
         request_token = headers["Authorization"][len("Bearer "):]
-        r = self._session.get(
+        r = schwab_request(self._session.get,
             url, params=params, headers=headers, timeout=timeout
         )
         if r.status_code != 401:
@@ -620,7 +633,7 @@ class SchwabClient:
             return None
         headers = self._headers()
         retried_token = headers["Authorization"][len("Bearer "):]
-        response = self._session.get(
+        response = schwab_request(self._session.get,
             url, params=params, headers=headers, timeout=timeout
         )
         if response.status_code == 401:

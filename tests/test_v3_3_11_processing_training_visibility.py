@@ -77,18 +77,19 @@ def test_processing_and_retraining_visibility_sources_exist():
     server = (ROOT / "server.py").read_text(encoding="utf-8")
     dashboard = (ROOT / "dashboard" / "index.html").read_text(encoding="utf-8")
     lifecycle = (ROOT / "agents" / "retraining_lifecycle.py").read_text(encoding="utf-8")
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
 
     assert "def _set_ticker_processing(" in engine
     assert "def ticker_processing_snapshot(" in engine
     assert "@app.route('/api/ticker-processing')" in server
-    assert '"version": "3.3.13"' in server
+    assert f'"version": "{version}"' in server
     assert "Estado de procesamiento por ticker" in dashboard
     assert "fetchTickerProcessing" in dashboard
     assert "last_supplemental_fit_samples" in lifecycle
     assert "Suplementarias usadas último reentreno" in dashboard
 
 
-def test_current_version_is_3311():
-    assert (ROOT / "VERSION").read_text(encoding="utf-8").strip() == "3.3.13"
+def test_current_version_matches_dashboard():
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     html = (ROOT / "dashboard" / "index.html").read_text(encoding="utf-8")
-    assert "Trading Algorítmico v3.3.13" in html
+    assert f"Trading Algorítmico v{version}" in html

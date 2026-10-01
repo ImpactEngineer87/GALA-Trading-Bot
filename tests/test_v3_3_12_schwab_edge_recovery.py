@@ -31,4 +31,4 @@ def test_v3312_network_diagnostic_and_circuit_breaker_are_present():
     assert '_oauth_edge_circuit_until' in client
     assert 'timedelta(minutes=5)' in client
     assert 'Diagnosticar red' in html
-    assert 'Trading Algorítmico v3.3.13' in html
+    assert f'Trading Algorítmico v{Path("VERSION").read_text().strip()}' in html

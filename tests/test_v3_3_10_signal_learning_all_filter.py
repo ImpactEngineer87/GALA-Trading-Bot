@@ -14,5 +14,4 @@ def test_todos_option_clears_previous_ticker_filter():
 def test_current_version_keeps_todos_fix():
     html = Path("dashboard/index.html").read_text(encoding="utf-8")
     version = Path("VERSION").read_text(encoding="utf-8").strip()
-    assert version == "3.3.13"
-    assert "Trading Algorítmico v3.3.13" in html
+    assert f"Trading Algorítmico v{version}" in html

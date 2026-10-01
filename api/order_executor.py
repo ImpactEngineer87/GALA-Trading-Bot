@@ -20,6 +20,7 @@ import requests
 from typing import Optional
 from dotenv import load_dotenv
 from core.risk_manager import OrdenTradingCalculada
+from api.schwab_transport import schwab_request
 
 load_dotenv()
 
@@ -160,7 +161,7 @@ class EjecutorDeOrdenes:
 
         url = f"{self.TRADER_URL}/accounts/{account_number}/orders"
         try:
-            respuesta = self._session.post(url, json=cuerpo_orden, timeout=10)
+            respuesta = schwab_request(self._session.post, url, json=cuerpo_orden, timeout=10, recovery_safe=False)
             respuesta.raise_for_status()
             order_id = respuesta.headers.get("Location", "").split("/")[-1]
             print(f"✅ Orden enviada a Schwab | ID: {order_id} | {orden}")
@@ -181,7 +182,7 @@ class EjecutorDeOrdenes:
 
         url = f"{self.TRADER_URL}/accounts/{account_number}/orders/{order_id}"
         try:
-            respuesta = self._session.delete(url, timeout=10)
+            respuesta = schwab_request(self._session.delete, url, timeout=10, recovery_safe=False)
             respuesta.raise_for_status()
             print(f"✅ Orden {order_id} cancelada correctamente")
             return True
