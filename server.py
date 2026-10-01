@@ -2054,15 +2054,20 @@ def schwab_auth_url_route():
     })
 
 
-def _probe_schwab_route(url: str, *, params: dict = None) -> dict:
+def _probe_schwab_route(
+    url: str, *, params: dict = None, method: str = "GET", data: dict = None
+) -> dict:
     """Read-only network-path probe; never sends account tokens or secrets."""
     try:
-        response = requests.get(
+        response = requests.request(
+            str(method or "GET").upper(),
             url,
             params=params,
+            data=data,
             headers={
                 "User-Agent": "GALA10-Chocoletra/3.3.12",
                 "Accept": "*/*",
+                "Content-Type": "application/x-www-form-urlencoded",
                 "Cache-Control": "no-cache",
             },
             timeout=8,
@@ -2120,10 +2125,17 @@ def schwab_network_diagnostics():
             "state": "network-diagnostic",
         },
     )
-    # GET is intentionally the wrong method for /oauth/token. Reaching Schwab's
-    # application should return a normal 4xx/405-style response. An Akamai HTML
-    # Access Denied here proves the path is blocked before OAuth evaluates data.
-    token_endpoint = _probe_schwab_route(SCHWAB_TOKEN_URL)
+    # Send an intentionally invalid, non-sensitive POST. Reaching OAuth should
+    # produce a normal JSON/auth error. An HTML Akamai Access Denied proves the
+    # request was blocked before Schwab evaluated credentials or token data.
+    token_endpoint = _probe_schwab_route(
+        SCHWAB_TOKEN_URL,
+        method="POST",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": "network-diagnostic-invalid",
+        },
+    )
     trader = _probe_schwab_route(
         f"{SCHWAB_TRADE_URL}/accounts/accountNumbers"
     )
