@@ -2135,6 +2135,7 @@ def schwab_connect():
             BOT_STATE["schwab_reauthorization_required"] = False
             BOT_STATE["schwab_oauth_diagnostic"] = None
             BOT_STATE["schwab_oauth_last_code_fingerprint"] = fingerprint
+            _reset_schwab_edge_state()
             session.pop("schwab_oauth_state", None)
             session.pop("schwab_oauth_state_created_at", None)
             _set_schwab_auth_state(
@@ -2184,33 +2185,59 @@ def schwab_connect():
         except SchwabOAuthFailure as exc:
             diag = dict(exc.diagnostic or {})
             BOT_STATE["schwab_oauth_diagnostic"] = diag
-            BOT_STATE["schwab_reauthorization_required"] = True
             oauth_error = str(diag.get("oauth_error") or "").lower()
-            if oauth_error == "invalid_client":
+            edge_block = bool(diag.get("edge_access_denied"))
+            if edge_block:
+                # The request was rejected before OAuth evaluated the code.
+                # Preserve any still-valid existing token/app authorization and
+                # tell the operator to change the network path before creating
+                # another short-lived authorization code.
+                BOT_STATE["schwab_reauthorization_required"] = False
+                _record_schwab_edge_denial(diag, authorization_code=True)
+                message = (
+                    "Schwab/Akamai está bloqueando esta ruta de red. "
+                    "No cambie nuevamente Client ID/Secret. Cambie la red/IP pública "
+                    "(por ejemplo hotspot), luego abra OAuth y genere una URL NUEVA."
+                )
+                status_code = 503
+            elif oauth_error == "invalid_client":
+                BOT_STATE["schwab_reauthorization_required"] = True
                 message = "Schwab rechazó el Client ID/Client Secret (invalid_client)."
+                _set_schwab_auth_state(
+                    "expired", message, verified=True, cache_seconds=0
+                )
+                status_code = 400
             elif oauth_error == "invalid_grant":
+                BOT_STATE["schwab_reauthorization_required"] = True
                 message = "Schwab rechazó el código OAuth (invalid_grant). Abra OAuth y use una URL nueva."
-            elif oauth_error:
-                message = f"Schwab rechazó OAuth: {oauth_error} (HTTP {diag.get('http_status')})."
+                _set_schwab_auth_state(
+                    "expired", message, verified=True, cache_seconds=0
+                )
+                status_code = 400
             else:
-                message = f"Schwab rechazó el intercambio OAuth (HTTP {diag.get('http_status')})."
-            _set_schwab_auth_state(
-                "expired" if oauth_error in {"invalid_grant", "invalid_client"} else "unavailable",
-                message,
-                verified=True,
-                cache_seconds=0,
-            )
+                BOT_STATE["schwab_reauthorization_required"] = False
+                message = (
+                    f"Schwab rechazó OAuth: {oauth_error} (HTTP {diag.get('http_status')})."
+                    if oauth_error else
+                    f"Schwab rechazó el intercambio OAuth (HTTP {diag.get('http_status')})."
+                )
+                _set_schwab_auth_state(
+                    "unavailable", message, verified=False, cache_seconds=30
+                )
+                status_code = 503
             _log(
                 "ERROR",
                 "[Schwab][OAuth] Token exchange rechazado "
                 f"HTTP={diag.get('http_status')} error={diag.get('oauth_error') or 'unknown'} "
+                f"edge={int(edge_block)} reference={diag.get('edge_reference') or '-'} "
                 f"action={diag.get('recommended_action')} client=****{diag.get('client_id_tail') or ''}",
             )
             return jsonify({
                 "status": "error",
                 "message": message,
                 "diagnostic": diag,
-            }), 400
+                "same_network_retry_recommended": False if edge_block else None,
+            }), status_code
         except requests.RequestException as exc:
             _set_schwab_auth_state(
                 "unavailable",
