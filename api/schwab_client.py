@@ -174,7 +174,7 @@ class SchwabClient:
         self.access_token  = access_token
         self.refresh_token = refresh_token
         self.token_expiry  = datetime.now() + timedelta(
-            seconds=max(30, int(expires_in) - 300)
+            seconds=max(30, int(expires_in))
         )
         self.token_es_usuario = True   # token de USUARIO → válido para trading
         self.reauthorization_required = False
@@ -225,33 +225,65 @@ class SchwabClient:
                 self._auth_warning_emitted = True
 
     def _asegurar_token(self, forzar_refresh: bool = False) -> bool:
-        """Devuelve True solo cuando existe un token OAuth utilizable."""
+        """Use the current token while valid and refresh proactively.
+
+        v3.3.12 separates the access token's *hard* expiry from the refresh
+        schedule.  A transient Schwab/Akamai denial therefore does not discard
+        a token that still has several usable minutes remaining.
+        """
         with self._auth_lock:
             ahora = datetime.now()
-            if (
-                self._oauth_edge_circuit_until
-                and ahora < self._oauth_edge_circuit_until
-            ):
-                self._oauth_transient_failure = True
-                self.auth_error = (
-                    "Circuito Schwab/Akamai abierto por denegaciones 403 repetidas; "
-                    "cambie de red/IP pública o espere antes de reintentar."
-                )
-                return False
-            if (
-                not forzar_refresh
-                and self.access_token
+            hard_valid = bool(
+                self.access_token
                 and self.token_expiry
                 and ahora < self.token_expiry
-            ):
+                and self.token_es_usuario
+            )
+            refresh_due = bool(
+                forzar_refresh
+                or not hard_valid
+                or (
+                    self.token_expiry
+                    and ahora >= self.token_expiry - timedelta(minutes=5)
+                )
+            )
+            if hard_valid and not refresh_due:
                 return True
-            if self._auth_retry_after and ahora < self._auth_retry_after:
-                # Hard OAuth failures stay fail-closed.  Transient edge/network
-                # failures wait for the bounded retry window rather than hammering
-                # Schwab's token endpoint once per ticker.
+
+            circuit_open = bool(
+                self._oauth_edge_circuit_until
+                and ahora < self._oauth_edge_circuit_until
+            )
+            retry_wait = bool(
+                self._auth_retry_after
+                and ahora < self._auth_retry_after
+            )
+            if circuit_open or retry_wait:
+                if hard_valid:
+                    return True
+                if circuit_open:
+                    self._oauth_transient_failure = True
+                    self.auth_error = (
+                        "Circuito Schwab/Akamai abierto por denegaciones 403 repetidas; "
+                        "cambie de red/IP pública o espere antes de reintentar."
+                    )
                 return False
+
             if self.refresh_token:
-                return self._refrescar_token()
+                refreshed = self._refrescar_token()
+                if refreshed:
+                    return True
+                # The refresh request can fail at Schwab's edge while the old
+                # access token is still valid. Keep using it until hard expiry.
+                return bool(
+                    self.access_token
+                    and self.token_expiry
+                    and datetime.now() < self.token_expiry
+                    and self.token_es_usuario
+                )
+
+            if hard_valid:
+                return True
             self._marcar_reautorizacion(
                 "No hay refresh_token valido; complete OAuth authorization_code.",
                 cooldown_seconds=0,
@@ -319,7 +351,7 @@ class SchwabClient:
                 self.refresh_token = d.get("refresh_token", self.refresh_token)
                 expires_in = int(d.get("expires_in", 1800))
                 self.token_expiry = datetime.now() + timedelta(
-                    seconds=max(30, expires_in - 300)
+                    seconds=max(30, expires_in)
                 )
                 self._session.headers.update({
                     "Authorization": f"Bearer {self.access_token}",
