@@ -1265,10 +1265,20 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
         )
         return False
     except requests.RequestException as exc:
+        backoff = max(
+            30, min(300, int(
+                BOT_STATE.get("schwab_refresh_backoff_seconds") or 30
+            ))
+        )
+        BOT_STATE["schwab_refresh_retry_after_monotonic"] = (
+            time.monotonic() + backoff
+        )
+        BOT_STATE["schwab_refresh_backoff_seconds"] = min(300, backoff * 2)
         _set_schwab_auth_state(
             "unavailable",
-            "No se pudo verificar la renovación por un error de red.",
+            f"No se pudo verificar la renovación por un error de red; reintento en {backoff}s.",
             verified=False,
+            cache_seconds=backoff,
         )
         _log("WARN", f"[Schwab] Refresh no verificable: {type(exc).__name__}")
         return False
@@ -4351,7 +4361,7 @@ def _learning_summary_rows(tickers):
 
 @app.route('/api/ai/signal-learning')
 def ai_signal_learning_visibility():
-    """Read-only v3.3.9 visibility for the supplemental signal-learning layer."""
+    """Read-only v3.3.11 visibility for signal learning and retraining."""
     try:
         tickers = list(BOT_STATE.get("tickers") or [])
         wanted = str(request.args.get("ticker", "") or "").strip().upper()
