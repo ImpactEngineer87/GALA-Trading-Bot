@@ -89,6 +89,8 @@ class SchwabClient:
         self._auth_retry_after: Optional[datetime] = None
         self._auth_lock = threading.RLock()
         self._auth_warning_emitted = False
+        self._oauth_transient_failure = False
+        self._oauth_backoff_seconds = 30
         # Todos los tokens aceptados por este cliente proceden del OAuth de usuario.
         # Arranca en False (fail-safe) hasta cargar o recibir uno.
         self.token_es_usuario = False
@@ -177,6 +179,8 @@ class SchwabClient:
         self.auth_error = ""
         self._auth_retry_after = None
         self._auth_warning_emitted = False
+        self._oauth_transient_failure = False
+        self._oauth_backoff_seconds = 30
         self._paper = False
         self._session.headers.update({
             "Authorization": f"Bearer {self.access_token}",
@@ -203,6 +207,19 @@ class SchwabClient:
                 _log(f"[WARN] Schwab desconectado: {motivo}")
                 self._auth_warning_emitted = True
 
+    def _marcar_degradado(self, motivo: str, cooldown_seconds: int = 30):
+        """Transient OAuth/API failure: preserve app authorization and back off."""
+        with self._auth_lock:
+            self.reauthorization_required = False
+            self.auth_error = str(motivo or "")
+            self._oauth_transient_failure = True
+            self._auth_retry_after = (
+                datetime.now() + timedelta(seconds=max(5, int(cooldown_seconds)))
+            )
+            if not self._auth_warning_emitted:
+                _log(f"[WARN] Schwab degradado: {motivo}")
+                self._auth_warning_emitted = True
+
     def _asegurar_token(self, forzar_refresh: bool = False) -> bool:
         """Devuelve True solo cuando existe un token OAuth utilizable."""
         with self._auth_lock:
@@ -214,11 +231,10 @@ class SchwabClient:
                 and ahora < self.token_expiry
             ):
                 return True
-            if (
-                self._auth_retry_after
-                and ahora < self._auth_retry_after
-                and self.reauthorization_required
-            ):
+            if self._auth_retry_after and ahora < self._auth_retry_after:
+                # Hard OAuth failures stay fail-closed.  Transient edge/network
+                # failures wait for the bounded retry window rather than hammering
+                # Schwab's token endpoint once per ticker.
                 return False
             if self.refresh_token:
                 return self._refrescar_token()
@@ -253,6 +269,8 @@ class SchwabClient:
             self.reauthorization_required = False
             self.auth_error = ""
             self._auth_retry_after = None
+            self._oauth_transient_failure = False
+            self._oauth_backoff_seconds = 30
             self._session.headers.update({
                 "Authorization": f"Bearer {self.access_token}",
                 "Accept": "application/json",
@@ -296,6 +314,8 @@ class SchwabClient:
                 self.auth_error = ""
                 self._auth_retry_after = None
                 self._auth_warning_emitted = False
+                self._oauth_transient_failure = False
+                self._oauth_backoff_seconds = 30
 
                 env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
                 self._save_env_token(env_path)
@@ -304,18 +324,36 @@ class SchwabClient:
             except SchwabOAuthFailure as exc:
                 diag = exc.diagnostic or {}
                 oauth_error = str(diag.get("oauth_error") or "").lower()
-                if oauth_error == "invalid_client":
-                    motivo = "Schwab rechazó Client ID/Client Secret; complete OAuth con credenciales válidas."
+                if bool(diag.get("transient")):
+                    backoff = max(30, min(300, int(self._oauth_backoff_seconds or 30)))
+                    self._oauth_backoff_seconds = min(300, backoff * 2)
+                    self._marcar_degradado(
+                        "Schwab rechazó temporalmente el refresh en su capa de acceso; "
+                        f"reintento automático en {backoff}s.",
+                        cooldown_seconds=backoff,
+                    )
+                elif oauth_error == "invalid_client":
+                    self._marcar_reautorizacion(
+                        "Schwab rechazó Client ID/Client Secret; complete OAuth con credenciales válidas.",
+                        cooldown_seconds=60,
+                    )
                 elif oauth_error == "invalid_grant":
-                    motivo = "Schwab rechazó el refresh token; complete OAuth authorization_code nuevamente."
+                    self._marcar_reautorizacion(
+                        "Schwab rechazó el refresh token; complete OAuth authorization_code nuevamente.",
+                        cooldown_seconds=60,
+                    )
                 else:
-                    motivo = f"No se pudo renovar OAuth (HTTP {diag.get('http_status') or '?'}); reconecte Schwab."
-                self._marcar_reautorizacion(motivo, cooldown_seconds=60)
+                    self._marcar_reautorizacion(
+                        f"No se pudo renovar OAuth (HTTP {diag.get('http_status') or '?'}); reconecte Schwab.",
+                        cooldown_seconds=60,
+                    )
                 return False
             except requests.RequestException as exc:
-                self._marcar_reautorizacion(
-                    f"No se pudo renovar OAuth ({type(exc).__name__}); reconecte Schwab.",
-                    cooldown_seconds=60,
+                backoff = max(30, min(300, int(self._oauth_backoff_seconds or 30)))
+                self._oauth_backoff_seconds = min(300, backoff * 2)
+                self._marcar_degradado(
+                    f"Error temporal de red OAuth ({type(exc).__name__}); reintento automático.",
+                    cooldown_seconds=backoff,
                 )
                 return False
             except (TypeError, ValueError, KeyError) as exc:
@@ -357,6 +395,11 @@ class SchwabClient:
             "token_is_user_oauth": bool(self.token_es_usuario),
             "expires_in_seconds": segundos,
             "reauthorization_required": bool(self.reauthorization_required),
+            "degraded": bool(self._oauth_transient_failure),
+            "retry_in_seconds": (
+                max(0, int((self._auth_retry_after - ahora).total_seconds()))
+                if self._auth_retry_after else 0
+            ),
             "error": self.auth_error,
         }
 
