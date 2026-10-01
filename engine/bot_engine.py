@@ -192,6 +192,11 @@ class ChocoletraBot:
         # v3.3.6: quarantine is temporary runtime state only. It must never
         # rewrite the operator's persisted REAL/PAPER selection.
         self._ticker_quarantine_health = {}
+        # v3.3.11: per-ticker runtime observability.  This is intentionally
+        # in-memory and read-only from the dashboard; it never influences a
+        # trading decision.  It answers whether a ticker was processed, vetoed,
+        # quarantined, or blocked by execution/broker safety.
+        self._ticker_processing = {}
         self.live_max_shares_per_order = max(1, int(
             live_cfg.get("max_shares_per_order", 1)
         ))
@@ -1426,14 +1431,86 @@ class ChocoletraBot:
     # PIPELINE POR TICKER
     # ==========================================================
 
+    def _set_ticker_processing(self, ticker: str, status: str, stage: str,
+                               reason: str = "", **extra):
+        """Record the latest processing stage without affecting execution."""
+        ticker = str(ticker or "").upper()
+        if not ticker:
+            return
+        now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self._lock:
+            row = dict(self._ticker_processing.get(ticker) or {})
+            if str(stage).upper() == "START":
+                row["cycles_seen"] = int(row.get("cycles_seen", 0) or 0) + 1
+                row["cycle_started_utc"] = now_utc
+                row["gala_signal"] = ""
+                row["ai_decision"] = ""
+                row["execution"] = ""
+            row.update({
+                "ticker": ticker,
+                "mode": self.execution_mode_for(ticker),
+                "status": str(status or "").upper(),
+                "stage": str(stage or "").upper(),
+                "reason": str(reason or ""),
+                "updated_utc": now_utc,
+                "quarantine_reason": str(
+                    getattr(self, "_ticker_quarantine", {}).get(ticker, "") or ""
+                ),
+            })
+            for key, value in extra.items():
+                if value is not None:
+                    row[key] = value
+            if row["status"] in {
+                "PROCESSED_NO_SIGNAL", "VETOED", "APPROVED", "EXECUTED",
+                "ORDER_SUBMITTED", "BLOCKED", "QUARANTINED", "ERROR",
+            }:
+                row["last_completed_utc"] = now_utc
+            self._ticker_processing[ticker] = row
+
+    def ticker_processing_snapshot(self):
+        """JSON-safe processing health for every monitored ticker."""
+        with self._lock:
+            current = {
+                str(k).upper(): dict(v)
+                for k, v in getattr(self, "_ticker_processing", {}).items()
+                if isinstance(v, dict)
+            }
+            tickers = list(getattr(self, "tickers", []) or self.TICKERS_DEFAULT)
+            quarantine = dict(getattr(self, "_ticker_quarantine", {}) or {})
+        rows = []
+        for ticker in tickers:
+            ticker = str(ticker).upper()
+            row = current.get(ticker, {
+                "ticker": ticker,
+                "status": "WAITING",
+                "stage": "IDLE",
+                "reason": "No cycle recorded yet",
+                "updated_utc": "",
+                "cycles_seen": 0,
+            })
+            row["mode"] = self.execution_mode_for(ticker)
+            row["quarantine_reason"] = str(quarantine.get(ticker, "") or "")
+            row["quarantined"] = bool(row["quarantine_reason"])
+            rows.append(row)
+        return sorted(rows, key=lambda x: x.get("ticker", ""))
+
     def _procesar_ticker(self, ticker: str):
         """Pipeline completo para un ticker (se ejecuta en un hilo)."""
         paper_ticker = self._is_paper_ticker(ticker)
+        self._set_ticker_processing(
+            ticker, "PROCESSING", "START",
+            market_data="PENDING", configured_mode=("PAPER" if paper_ticker else "REAL"),
+        )
         # 1) Datos multi-temporal (con caché)
         try:
             datos = self._obtener_mtf(ticker)
-        except Exception:
+        except Exception as exc:
             self._quarantine_real_ticker(ticker, 'Market data request failed')
+            self._set_ticker_processing(
+                ticker, "QUARANTINED", "MARKET_DATA",
+                "MARKET_DATA_REQUEST_FAILED", market_data="ERROR",
+                detail=type(exc).__name__,
+            )
             return
         datos_confirmados = self._datos_micro_confirmados(datos)
         # GALA10 y el dimensionamiento inmediato trabajan sobre 1m. Las TF mayores
@@ -1447,6 +1524,10 @@ class ChocoletraBot:
         if df_micro is None or len(df_micro) < 30:
             self._emit_log("WARN", f"[{ticker}] Datos micro insuficientes")
             self._quarantine_real_ticker(ticker, 'Insufficient market data')
+            self._set_ticker_processing(
+                ticker, "QUARANTINED", "MARKET_DATA",
+                "INSUFFICIENT_MARKET_DATA", market_data="INSUFFICIENT",
+            )
             return
         # A fallback frame is useful for keeping diagnostics alive, but it is not
         # a price source.  Never publish it into risk/PnL, manage positions, close
@@ -1459,10 +1540,18 @@ class ChocoletraBot:
                 "WARN",
                 f"[{ticker}] Datos sintéticos descartados: sin valoración ni ejecución",
             )
+            self._set_ticker_processing(
+                ticker, "QUARANTINED", "MARKET_DATA",
+                "SYNTHETIC_MARKET_DATA", market_data="SYNTHETIC",
+            )
             return
         if df_1m is not None and len(df_1m) and not datos.sintetico:
             self._emit_candles(ticker, df_1m)
         precio_actual = float(df_micro["close"].iloc[-1])
+        self._set_ticker_processing(
+            ticker, "PROCESSING", "DATA_READY",
+            market_data="REAL", last_price=round(precio_actual, 4),
+        )
         with self._lock:
             self._last_prices[ticker] = precio_actual
             self._last_price_times[ticker] = time.time()
@@ -1529,6 +1618,9 @@ class ChocoletraBot:
         # de obtener un precio y antes del siguiente ciclo global. Bloquear primero
         # impide que otra hebra reserve/mande una entrada nueva.
         if self._evaluar_limite_perdida_diaria():
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "RISK", "DAILY_LOSS_BLOCK"
+            )
             return
 
         # 2) Gestionar posición ya abierta (parciales / breakeven / cierre)
@@ -1540,8 +1632,20 @@ class ChocoletraBot:
             datos_confirmados, ticker, precio_actual
         )
         if senal_gala10 not in ("BUY", "SELL"):
+            self._set_ticker_processing(
+                ticker, "PROCESSED_NO_SIGNAL", "STRATEGY", "NO_GALA10_SIGNAL",
+                gala_signal=str(senal_gala10 or ""),
+            )
             return
+        self._set_ticker_processing(
+            ticker, "PROCESSING", "GALA10_SIGNAL", "",
+            gala_signal=senal_gala10,
+        )
         if not self.agentes_activos:
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "AGENTS", "AGENTS_DISABLED",
+                gala_signal=senal_gala10,
+            )
             return
 
         # v2.9.3: una señal opuesta a una posición ya abierta tiene DOS efectos
@@ -1586,6 +1690,10 @@ class ChocoletraBot:
                 execution_mode="REAL",
                 ai_decision="BLOCKED_POLICY",
             )
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "POLICY", "REAL_LONG_ONLY",
+                gala_signal=senal_gala10, ai_decision="BLOCKED_POLICY",
+            )
             return
         requerir_modelo = bool(
             not paper_ticker and self.requerir_modelo_aprobado_en_real
@@ -1608,6 +1716,10 @@ class ChocoletraBot:
                 ai_threshold=self._ai_threshold_for_ticker(ticker),
                 execution_mode="REAL",
                 ai_decision="BLOCKED_MODEL",
+            )
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "AI_MODEL", "REAL_MODEL_REQUIRED",
+                gala_signal=senal_gala10, ai_decision="BLOCKED_MODEL",
             )
             return
 
@@ -1636,6 +1748,10 @@ class ChocoletraBot:
         except Exception as e:
             self._emit_log("ERROR", f"[{ticker}] Error en auditoría de agentes: {e}")
             self._quarantine_real_ticker(ticker, 'AI inference failed')
+            self._set_ticker_processing(
+                ticker, "ERROR", "AI_INFERENCE", "AI_INFERENCE_FAILED",
+                gala_signal=senal_gala10, detail=type(e).__name__,
+            )
             return
 
         if getattr(decision, 'ai_inference_error', False) and not paper_ticker:
@@ -1678,6 +1794,12 @@ class ChocoletraBot:
         except Exception:
             pass
         if decision.operar:
+            self._set_ticker_processing(
+                ticker, "APPROVED", "AI_DECISION", "AI_APPROVED",
+                gala_signal=senal_gala10, ai_decision="APPROVED",
+                ai_probability=getattr(decision, "prob_meta", None),
+                ai_threshold=self._effective_ai_threshold(decision, ticker),
+            )
             signal_row = self._emit_signal(
                 senal_gala10, ticker, precio_actual,
                 atr_micro, decision.prob_meta,
@@ -1743,6 +1865,12 @@ class ChocoletraBot:
                 execution_mode=("PAPER" if paper_ticker else "REAL"),
             )
             self._registrar_no_op(decision)
+            self._set_ticker_processing(
+                ticker, "VETOED", "AI_DECISION", "AI_VETO",
+                gala_signal=senal_gala10, ai_decision="VETO",
+                ai_probability=getattr(decision, "prob_meta", None),
+                ai_threshold=self._effective_ai_threshold(decision, ticker),
+            )
             return
 
         # 6) Reversión o apertura
