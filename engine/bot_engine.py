@@ -1846,6 +1846,13 @@ class ChocoletraBot:
                         motivo=f"señal opuesta {senal_gala10} (entrada IA vetada)",
                     )
                 self._registrar_no_op(decision)
+                self._set_ticker_processing(
+                    ticker, "VETOED", "AI_DECISION", "AI_VETO_CLOSE_ONLY",
+                    gala_signal=senal_gala10, ai_decision="VETO_CLOSE_ONLY",
+                    ai_probability=getattr(decision, "prob_meta", None),
+                    ai_threshold=self._effective_ai_threshold(decision, ticker),
+                    execution="CLOSE_ONLY",
+                )
                 return
             signal_row = self._emit_signal(
                 "OM-R", ticker, precio_actual, atr_micro, decision.prob_meta,
