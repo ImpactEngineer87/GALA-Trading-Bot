@@ -1155,23 +1155,88 @@ def schwab_get_token_cc() -> bool:
     )
     return False
 
+def _reset_schwab_edge_state():
+    BOT_STATE["schwab_refresh_retry_after_monotonic"] = 0.0
+    BOT_STATE["schwab_refresh_backoff_seconds"] = 30
+    BOT_STATE["schwab_edge_denial_count"] = 0
+    BOT_STATE["schwab_edge_circuit_until_monotonic"] = 0.0
+    BOT_STATE["schwab_edge_last_reference"] = ""
+
+
+def _record_schwab_edge_denial(diag: dict, *, authorization_code: bool = False) -> int:
+    """Open a circuit after repeated Akamai/edge denials on the same route."""
+    count = int(BOT_STATE.get("schwab_edge_denial_count") or 0) + 1
+    BOT_STATE["schwab_edge_denial_count"] = count
+    ref = str((diag or {}).get("edge_reference") or "")
+    if ref:
+        BOT_STATE["schwab_edge_last_reference"] = ref
+    if count >= 3:
+        backoff = 15 * 60
+        BOT_STATE["schwab_edge_circuit_until_monotonic"] = time.monotonic() + backoff
+    else:
+        backoff = max(
+            30, min(300, int(BOT_STATE.get("schwab_refresh_backoff_seconds") or 30))
+        )
+        BOT_STATE["schwab_refresh_backoff_seconds"] = min(300, backoff * 2)
+    BOT_STATE["schwab_refresh_retry_after_monotonic"] = time.monotonic() + backoff
+    if authorization_code:
+        message = (
+            "Schwab/Akamai bloqueó el intercambio OAuth desde esta ruta de red. "
+            "Cambie la red/IP pública y después genere un código OAuth NUEVO."
+        )
+    elif count >= 3:
+        message = (
+            "Schwab/Akamai bloqueó repetidamente la ruta OAuth. Circuito pausado "
+            "15 minutos; cambie la red/IP pública si persiste."
+        )
+    else:
+        message = (
+            f"Schwab/Akamai bloqueó temporalmente la ruta OAuth; reintento en {backoff}s."
+        )
+    _set_schwab_auth_state(
+        "unavailable", message, verified=False, cache_seconds=backoff
+    )
+    return backoff
+
+
 def schwab_ensure_token():
-    """Renueva el token con backoff para fallos transitorios de Schwab."""
+    """Refresh five minutes early while preserving a still-valid access token."""
     if BOT_STATE.get("schwab_reauthorization_required"):
         return False
     expiry = BOT_STATE.get("schwab_token_expiry")
-    if not expiry or datetime.now() >= expiry:
-        retry_after = float(
-            BOT_STATE.get("schwab_refresh_retry_after_monotonic") or 0.0
+    token = _current_schwab_access_token()
+    now = datetime.now()
+    hard_valid = bool(token and expiry and now < expiry)
+    refresh_due = bool(
+        not hard_valid
+        or (expiry and now >= expiry - timedelta(minutes=5))
+    )
+    if hard_valid and not refresh_due:
+        return True
+
+    circuit_until = float(
+        BOT_STATE.get("schwab_edge_circuit_until_monotonic") or 0.0
+    )
+    retry_after = float(
+        BOT_STATE.get("schwab_refresh_retry_after_monotonic") or 0.0
+    )
+    if time.monotonic() < max(circuit_until, retry_after):
+        return hard_valid
+
+    refresh = BOT_STATE.get("schwab_refresh_token") or get_env("SCHWAB_REFRESH_TOKEN")
+    if refresh:
+        if schwab_refresh(refresh):
+            return True
+        expiry = BOT_STATE.get("schwab_token_expiry")
+        return bool(
+            _current_schwab_access_token()
+            and expiry
+            and datetime.now() < expiry
         )
-        if time.monotonic() < retry_after:
-            return False
-        refresh = BOT_STATE.get("schwab_refresh_token") or get_env("SCHWAB_REFRESH_TOKEN")
-        if refresh:
-            schwab_refresh(refresh)
-        else:
-            schwab_get_token_cc()
-    return bool(_current_schwab_access_token())
+    if hard_valid:
+        return True
+    schwab_get_token_cc()
+    return False
 
 def _sync_schwab_token_to_engine(access_token: str, refresh_token: str,
                                  expires_in: int = 1800):
@@ -1222,11 +1287,10 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
         BOT_STATE["schwab_token"] = new_access_token
         BOT_STATE["schwab_refresh_token"] = d.get("refresh_token", refresh_token)
         BOT_STATE["schwab_token_expiry"] = datetime.now() + timedelta(
-            seconds=max(30, expires_in - 60)
+            seconds=max(30, expires_in)
         )
         BOT_STATE["schwab_oauth_diagnostic"] = None
-        BOT_STATE["schwab_refresh_retry_after_monotonic"] = 0.0
-        BOT_STATE["schwab_refresh_backoff_seconds"] = 30
+        _reset_schwab_edge_state()
         try:
             _persist_schwab_credentials(
                 BOT_STATE["schwab_token"],
@@ -1258,6 +1322,8 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
             _mark_schwab_expired(
                 "Schwab rechazó la renovación OAuth. Se requiere una nueva autorización."
             )
+        elif bool(diag.get("edge_access_denied")):
+            _record_schwab_edge_denial(diag)
         elif bool(diag.get("transient")):
             backoff = max(
                 30, min(300, int(
@@ -1270,7 +1336,7 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
             BOT_STATE["schwab_refresh_backoff_seconds"] = min(300, backoff * 2)
             _set_schwab_auth_state(
                 "unavailable",
-                "Schwab bloqueó temporalmente la renovación en su capa de acceso; "
+                "Schwab devolvió un fallo temporal; "
                 f"reintento automático en {backoff}s.",
                 verified=False,
                 cache_seconds=backoff,
@@ -2064,7 +2130,7 @@ def schwab_connect():
             BOT_STATE["schwab_refresh_token"] = d.get("refresh_token", "")
             expires_in = int(d.get("expires_in", 1800))
             BOT_STATE["schwab_token_expiry"] = datetime.now() + timedelta(
-                seconds=max(30, expires_in - 60)
+                seconds=max(30, expires_in)
             )
             BOT_STATE["schwab_reauthorization_required"] = False
             BOT_STATE["schwab_oauth_diagnostic"] = None
