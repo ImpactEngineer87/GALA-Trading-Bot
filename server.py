@@ -2054,6 +2054,135 @@ def schwab_auth_url_route():
     })
 
 
+def _probe_schwab_route(url: str, *, params: dict = None) -> dict:
+    """Read-only network-path probe; never sends account tokens or secrets."""
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers={
+                "User-Agent": "GALA10-Chocoletra/3.3.12",
+                "Accept": "*/*",
+                "Cache-Control": "no-cache",
+            },
+            timeout=8,
+            allow_redirects=False,
+        )
+        diag = build_safe_diagnostic(
+            response,
+            phase="network_probe",
+            client_id=get_env("SCHWAB_CLIENT_ID"),
+            redirect_uri=SCHWAB_REDIRECT_URI,
+        )
+        return {
+            "ok": not bool(diag.get("edge_access_denied")),
+            "http_status": int(response.status_code or 0),
+            "content_type": str(response.headers.get("Content-Type") or "")[:120],
+            "edge_access_denied": bool(diag.get("edge_access_denied")),
+            "edge_reference": diag.get("edge_reference"),
+            "edge_url": diag.get("edge_url"),
+        }
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "http_status": 0,
+            "network_error": type(exc).__name__,
+            "edge_access_denied": False,
+            "edge_reference": None,
+            "edge_url": None,
+        }
+
+
+@app.route('/api/schwab/network-diagnostics', methods=['POST'])
+def schwab_network_diagnostics():
+    """Diagnose whether this machine's route/IP is being blocked by Schwab edge."""
+    host = "api.schwabapi.com"
+    addresses = []
+    dns_error = ""
+    try:
+        addresses = sorted({
+            item[4][0]
+            for item in socket.getaddrinfo(
+                host, 443, type=socket.SOCK_STREAM
+            )
+            if item and item[4]
+        })[:8]
+    except OSError as exc:
+        dns_error = type(exc).__name__
+
+    cid = get_env("SCHWAB_CLIENT_ID").strip()
+    authorize = _probe_schwab_route(
+        SCHWAB_AUTH_URL,
+        params={
+            "client_id": cid,
+            "redirect_uri": SCHWAB_REDIRECT_URI,
+            "response_type": "code",
+            "state": "network-diagnostic",
+        },
+    )
+    # GET is intentionally the wrong method for /oauth/token. Reaching Schwab's
+    # application should return a normal 4xx/405-style response. An Akamai HTML
+    # Access Denied here proves the path is blocked before OAuth evaluates data.
+    token_endpoint = _probe_schwab_route(SCHWAB_TOKEN_URL)
+    trader = _probe_schwab_route(
+        f"{SCHWAB_TRADE_URL}/accounts/accountNumbers"
+    )
+
+    probes = {
+        "authorize": authorize,
+        "token_endpoint": token_endpoint,
+        "trader": trader,
+    }
+    edge_rows = [
+        row for row in probes.values()
+        if bool(row.get("edge_access_denied"))
+    ]
+    references = list(dict.fromkeys(
+        str(row.get("edge_reference") or "")
+        for row in edge_rows
+        if row.get("edge_reference")
+    ))
+    if dns_error or not addresses:
+        conclusion = "DNS_OR_NETWORK_FAILURE"
+        recommendation = (
+            "La máquina no resolvió correctamente api.schwabapi.com. "
+            "Revise DNS/Internet antes de OAuth."
+        )
+    elif edge_rows:
+        conclusion = "EDGE_ROUTE_BLOCKED"
+        recommendation = (
+            "La ruta/IP pública de esta máquina está siendo bloqueada por "
+            "Schwab/Akamai. Repetir OAuth desde la misma red probablemente fallará. "
+            "Cambie de red/IP pública (por ejemplo hotspot), ejecute este diagnóstico "
+            "otra vez y solo después genere un código OAuth nuevo. Si persiste, "
+            "contacte Schwab Trader API con el Reference ID."
+        )
+    else:
+        conclusion = "ROUTE_REACHABLE"
+        recommendation = (
+            "No se detectó un bloqueo HTML de Schwab/Akamai en este momento. "
+            "Genere un código OAuth nuevo e intente conectarlo una sola vez."
+        )
+
+    result = {
+        "status": "ok",
+        "version": "3.3.12",
+        "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "host": host,
+        "dns_addresses": addresses,
+        "dns_error": dns_error or None,
+        "conclusion": conclusion,
+        "same_network_retry_recommended": conclusion == "ROUTE_REACHABLE",
+        "references": references,
+        "recommendation": recommendation,
+        "probes": probes,
+    }
+    BOT_STATE["schwab_network_diagnostic"] = result
+    if references:
+        BOT_STATE["schwab_edge_last_reference"] = references[-1]
+    return jsonify(result)
+
+
 @app.route('/api/schwab/connect', methods=['POST'])
 def schwab_connect():
     from api.schwab_oauth import parse_authorization_input
