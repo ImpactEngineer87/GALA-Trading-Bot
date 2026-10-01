@@ -1,0 +1,15 @@
+GALA10 v3.3.11 -> v3.3.12
+
+VERSION
+server.py
+dashboard/index.html
+api/schwab_oauth.py
+api/schwab_client.py
+agents/signal_learning_store.py
+tests/test_v3_3_12_schwab_edge_recovery.py
+tests/test_v3_3_11_processing_training_visibility.py
+tests/test_v3_3_10_signal_learning_all_filter.py
+tests/test_v3_3_9_signal_learning_visibility.py
+CHANGELOG_V3_3_12.md
+UPGRADE_V3_3_11_TO_V3_3_12.md
+V3_3_12_VALIDATION.md
