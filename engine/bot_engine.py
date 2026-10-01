@@ -2357,6 +2357,10 @@ class ChocoletraBot:
         """
         with self._lock:
             if not self._activo:
+                self._set_ticker_processing(
+                    ticker, "BLOCKED", "ENGINE", "ENGINE_STOPPING",
+                    gala_signal=tipo,
+                )
                 return False
             if ticker in getattr(self, '_ticker_quarantine', {}) and self.execution_mode_for(ticker) == 'REAL':
                 return False
@@ -2446,6 +2450,10 @@ class ChocoletraBot:
         tipo = decision.tipo
 
         if self._daily_blocked():
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "RISK", "DAILY_LOSS_BLOCK",
+                gala_signal=tipo, ai_decision="APPROVED",
+            )
             self._emit_log(
                 "WARN",
                 f"[{ticker}] Señal {tipo} ignorada: límite diario activo",
@@ -2467,15 +2475,27 @@ class ChocoletraBot:
             if pos is not None:
                 if pos.get("reservado"):
                     # Otra hebra ya está abriendo este ticker → no duplicar
+                    self._set_ticker_processing(
+                        ticker, "BLOCKED", "POSITION", "ENTRY_ALREADY_RESERVED",
+                        gala_signal=tipo,
+                    )
                     return
                 if pos["tipo"] == tipo:
                     self._emit_log("INFO", f"[{ticker}] Señal {tipo} repetida — se mantiene (sin adicionar)")
+                    self._set_ticker_processing(
+                        ticker, "BLOCKED", "POSITION", "SAME_SIDE_POSITION_EXISTS",
+                        gala_signal=tipo,
+                    )
                     return
                 if not self.reversion_activa:
                     self._emit_log("INFO", f"[{ticker}] Reversión desactivada — se ignora giro de señal")
                     self._registrar_senal_no_ejecutada(
                         decision, reason="REVERSAL_DISABLED",
                         source_kind="POLICY_BLOCK", training_candidate=False,
+                    )
+                    self._set_ticker_processing(
+                        ticker, "BLOCKED", "REVERSAL", "REVERSAL_DISABLED",
+                        gala_signal=tipo,
                     )
                     return
                 if pos.get("pendiente"):
@@ -2625,6 +2645,10 @@ class ChocoletraBot:
                 )
             if reverse:
                 self._reversal_contexts.pop(ticker, None)
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "EXECUTION", "ENTRY_SLOT_NOT_AVAILABLE",
+                gala_signal=tipo, ai_decision="APPROVED",
+            )
             return
         # try/finally: si _abrir_operacion LANZA, la reserva DEBE liberarse igual
         # (si no, el hueco 'reservado' bloquea el ticker para siempre).
@@ -2653,6 +2677,11 @@ class ChocoletraBot:
                 ),
                 training_candidate=not policy_only,
             )
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "EXECUTION", miss_reason,
+                gala_signal=tipo, ai_decision="APPROVED",
+                execution="NOT_EXECUTED",
+            )
             if reverse:
                 self._audit_event(
                     "REVERSAL_OPPOSITE_ENTRY_FAILED", ticker=ticker, lado=tipo,
@@ -2672,6 +2701,10 @@ class ChocoletraBot:
         if self._daily_blocked():
             decision.execution_skip_reason = "DAILY_LOSS_BLOCK"
             self._emit_log("WARN", f"[{ticker}] Apertura abortada: límite diario activo")
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "RISK", "DAILY_LOSS_BLOCK",
+                execution="NOT_EXECUTED",
+            )
             return False
         # ATR de la temporalidad micro (sin mutar el DataFrame de la caché)
         from agents import smc_primitives as smc
@@ -2679,6 +2712,10 @@ class ChocoletraBot:
         atr_micro = float(serie_atr.iloc[-1]) if len(serie_atr) else 0.0
         if atr_micro <= 0:
             decision.execution_skip_reason = "ATR_INVALID"
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "RISK", "ATR_INVALID",
+                execution="NOT_EXECUTED",
+            )
             return False
 
         orden = self.gestor_riesgo.calcular_orden(
@@ -2695,6 +2732,10 @@ class ChocoletraBot:
                 "ENTRY_BLOCKED", ticker=ticker, lado=prop.tipo,
                 estado="RISK_REJECTED", precio=precio_actual,
                 motivo="El gestor de riesgo no generó una orden válida",
+            )
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "RISK", "RISK_ORDER_REJECTED",
+                execution="NOT_EXECUTED",
             )
             return False
 
@@ -2738,6 +2779,10 @@ class ChocoletraBot:
                     cantidad=orden.cantidad, precio=orden.precio_limite,
                     motivo=resultado.get("mensaje", ""),
                 )
+                self._set_ticker_processing(
+                    ticker, "BLOCKED", "PAPER_EXECUTION",
+                    decision.execution_skip_reason, execution="REJECTED",
+                )
                 return False
             # Usar la orden AJUSTADA por volatilidad (cantidad real), no la base
             self._registrar_posicion_abierta(
@@ -2746,6 +2791,10 @@ class ChocoletraBot:
                 decision,
                 entry_order_id=resultado.get("order_id", ""),
                 execution_context=resultado,
+            )
+            self._set_ticker_processing(
+                ticker, "EXECUTED", "PAPER_EXECUTION", "PAPER_FILLED",
+                execution="FILLED", quantity=int(orden.cantidad or 0),
             )
             return True
 
@@ -2769,6 +2818,10 @@ class ChocoletraBot:
                     precio=orden.precio_limite,
                     motivo="Cuenta/hash de Schwab no disponible",
                 )
+                self._set_ticker_processing(
+                    ticker, "BLOCKED", "BROKER", "BROKER_ACCOUNT_NOT_READY",
+                    execution="NOT_EXECUTED",
+                )
                 return False
         if not self._asegurar_token_trading():
             decision.execution_skip_reason = "BROKER_OAUTH_UNAVAILABLE"
@@ -2777,6 +2830,10 @@ class ChocoletraBot:
                 "ENTRY_BLOCKED", ticker=ticker, lado=prop.tipo,
                 estado="OAUTH_UNAVAILABLE", cantidad=orden.cantidad,
                 precio=orden.precio_limite,
+            )
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "BROKER", "BROKER_OAUTH_UNAVAILABLE",
+                execution="NOT_EXECUTED",
             )
             return False
         if not self._confirm_real_ticker_flat_before_entry(ticker):
@@ -2788,6 +2845,10 @@ class ChocoletraBot:
                 motivo=(getattr(self, "_broker_reconciliation", {}) or {}).get(
                     "message", "Broker no reconciliado"
                 ),
+            )
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "BROKER", "BROKER_RECONCILIATION_REQUIRED",
+                execution="NOT_EXECUTED",
             )
             return False
         # Antes de ABRIR (sobre todo tras una reversión): garantizar que no queda
@@ -2802,6 +2863,10 @@ class ChocoletraBot:
                 precio=orden.precio_limite,
                 motivo="Persisten órdenes activas del símbolo",
             )
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "BROKER", "BROKER_SYMBOL_NOT_CLEAN",
+                execution="NOT_EXECUTED",
+            )
             return False
         # Última barrera justo antes del envío. Otro worker puede haber activado
         # el kill switch mientras se calculaban niveles o se limpiaban órdenes.
@@ -2811,6 +2876,10 @@ class ChocoletraBot:
             return False
         if not self._reserve_real_capacity(ticker, orden):
             decision.execution_skip_reason = "REAL_CAPACITY_BLOCK"
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "CAPACITY", "REAL_CAPACITY_BLOCK",
+                execution="NOT_EXECUTED",
+            )
             return False
         res = self.ejecutor_hibrido.enviar_entrada(orden, contexto, self.account_number)
         if res.get("status") not in ("OK", "RECONCILIAR"):
@@ -2824,6 +2893,10 @@ class ChocoletraBot:
                 cantidad=orden.cantidad, precio=orden.precio_limite,
                 latency_ms=res.get("latency_ms"),
                 motivo=res.get("mensaje", ""),
+            )
+            self._set_ticker_processing(
+                ticker, "BLOCKED", "BROKER_EXECUTION",
+                decision.execution_skip_reason, execution="REJECTED",
             )
             return False
         if res.get("status") == "RECONCILIAR":
@@ -2866,6 +2939,12 @@ class ChocoletraBot:
                 oid=res.get("order_id", ""),
             )
         self._emit_log("INFO", f"[{ticker}] Entrada REAL colocada, esperando llenado | {orden_aj}")
+        self._set_ticker_processing(
+            ticker, "ORDER_SUBMITTED", "BROKER_EXECUTION",
+            "REAL_ORDER_SUBMITTED", execution="PENDING_FILL",
+            quantity=int(orden_aj.cantidad or 0),
+            order_id=str(res.get("order_id", "") or ""),
+        )
         return True
 
     @staticmethod
