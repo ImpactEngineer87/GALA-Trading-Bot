@@ -38,7 +38,7 @@ import threading
 import uuid
 from contextlib import contextmanager, nullcontext
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict, Callable
 
@@ -1223,8 +1223,21 @@ class ChocoletraBot:
                             except Exception as e:
                                 self._emit_log("ERROR", f"Error inesperado en {ticker}: {e}")
                 except _DailyLossCycleBlocked:
-                    pass
+                    for _ticker in list(getattr(self, "tickers", []) or []):
+                        self._set_ticker_processing(
+                            _ticker, "BLOCKED", "CYCLE", "DAILY_LOSS_BLOCK"
+                        )
                 except Exception as e:
+                    # A cycle-level failure can happen before the worker pool (for
+                    # example broker orphan reconciliation during an OAuth outage).
+                    # Make that visible for every ticker instead of leaving stale
+                    # rows that look as if only 2-3 machines were running.
+                    for _ticker in list(getattr(self, "tickers", []) or []):
+                        self._set_ticker_processing(
+                            _ticker, "BLOCKED", "CYCLE",
+                            f"CYCLE_ERROR:{type(e).__name__}",
+                            detail=str(e)[:240],
+                        )
                     # Un error a NIVEL DE CICLO (timing, reconciliación con el broker,
                     # pool de hilos) NO debe apagar el bot: se registra y se continúa en
                     # el siguiente ciclo. Antes cualquier fallo transitorio de la API se
