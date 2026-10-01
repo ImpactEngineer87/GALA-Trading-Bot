@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.11</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.12</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -782,10 +782,10 @@
         .exec-row-actions .btn{flex:1;justify-content:center;min-height:42px}.exec-mode-select,.exec-shares-input{width:100%;font-size:16px;min-height:44px}
       }
     </style>
-    <div class="card" id="tickerExecutionCard" data-editor-build="v3.3.11-ui1">
+    <div class="card" id="tickerExecutionCard" data-editor-build="v3.3.12-ui1">
       <div class="ticker-exec-head">
         <div>
-          <div class="exec-eyebrow">Control de ejecución · v3.3.11 · Editor 5</div>
+          <div class="exec-eyebrow">Control de ejecución · v3.3.12 · Editor 5</div>
           <h2 class="exec-heading">Tickers y tamaño de las órdenes</h2>
           <p class="exec-muted">Defina los límites de REAL y guarde la cantidad de cada ticker.</p>
         </div>
@@ -923,14 +923,14 @@
           <tbody id="aiLifecycleRows"><tr><td colspan="17">Cargando estado IA…</td></tr></tbody>
         </table>
       </div>
-      <div class="section-note" style="margin-top:8px"><strong>v3.3.11:</strong> x/50 sigue contando únicamente operaciones ejecutadas y cerradas con integridad válida. <strong>Aprendizaje señales</strong> muestra vetos/señales no ejecutadas cuyo resultado hipotético se sigue con velas confirmadas; solo TP/SL no ambiguos pueden complementar el bloque FIT con peso reducido. VALIDACIÓN y TEST continúan usando exclusivamente operaciones reales/PAPER ejecutadas válidas. <span style="color:var(--green)">BA aceptada SHADOW</span> sigue siendo la puntuación histórica del modelo instalado; un reentrenamiento posterior REJECTED no la reemplaza ni degrada el modelo aceptado.</div>
+      <div class="section-note" style="margin-top:8px"><strong>v3.3.12:</strong> x/50 sigue contando únicamente operaciones ejecutadas y cerradas con integridad válida. <strong>Aprendizaje señales</strong> muestra vetos/señales no ejecutadas cuyo resultado hipotético se sigue con velas confirmadas; solo TP/SL no ambiguos pueden complementar el bloque FIT con peso reducido. VALIDACIÓN y TEST continúan usando exclusivamente operaciones reales/PAPER ejecutadas válidas. <span style="color:var(--green)">BA aceptada SHADOW</span> sigue siendo la puntuación histórica del modelo instalado; un reentrenamiento posterior REJECTED no la reemplaza ni degrada el modelo aceptado.</div>
     </div>
 
     <div class="card" id="signalLearningVisibilityCard" style="margin-bottom:16px">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
         <div>
           <div class="card-title" style="margin:0">🔎 Visibilidad · Aprendizaje de señales</div>
-          <div class="section-note">v3.3.11 muestra qué evidencia adicional está observando cada modelo. Esta vista es auditoría/visibilidad: no cambia señales, órdenes, x/50 ni las puertas de VALIDACIÓN/TEST.</div>
+          <div class="section-note">v3.3.12 muestra qué evidencia adicional está observando cada modelo. Esta vista es auditoría/visibilidad: no cambia señales, órdenes, x/50 ni las puertas de VALIDACIÓN/TEST.</div>
         </div>
         <div class="learning-controls">
           <label class="section-note" for="signalLearningTicker">Ticker</label>
@@ -1256,7 +1256,10 @@
           <div style="font-size:.82rem;font-weight:600" id="schwabStatusText">Sin conectar</div>
           <div style="font-size:.72rem;color:var(--txt3)" id="schwabAccountText">—</div>
         </div>
-        <button class="btn btn-ghost btn-sm" style="margin-left:auto" onclick="testSchwab()">🧪 Test</button>
+        <div style="margin-left:auto;display:flex;gap:6px;flex-wrap:wrap">
+          <button id="schwabNetworkDiagBtn" class="btn btn-ghost btn-sm" onclick="diagnoseSchwabNetwork()">🌐 Diagnosticar red</button>
+          <button class="btn btn-ghost btn-sm" onclick="testSchwab()">🧪 Test</button>
+        </div>
       </div>
       <div class="schwab-steps">
         <div class="schwab-step">
@@ -1277,6 +1280,7 @@
             <input id="schwabCodeInput" class="cfg-input" style="margin-top:8px" placeholder="https://127.0.0.1/?code=XXXXXXXX" />
             <button id="schwabConnectBtn" class="btn btn-green btn-sm" style="margin-top:8px" onclick="connectSchwab()">✅ Conectar Schwab</button>
             <div id="schwabOAuthDiagnostic" style="display:none;margin-top:10px;padding:10px 12px;border:1px solid rgba(255,176,32,.35);border-radius:8px;background:rgba(255,176,32,.08);font-size:.72rem;line-height:1.55;color:var(--txt2)"></div>
+            <div id="schwabNetworkDiagnostic" style="display:none;margin-top:10px;padding:10px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg3);font-size:.72rem;line-height:1.6;color:var(--txt2);white-space:pre-wrap"></div>
           </div>
         </div>
       </div>
@@ -2921,10 +2925,13 @@ async function checkSchwabStatus(){
       const dot = el(id);
       if(dot){ dot.className='schwab-dot '+dotState; }
     });
-    el('schwabLabel').textContent = ok ? 'Schwab ✓' : (state === 'expired' ? 'Schwab expirada' : 'Schwab ✗');
+    const edgeCircuit = Boolean(d.edge_circuit_open);
+    el('schwabLabel').textContent = ok ? 'Schwab ✓' : (edgeCircuit ? 'Schwab ruta bloqueada' : (state === 'expired' ? 'Schwab expirada' : 'Schwab ✗'));
     el('schwabStatusText').textContent = ok
       ? '✅ Conectado y verificado'
-      : (state === 'expired' ? '⚠️ Autorización expirada' : (state === 'unavailable' ? '⚠️ Verificación no disponible' : '❌ Sin conectar'));
+      : (edgeCircuit
+          ? '⚠️ Ruta Schwab/Akamai bloqueada · pausa '+Math.ceil(Number(d.edge_circuit_remaining_seconds||0)/60)+' min'
+          : (state === 'expired' ? '⚠️ Autorización expirada' : (state === 'unavailable' ? '⚠️ Verificación no disponible' : '❌ Sin conectar')));
     el('schwabAccountText').textContent = state === 'expired'
       ? 'Vuelve a autorizar en los pasos 1–3 de abajo'
       : (d.account_number ? 'Cuenta: '+d.account_number : (d.message || 'Autoriza en el paso 1-3 de abajo'));
@@ -2952,12 +2959,49 @@ function renderSchwabOAuthDiagnostic(diag){
   if(diag.client_id_tail) rows.push('Client ID: ****'+diag.client_id_tail);
   if(diag.redirect_uri) rows.push('Callback: '+diag.redirect_uri);
   if(diag.recommended_action) rows.push('Acción: '+diag.recommended_action);
-  if(diag.edge_access_denied) rows.push('Tipo: bloqueo temporal de acceso Schwab/Akamai');
-  if(diag.transient) rows.push('Estado: temporal; el bot reintentará con espera progresiva');
+  if(diag.edge_access_denied) rows.push('Tipo: bloqueo de ruta Schwab/Akamai');
+  if(diag.edge_reference) rows.push('Reference ID: '+diag.edge_reference);
+  if(diag.transient) rows.push('Estado: temporal; el bot protege el token válido y limita los reintentos');
+  if(diag.network_recovery_required) rows.push('Recuperación: cambiar red/IP pública y después generar un código OAuth NUEVO');
   if(diag.description) rows.push('Detalle: '+diag.description);
   if(diag.request_id) rows.push('Request ID: '+diag.request_id);
   box.textContent = rows.join(' · ');
   box.style.display = rows.length ? 'block' : 'none';
+}
+
+async function diagnoseSchwabNetwork(){
+  const btn=el('schwabNetworkDiagBtn');
+  const box=el('schwabNetworkDiagnostic');
+  if(btn){btn.disabled=true;btn.textContent='🌐 Diagnosticando…';}
+  try{
+    const r=await api('/api/schwab/network-diagnostics',{method:'POST'});
+    const d=await r.json();
+    if(d.status!=='ok') throw new Error(d.message||'Diagnóstico no disponible');
+    const probes=d.probes||{};
+    const fmt=(name,row)=>{
+      row=row||{};
+      const edge=row.edge_access_denied?' · EDGE BLOCKED':'';
+      const net=row.network_error?' · '+row.network_error:'';
+      return name+': HTTP '+(row.http_status||'—')+edge+net;
+    };
+    const refs=(d.references||[]).length?'\nReference ID: '+(d.references||[]).join(', '):'';
+    const dns=(d.dns_addresses||[]).length?'\nDNS: '+d.dns_addresses.join(', '):'';
+    if(box){
+      box.textContent='Resultado: '+d.conclusion+'\n'+fmt('Authorize',probes.authorize)+'\n'+fmt('Token',probes.token_endpoint)+'\n'+fmt('Trader',probes.trader)+dns+refs+'\n\n'+(d.recommendation||'');
+      box.style.display='block';
+      box.style.borderColor=d.conclusion==='EDGE_ROUTE_BLOCKED'?'rgba(239,68,68,.45)':'rgba(34,197,94,.35)';
+    }
+    if(d.conclusion==='EDGE_ROUTE_BLOCKED'){
+      toast('err','Ruta Schwab bloqueada','Cambie de red/IP pública antes de generar otro código OAuth.');
+    }else{
+      toast('ok','Ruta Schwab','No se detectó bloqueo Akamai ahora; genere un código OAuth nuevo.');
+    }
+  }catch(e){
+    if(box){box.textContent='Diagnóstico falló: '+String(e.message||e);box.style.display='block';}
+    toast('err','Diagnóstico Schwab',String(e.message||e));
+  }finally{
+    if(btn){btn.disabled=false;btn.textContent='🌐 Diagnosticar red';}
+  }
 }
 
 async function connectSchwab(){
@@ -3422,7 +3466,7 @@ async function showExecutionDiagnostics(){
     const d=await (await api('/api/execution-diagnostics')).json();
     if(d.status!=='ok') throw new Error(d.message || 'No hay datos');
     const sum=d.summary||{};
-    showV330Dialog(`<h2>Calidad de ejecución · v3.3.11</h2><p>${escHtml(d.scope)}</p>
+    showV330Dialog(`<h2>Calidad de ejecución · v3.3.12</h2><p>${escHtml(d.scope)}</p>
       <p>PnL de señales: ${metricV330(sum.strategy_pnl_usd,' USD')} · PnL real comparable: ${metricV330(sum.actual_pnl_matched_usd,' USD')} · Coste de ejecución medido: ${metricV330(sum.execution_loss_usd,' USD')} · Spread medio: ${metricV330(sum.average_spread,' USD')}</p>
       <p>${escHtml(d.attribution_note)}</p><table class="ai-life-table"><thead><tr><th>Ticker</th><th>Modo / etapa</th><th>Señal</th><th>Solicitado</th><th>Límite</th><th>Fill</th><th>Spread</th><th>Slippage USD</th><th>Motivo</th></tr></thead><tbody>${(d.orders||[]).slice(-50).reverse().map(o=>`<tr><td>${escHtml(o.ticker)}</td><td>${escHtml(o.mode)} / ${escHtml(o.role)}</td><td>${metricV330(o.signal_price)}</td><td>${metricV330(o.requested_price)}</td><td>${metricV330(o.limit_price)}</td><td>${metricV330(o.fill_price)}</td><td>${metricV330(o.spread)}</td><td>${metricV330(o.slippage_usd)}</td><td>${escHtml(o.exit_reason||'—')}</td></tr>`).join('')}</tbody></table>`);
   } catch(e){ toast('err','Ejecución',String(e)); }
