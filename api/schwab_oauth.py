@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Shared Schwab OAuth helpers.
 
-v3.3.8 goals:
+v3.3.11 goals:
 - one process-wide lock for authorization-code / refresh token exchanges
 - safe diagnostics that never expose client secrets, auth codes, access tokens,
   or refresh tokens
@@ -138,8 +138,24 @@ def build_safe_diagnostic(
         secrets_to_redact,
     )
     status = int(getattr(response, "status_code", 0) or 0)
+    desc_lower = description.lower()
+    # Schwab/Akamai occasionally returns an HTML Access Denied page instead of
+    # an OAuth JSON body.  That is an edge/network denial, not proof that the
+    # client credentials or refresh grant are invalid.
+    edge_access_denied = bool(
+        status == 403
+        and not oauth_error
+        and (
+            "access denied" in desc_lower
+            or "edgesuite" in desc_lower
+            or "<html" in desc_lower
+            or "<!doctype html" in desc_lower
+        )
+    )
 
-    if oauth_error == "invalid_client":
+    if edge_access_denied:
+        action = "RETRY_EDGE_ACCESS"
+    elif oauth_error == "invalid_client":
         action = "CHECK_CLIENT_CREDENTIALS"
     elif oauth_error == "invalid_grant":
         action = "NEW_AUTHORIZATION_CODE"
@@ -170,6 +186,10 @@ def build_safe_diagnostic(
         "client_id_tail": client_id_tail(client_id),
         "redirect_uri": redirect_uri,
         "request_id": request_id or None,
+        "edge_access_denied": edge_access_denied,
+        "transient": bool(
+            edge_access_denied or status == 429 or status >= 500
+        ),
     }
 
 
