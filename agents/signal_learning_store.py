@@ -70,7 +70,7 @@ def _timestamp(value=None) -> str:
 class SignalLearningStore:
     """Thread-safe ledger for non-executed GALA10 signal outcomes."""
 
-    VERSION = "3.3.10"
+    VERSION = "3.3.11"
 
     def __init__(
         self,
