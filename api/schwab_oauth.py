@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Shared Schwab OAuth helpers.
 
-v3.3.11 goals:
+v3.3.12 goals:
 - one process-wide lock for authorization-code / refresh token exchanges
 - safe diagnostics that never expose client secrets, auth codes, access tokens,
   or refresh tokens
@@ -11,6 +11,7 @@ v3.3.11 goals:
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 import threading
@@ -23,6 +24,12 @@ from requests.auth import HTTPBasicAuth
 
 TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token"
 DEFAULT_REDIRECT_URI = "https://127.0.0.1"
+OAUTH_USER_AGENT = "GALA10-Chocoletra/3.3.12"
+OAUTH_FORM_HEADERS = {
+    "Content-Type": "application/x-www-form-urlencoded",
+    "User-Agent": OAUTH_USER_AGENT,
+    "Cache-Control": "no-cache",
+}
 
 # Shared by dashboard + engine/client instances in the same Python process.
 OAUTH_ROTATION_LOCK = threading.RLock()
@@ -153,8 +160,34 @@ def build_safe_diagnostic(
         )
     )
 
+    decoded_description = html.unescape(description or "")
+    edge_reference = ""
+    edge_url = ""
     if edge_access_denied:
-        action = "RETRY_EDGE_ACCESS"
+        ref_match = re.search(
+            r"(?i)Reference\s*#?\s*([A-Za-z0-9.\-]+)",
+            decoded_description,
+        )
+        if ref_match:
+            edge_reference = ref_match.group(1)[:160]
+        url_match = re.search(
+            r"https?://errors\.edgesuite\.net/[^\s<>'\"]+",
+            decoded_description,
+        )
+        if url_match:
+            edge_url = url_match.group(0)[:300]
+        # The HTML body itself adds noise and can mislead operators into
+        # changing valid credentials. Preserve only an actionable description.
+        description = (
+            "Schwab/Akamai bloqueó esta ruta de red antes de que OAuth "
+            "respondiera. Cambiar/recrear Client ID o Secret no resuelve este "
+            "tipo de 403 mientras se use la misma ruta/IP pública."
+        )
+        action = (
+            "CHANGE_NETWORK_THEN_NEW_CODE"
+            if phase == "authorization_code_exchange"
+            else "EDGE_CIRCUIT_BREAKER"
+        )
     elif oauth_error == "invalid_client":
         action = "CHECK_CLIENT_CREDENTIALS"
     elif oauth_error == "invalid_grant":
@@ -187,6 +220,9 @@ def build_safe_diagnostic(
         "redirect_uri": redirect_uri,
         "request_id": request_id or None,
         "edge_access_denied": edge_access_denied,
+        "edge_reference": edge_reference or None,
+        "edge_url": edge_url or None,
+        "network_recovery_required": bool(edge_access_denied),
         "transient": bool(
             edge_access_denied or status == 429 or status >= 500
         ),
@@ -234,7 +270,7 @@ def exchange_authorization_code(
         response = post(
             TOKEN_URL,
             auth=HTTPBasicAuth(cid, secret),
-            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            headers=dict(OAUTH_FORM_HEADERS),
             data={
                 "grant_type": "authorization_code",
                 "code": auth_code,
@@ -287,7 +323,7 @@ def refresh_oauth_token(
         response = post(
             TOKEN_URL,
             auth=HTTPBasicAuth(cid, secret),
-            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            headers=dict(OAUTH_FORM_HEADERS),
             data={"grant_type": "refresh_token", "refresh_token": refresh},
             timeout=timeout,
         )
