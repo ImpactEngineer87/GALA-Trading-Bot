@@ -19,6 +19,7 @@ import yaml
 import hashlib
 import hmac
 import secrets
+import socket
 import threading
 import time
 import uuid
@@ -59,6 +60,7 @@ from api.schwab_oauth import (
     DEFAULT_REDIRECT_URI as SCHWAB_REDIRECT_URI,
     OAUTH_ROTATION_LOCK,
     SchwabOAuthFailure,
+    build_safe_diagnostic,
     code_fingerprint,
     exchange_authorization_code,
     refresh_oauth_token,
@@ -120,6 +122,10 @@ BOT_STATE = {
     "schwab_oauth_last_code_fingerprint": "",
     "schwab_refresh_retry_after_monotonic": 0.0,
     "schwab_refresh_backoff_seconds": 30,
+    "schwab_edge_denial_count": 0,
+    "schwab_edge_circuit_until_monotonic": 0.0,
+    "schwab_edge_last_reference": "",
+    "schwab_network_diagnostic": None,
     "account_number":       os.getenv("SCHWAB_ACCOUNT_NUMBER", ""),
 }
 
@@ -927,6 +933,10 @@ def _clear_schwab_oauth_tokens(reason: str = "Credenciales OAuth modificadas"):
     BOT_STATE["schwab_oauth_last_code_fingerprint"] = ""
     BOT_STATE["schwab_refresh_retry_after_monotonic"] = 0.0
     BOT_STATE["schwab_refresh_backoff_seconds"] = 30
+    BOT_STATE["schwab_edge_denial_count"] = 0
+    BOT_STATE["schwab_edge_circuit_until_monotonic"] = 0.0
+    BOT_STATE["schwab_edge_last_reference"] = ""
+    BOT_STATE["schwab_network_diagnostic"] = None
     _set_schwab_auth_state(
         "not_connected",
         f"{reason}. Complete una autorización OAuth nueva.",
@@ -1102,6 +1112,20 @@ def _schwab_auth_snapshot() -> dict:
         "next_verification_in_seconds": next_check,
         "notification_interval_seconds": SCHWAB_AUTH_NOTIFICATION_SECONDS,
         "oauth_diagnostic": BOT_STATE.get("schwab_oauth_diagnostic"),
+        "edge_denial_count": int(BOT_STATE.get("schwab_edge_denial_count") or 0),
+        "edge_circuit_open": bool(
+            time.monotonic()
+            < float(BOT_STATE.get("schwab_edge_circuit_until_monotonic") or 0.0)
+        ),
+        "edge_circuit_remaining_seconds": max(
+            0,
+            int(
+                float(BOT_STATE.get("schwab_edge_circuit_until_monotonic") or 0.0)
+                - time.monotonic()
+            ),
+        ),
+        "edge_last_reference": BOT_STATE.get("schwab_edge_last_reference") or "",
+        "network_diagnostic": BOT_STATE.get("schwab_network_diagnostic"),
     }
 
 
