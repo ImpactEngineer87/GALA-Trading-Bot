@@ -118,6 +118,8 @@ BOT_STATE = {
     "schwab_reauthorization_required": False,
     "schwab_oauth_diagnostic": None,
     "schwab_oauth_last_code_fingerprint": "",
+    "schwab_refresh_retry_after_monotonic": 0.0,
+    "schwab_refresh_backoff_seconds": 30,
     "account_number":       os.getenv("SCHWAB_ACCOUNT_NUMBER", ""),
 }
 
@@ -923,6 +925,8 @@ def _clear_schwab_oauth_tokens(reason: str = "Credenciales OAuth modificadas"):
     BOT_STATE["schwab_reauthorization_required"] = True
     BOT_STATE["schwab_oauth_diagnostic"] = None
     BOT_STATE["schwab_oauth_last_code_fingerprint"] = ""
+    BOT_STATE["schwab_refresh_retry_after_monotonic"] = 0.0
+    BOT_STATE["schwab_refresh_backoff_seconds"] = 30
     _set_schwab_auth_state(
         "not_connected",
         f"{reason}. Complete una autorización OAuth nueva.",
@@ -1128,12 +1132,16 @@ def schwab_get_token_cc() -> bool:
     return False
 
 def schwab_ensure_token():
-    """Renueva el token si esta por expirar."""
+    """Renueva el token con backoff para fallos transitorios de Schwab."""
     if BOT_STATE.get("schwab_reauthorization_required"):
         return False
     expiry = BOT_STATE.get("schwab_token_expiry")
     if not expiry or datetime.now() >= expiry:
-        # Intentar refresh primero
+        retry_after = float(
+            BOT_STATE.get("schwab_refresh_retry_after_monotonic") or 0.0
+        )
+        if time.monotonic() < retry_after:
+            return False
         refresh = BOT_STATE.get("schwab_refresh_token") or get_env("SCHWAB_REFRESH_TOKEN")
         if refresh:
             schwab_refresh(refresh)
@@ -1193,6 +1201,8 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
             seconds=max(30, expires_in - 60)
         )
         BOT_STATE["schwab_oauth_diagnostic"] = None
+        BOT_STATE["schwab_refresh_retry_after_monotonic"] = 0.0
+        BOT_STATE["schwab_refresh_backoff_seconds"] = 30
         try:
             _persist_schwab_credentials(
                 BOT_STATE["schwab_token"],
@@ -1223,6 +1233,23 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
         if oauth_error in {"invalid_grant", "invalid_token", "invalid_client"}:
             _mark_schwab_expired(
                 "Schwab rechazó la renovación OAuth. Se requiere una nueva autorización."
+            )
+        elif bool(diag.get("transient")):
+            backoff = max(
+                30, min(300, int(
+                    BOT_STATE.get("schwab_refresh_backoff_seconds") or 30
+                ))
+            )
+            BOT_STATE["schwab_refresh_retry_after_monotonic"] = (
+                time.monotonic() + backoff
+            )
+            BOT_STATE["schwab_refresh_backoff_seconds"] = min(300, backoff * 2)
+            _set_schwab_auth_state(
+                "unavailable",
+                "Schwab bloqueó temporalmente la renovación en su capa de acceso; "
+                f"reintento automático en {backoff}s.",
+                verified=False,
+                cache_seconds=backoff,
             )
         else:
             _set_schwab_auth_state(
@@ -2449,6 +2476,46 @@ def get_status():
         "daily_risk": _engine_daily_risk_snapshot(),
         "scheduler": _scheduler_status(),
         "broker_reconciliation": _engine_broker_reconciliation_snapshot(),
+    })
+
+
+def _engine_ticker_processing_snapshot():
+    engine = globals().get("_ENGINE")
+    if engine is not None and hasattr(engine, "ticker_processing_snapshot"):
+        try:
+            return engine.ticker_processing_snapshot()
+        except Exception as exc:
+            _log("WARN", f"[TickerHealth] snapshot falló: {type(exc).__name__}")
+    cfg = _read_config_runtime()
+    rows = []
+    for row in _ticker_execution_rows(cfg, persist_missing=False):
+        rows.append({
+            "ticker": row.get("ticker"),
+            "mode": row.get("effective_mode") or row.get("mode") or "PAPER",
+            "status": "WAITING" if BOT_STATE.get("running") else "ENGINE_STOPPED",
+            "stage": "IDLE",
+            "reason": "No runtime cycle available",
+            "updated_utc": "",
+            "cycles_seen": 0,
+            "quarantined": False,
+            "quarantine_reason": "",
+        })
+    return rows
+
+
+@app.route('/api/ticker-processing')
+def ticker_processing_status():
+    rows = _engine_ticker_processing_snapshot()
+    counts = defaultdict(int)
+    for row in rows:
+        counts[str(row.get("status") or "UNKNOWN").upper()] += 1
+    return jsonify({
+        "status": "ok",
+        "version": "3.3.11",
+        "running": bool(BOT_STATE.get("running")),
+        "tickers": rows,
+        "counts": dict(counts),
+        "updated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     })
 
 
@@ -4308,6 +4375,16 @@ def ai_signal_learning_visibility():
             item["executed_valid"] = int(life.get("eligible_observations", 0) or 0)
             item["x50_progress"] = int(life.get("new_observations", 0) or 0)
             item["x50_target"] = int(life.get("retrain_samples", 50) or 50)
+            item["retrain_status"] = str(life.get("status", "COLLECTING") or "COLLECTING")
+            item["last_retrain_result"] = str(life.get("last_result", "") or "")
+            item["last_retrain_utc"] = str(life.get("last_attempt_utc", "") or "")
+            item["last_retrain_reason"] = str(life.get("last_reason", "") or "")
+            item["last_supplemental_fit_samples"] = int(
+                life.get("last_supplemental_fit_samples", 0) or 0
+            )
+            item["last_signal_learning_weight"] = float(
+                life.get("last_signal_learning_weight", 0.0) or 0.0
+            )
             rows.append(item)
         if wanted:
             rows = [r for r in rows if str(r.get("ticker", "") or "").upper() == wanted]
@@ -4326,6 +4403,15 @@ def ai_signal_learning_visibility():
             "learning_excluded": sum(int(r.get("learning_excluded", 0) or 0) for r in rows),
             "learning_ambiguous": sum(int(r.get("learning_ambiguous", 0) or 0) for r in rows),
             "learning_timeout": sum(int(r.get("learning_timeout", 0) or 0) for r in rows),
+            "retraining_now": sum(
+                1 for r in rows if str(r.get("retrain_status", "")).upper() == "TRAINING"
+            ),
+            "retraining_pending": sum(
+                1 for r in rows if str(r.get("retrain_status", "")).upper() == "PENDING_RETRAIN"
+            ),
+            "last_supplemental_fit_samples": sum(
+                int(r.get("last_supplemental_fit_samples", 0) or 0) for r in rows
+            ),
         }
         useful_den = totals["learning_avoided_losses"] + totals["learning_blocked_winners"]
         totals["learning_usefulness_pct"] = (
@@ -4338,7 +4424,7 @@ def ai_signal_learning_visibility():
             counterfactual_weight = 0.35
         return jsonify({
             "status": "ok",
-            "version": "3.3.10",
+            "version": "3.3.11",
             "ticker": wanted or None,
             "summary": totals,
             "tickers": rows,
@@ -4347,6 +4433,10 @@ def ai_signal_learning_visibility():
                 "counts_toward_x50": False,
                 "validation_test_actual_only": True,
                 "counterfactual_fit_weight": counterfactual_weight,
+                "retrain_trigger_actual_closes_only": True,
+                "auto_retrain_enabled": bool(getattr(trainer, "auto_retrain_enabled", False)),
+                "only_after_session": bool(getattr(trainer, "auto_retrain_only_after_session", False)),
+                "retrain_samples": int(getattr(trainer, "retrain_trigger_samples", 50) or 50),
             },
         })
     except Exception as exc:
