@@ -1390,7 +1390,14 @@ class ChocoletraBot:
         except Exception:
             pass
         broker_flat = True
-        if self._has_real_tickers() and self.ks_liquidar_apagar:
+        if self._has_real_tickers():
+            # Stopping computation is not evidence that exposure was closed.
+            # Even a configured stop-without-liquidation must retain the engine
+            # recovery context and report the broker's actual state.
+            if not self.ks_liquidar_apagar or already_stopped:
+                broker_state = self._refresh_broker_reconciliation(
+                    context="STOP_VERIFY", require_flat=True
+                )
             broker_flat = bool(broker_state.get("ok") and broker_state.get("flat"))
         if broker_flat:
             self._emit_log("INFO", "Motor detenido correctamente — broker plano confirmado")
@@ -1654,13 +1661,6 @@ class ChocoletraBot:
             ticker, "PROCESSING", "GALA10_SIGNAL", "",
             gala_signal=senal_gala10,
         )
-        if not self.agentes_activos:
-            self._set_ticker_processing(
-                ticker, "BLOCKED", "AGENTS", "AGENTS_DISABLED",
-                gala_signal=senal_gala10,
-            )
-            return
-
         # v2.9.3: una señal opuesta a una posición ya abierta tiene DOS efectos
         # distintos: (1) cerrar la posición actual y (2) eventualmente abrir la
         # opuesta. La IA de producción puede vetar (2), pero nunca debe dejar una
@@ -1682,6 +1682,18 @@ class ChocoletraBot:
                 and not _pos_signal.get("pendiente")
                 and _pos_signal.get("tipo") == "BUY"
             )
+
+        if not self.agentes_activos:
+            if _opposite_existing:
+                self._close_opposite_without_entry(
+                    ticker, senal_gala10, precio_actual, "AGENTS_DISABLED"
+                )
+            else:
+                self._set_ticker_processing(
+                    ticker, "BLOCKED", "AGENTS", "AGENTS_DISABLED",
+                    gala_signal=senal_gala10,
+                )
+            return
 
         # En long-only, SELL sigue siendo válida para CERRAR un LONG existente.
         # Solo se bloquea SELL cuando implicaría ABRIR un SHORT desde OUT.
@@ -1718,6 +1730,11 @@ class ChocoletraBot:
             and not self.orquestador.entrenador.modelo_disponible(ticker)
         ):
             self._quarantine_real_ticker(ticker, 'Production model unavailable')
+            if _opposite_existing:
+                self._close_opposite_without_entry(
+                    ticker, senal_gala10, precio_actual, "REAL_MODEL_REQUIRED"
+                )
+                return
             self._emit_log(
                 "ERROR",
                 f"[{ticker}] Señal {senal_gala10} bloqueada: modo real exige "
@@ -1761,6 +1778,11 @@ class ChocoletraBot:
         except Exception as e:
             self._emit_log("ERROR", f"[{ticker}] Error en auditoría de agentes: {e}")
             self._quarantine_real_ticker(ticker, 'AI inference failed')
+            if _opposite_existing:
+                self._close_opposite_without_entry(
+                    ticker, senal_gala10, precio_actual, "AI_INFERENCE_FAILED"
+                )
+                return
             self._set_ticker_processing(
                 ticker, "ERROR", "AI_INFERENCE", "AI_INFERENCE_FAILED",
                 gala_signal=senal_gala10, detail=type(e).__name__,
@@ -1854,17 +1876,18 @@ class ChocoletraBot:
                     "pero se cerrará la posición vigente y quedará OUT.",
                 )
                 with self.ejecutor_hibrido.secuencia_simbolo(ticker):
-                    self._cerrar_posicion(
+                    closed = self._cerrar_posicion(
                         ticker, precio_actual,
                         motivo=f"señal opuesta {senal_gala10} (entrada IA vetada)",
                     )
                 self._registrar_no_op(decision)
                 self._set_ticker_processing(
-                    ticker, "VETOED", "AI_DECISION", "AI_VETO_CLOSE_ONLY",
+                    ticker, "VETOED" if closed else "BLOCKED", "AI_DECISION",
+                    "AI_VETO_CLOSE_ONLY" if closed else "OPPOSITE_CLOSE_NOT_CONFIRMED",
                     gala_signal=senal_gala10, ai_decision="VETO_CLOSE_ONLY",
                     ai_probability=getattr(decision, "prob_meta", None),
                     ai_threshold=self._effective_ai_threshold(decision, ticker),
-                    execution="CLOSE_ONLY",
+                    execution="CLOSE_ONLY" if closed else "CLOSE_NOT_CONFIRMED",
                 )
                 return
             signal_row = self._emit_signal(
@@ -1896,6 +1919,49 @@ class ChocoletraBot:
         # 6) Reversión o apertura
         with self.ejecutor_hibrido.secuencia_simbolo(ticker):
             self._abrir_o_revertir(decision, precio_actual, df_micro)
+
+    def _close_opposite_without_entry(self, ticker, side, price, entry_block_reason):
+        """An unavailable entry auditor must not suppress a verified signal exit.
+
+        Called only after real, closed-bar market data produced a GALA10 signal.
+        It never opens the opposite side and uses the existing broker-confirmed
+        close path, including cancellation, token, and duplicate-order guards.
+        """
+        with self.ejecutor_hibrido.secuencia_simbolo(ticker):
+            with self._lock:
+                pos = self._posiciones.get(ticker)
+                opposite = bool(
+                    self._activo and pos
+                    and not pos.get("reservado") and not pos.get("pendiente")
+                    and ((pos.get("tipo") == "BUY" and side == "SELL")
+                         or (pos.get("tipo") == "SELL" and side == "BUY"))
+                )
+            if not opposite:
+                return False
+            mode = "PAPER" if self._is_paper_ticker(ticker, pos=pos) else "REAL"
+            self._emit_signal(
+                side, ticker, price, 0.0, None,
+                motivo="AI_UNAVAILABLE_CLOSE_ONLY:" + entry_block_reason,
+                execution_mode=mode, ai_decision="UNAVAILABLE_CLOSE_ONLY",
+                ai_context={"entry_block_reason": entry_block_reason},
+            )
+            closed = self._cerrar_posicion(
+                ticker, price,
+                motivo=f"señal opuesta {side} (entrada bloqueada: {entry_block_reason})",
+            )
+            self._set_ticker_processing(
+                ticker, "CLOSED_TO_OUT" if closed else "BLOCKED", "CLOSE_ONLY",
+                entry_block_reason if closed else "OPPOSITE_CLOSE_NOT_CONFIRMED",
+                gala_signal=side, ai_decision="UNAVAILABLE_CLOSE_ONLY",
+                execution="CLOSE_ONLY" if closed else "CLOSE_NOT_CONFIRMED",
+                entry_block_reason=entry_block_reason,
+            )
+            self._audit_event(
+                "OPPOSITE_SIGNAL_CLOSE_CONFIRMED" if closed else "OPPOSITE_SIGNAL_CLOSE_FAILED",
+                ticker=ticker, lado=side, estado="OUT" if closed else "UNRESOLVED",
+                precio=price, motivo=entry_block_reason, modo=mode,
+            )
+            return bool(closed)
 
     def _atr_micro(self, df_micro) -> float:
         """ATR de la temporalidad micro (para dimensionar SL/TP de la entrada)."""
@@ -3634,6 +3700,7 @@ class ChocoletraBot:
             ok_orders, ordenes, err_orders = self._broker_read_with_retry(
                 f"órdenes abiertas {ticker}",
                 lambda: self.schwab.obtener_ordenes_abiertas(self.account_number),
+                operation="orders",
             )
             if not ok_orders:
                 # No abrir/cerrar a ciegas si Schwab no confirmó la foto de órdenes.
@@ -5225,7 +5292,7 @@ class ChocoletraBot:
         delay = max(0.0, float(live.get("reconciliation_retry_delay_sec", 0.75) or 0.75))
         return attempts, delay
 
-    def _broker_read_with_retry(self, label: str, callback):
+    def _broker_read_with_retry(self, label: str, callback, *, operation=""):
         """Read broker state with bounded retry; an empty list is a valid success."""
         attempts, delay = self._broker_retry_settings()
         last_error = ""
@@ -5233,7 +5300,9 @@ class ChocoletraBot:
             try:
                 value = callback()
                 if value is None:
-                    raise RuntimeError("respuesta vacía")
+                    reader = getattr(getattr(self, "schwab", None), "broker_read_error", None)
+                    detail = reader(operation) if operation and callable(reader) else ""
+                    raise RuntimeError(detail or "respuesta vacía")
                 if attempt > 1:
                     self._emit_log(
                         "INFO",
@@ -5260,15 +5329,22 @@ class ChocoletraBot:
         already-open position is safely readopted.
         """
         real_tickers = set(self._real_tickers(self.tickers))
-        if not real_tickers or not self.account_number:
+        if not real_tickers:
             return self._set_broker_reconciliation(
                 ok=True, flat=True, context=context,
                 message="Sin tickers REAL activos", positions=[],
                 open_order_symbols=[],
             )
+        if not self.account_number:
+            return self._set_broker_reconciliation(
+                ok=False, flat=False, context=context,
+                message="Cuenta Schwab no configurada; exposición REAL desconocida",
+                positions=[], open_order_symbols=[],
+            )
         ok_pos, positions_raw, err_pos = self._broker_read_with_retry(
             "posiciones",
             lambda: self.schwab.obtener_posiciones(self.account_number),
+            operation="positions",
         )
         if not ok_pos:
             return self._set_broker_reconciliation(
@@ -5279,6 +5355,7 @@ class ChocoletraBot:
         ok_ord, orders_raw, err_ord = self._broker_read_with_retry(
             "órdenes abiertas",
             lambda: self.schwab.obtener_ordenes_abiertas(self.account_number),
+            operation="orders",
         )
         if not ok_ord:
             return self._set_broker_reconciliation(
@@ -5831,3 +5908,4 @@ class ChocoletraBot:
         for tipo, cantidad in conteo.items():
             log_info(f"  {tipo}: {cantidad}")
         return df_resultado
+

@@ -3429,6 +3429,16 @@ def _stop_engine_controlled(source: str):
                 return False, str(exc)
 
         broker_flat = True
+        if bot is None and _real_tickers_runtime(_read_config_runtime()):
+            # A server restart loses the in-memory engine, not broker exposure.
+            # Do not claim FLAT simply because there is no engine to stop.
+            try:
+                state = _refresh_broker_reconciliation_read_only()
+                broker_flat = bool(state.get("ok") and state.get("flat"))
+                result = {"broker_flat": broker_flat, "message": state.get("message", "")}
+            except Exception as exc:
+                broker_flat = False
+                result = {"broker_flat": False, "message": str(exc)}
         if isinstance(result, dict) and "broker_flat" in result:
             broker_flat = bool(result.get("broker_flat"))
         if broker_flat:
@@ -3445,6 +3455,13 @@ def _stop_engine_controlled(source: str):
             (result.get("message") if isinstance(result, dict) else "")
             or "Schwab no confirmó cuenta plana"
         )
+        if bot is None:
+            return False, (
+                "Motor detenido sin contexto de recuperación. "
+                "Schwab NO confirmó posiciones REAL planas: " + message
+                + ". Revise posiciones y órdenes directamente en Schwab. "
+                "Esta comprobación no envió órdenes."
+            )
         _log(
             "ERROR",
             f"[Motor] DETENIDO desde {origen}, PERO QUEDA EXPOSICIÓN REAL: {message}",
@@ -3542,6 +3559,7 @@ def stop_bot():
     return jsonify({
         "status": "ok" if ok else "error",
         "running": False,
+        "broker_flat": bool(ok),
         "message": mensaje,
         "automatic_resume": "next_session"
         if _scheduler_mode() == "automatico" else None,
@@ -5100,3 +5118,4 @@ if __name__ == '__main__':
 
     app.run(host=dashboard_host, port=dashboard_port, debug=False, use_reloader=False,
             threaded=True)
+
