@@ -113,6 +113,7 @@ class SchwabClient:
         self.reauthorization_required = False
         self._auth_retry_after: Optional[datetime] = None
         self._auth_lock = threading.RLock()
+        self._broker_read_errors = threading.local()
         self._auth_warning_emitted = False
         self._oauth_transient_failure = False
         self._oauth_backoff_seconds = 30
@@ -1088,6 +1089,19 @@ class SchwabClient:
             _log(f"[ERROR] obtener_account_hash: {e}")
             return None
 
+    def _broker_read_failed(self, operation, reason, response=None):
+        """Expose a safe, per-thread reason without account URLs or response bodies."""
+        status = getattr(response, "status_code", None)
+        pause = schwab_request_pause()
+        detail = f"HTTP {status}: {reason}" if status is not None else str(reason)
+        if pause.get("paused"):
+            detail = f"COOLDOWN_ACTIVE ({pause.get('retry_after_seconds', 0)}s): {detail}"
+        setattr(self._broker_read_errors, operation, detail)
+        return None
+
+    def broker_read_error(self, operation):
+        return str(getattr(self._broker_read_errors, operation, "") or "")
+
     def obtener_posiciones(self, account_number: str) -> Optional[list]:
         """
         Devuelve las posiciones abiertas REALES de la cuenta Schwab.
@@ -1100,10 +1114,11 @@ class SchwabClient:
         importa: una lista vacía significa 'cuenta plana' y autoriza limpiezas;
         None significa 'no sé' y NO debe interpretarse como plano.
         """
+        self._broker_read_errors.positions = ""
         if not account_number:
-            return None
+            return self._broker_read_failed("positions", "ACCOUNT_NOT_CONFIGURED")
         if not self._asegurar_token():
-            return None
+            return self._broker_read_failed("positions", "AUTH_UNAVAILABLE")
         try:
             r = self._get_autorizado(
                 f"{TRADER_URL}/accounts/{account_number}",
@@ -1111,11 +1126,17 @@ class SchwabClient:
                 timeout=10,
             )
             if r is None:
-                return None
+                return self._broker_read_failed("positions", "AUTH_UNAVAILABLE")
             r.raise_for_status()
-            acc = r.json().get("securitiesAccount", {})
+            payload = r.json()
+            if not isinstance(payload, dict) or not isinstance(payload.get("securitiesAccount"), dict):
+                return self._broker_read_failed("positions", "INVALID_ACCOUNT_RESPONSE", r)
+            acc = payload["securitiesAccount"]
+            rows = acc.get("positions", [])
+            if not isinstance(rows, list):
+                return self._broker_read_failed("positions", "INVALID_POSITIONS_RESPONSE", r)
             out = []
-            for p in acc.get("positions", []):
+            for p in rows:
                 inst = p.get("instrument", {})
                 longq = float(p.get("longQuantity", 0) or 0)
                 shortq = float(p.get("shortQuantity", 0) or 0)
@@ -1130,7 +1151,9 @@ class SchwabClient:
             return out
         except Exception as e:
             _log(f"[ERROR] obtener_posiciones: {e}")
-            return None
+            return self._broker_read_failed(
+                "positions", type(e).__name__, getattr(e, "response", None)
+            )
 
     def obtener_ordenes_abiertas(self, account_number: str) -> list:
         """Devuelve las órdenes de trabajo (WORKING) abiertas de la cuenta.
@@ -1140,10 +1163,11 @@ class SchwabClient:
         ciegos a las órdenes vivas. Se pide una ventana amplia (7 días) para
         cubrir cualquier orden DAY todavía en trabajo.
         """
+        self._broker_read_errors.orders = ""
         if not account_number:
-            return None
+            return self._broker_read_failed("orders", "ACCOUNT_NOT_CONFIGURED")
         if not self._asegurar_token():
-            return None
+            return self._broker_read_failed("orders", "AUTH_UNAVAILABLE")
         ahora = datetime.utcnow()
         desde = ahora - timedelta(days=7)
         # Colchón de +1 día en el límite superior: si el reloj del VPS va atrasado,
@@ -1163,10 +1187,12 @@ class SchwabClient:
                 timeout=10,
             )
             if r is None:
-                return None
+                return self._broker_read_failed("orders", "AUTH_UNAVAILABLE")
             r.raise_for_status()
             data = r.json()
-            return data if isinstance(data, list) else []
+            if not isinstance(data, list):
+                return self._broker_read_failed("orders", "INVALID_ORDERS_RESPONSE", r)
+            return data
         except Exception as e:
             cuerpo = ""
             resp = getattr(e, "response", None)
@@ -1176,7 +1202,9 @@ class SchwabClient:
                 except Exception:
                     cuerpo = ""
             _log(f"[ERROR] obtener_ordenes_abiertas: {e}{cuerpo}")
-            return None  # None = no se pudo consultar (distinto de [] = sin órdenes)
+            return self._broker_read_failed(
+                "orders", type(e).__name__, getattr(e, "response", None)
+            )  # None = desconocido; nunca cuenta plana
 
     # ----------------------------------------------------------
     # COMPATIBILIDAD (alias viejo)
@@ -1186,3 +1214,4 @@ class SchwabClient:
         """Alias para compatibilidad -- ahora intenta datos reales primero."""
         result = self.obtener_velas(ticker, cantidad=cantidad)
         return result if result is not None else self._velas_fallback(ticker, cantidad)
+

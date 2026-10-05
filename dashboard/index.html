@@ -709,6 +709,7 @@
         <div class="broker-sync-actions">
           <div class="broker-sync-failures" id="brokerSyncFailures"></div>
           <button class="btn btn-sm" id="brokerSyncRefresh" onclick="refreshBrokerReconciliation()">Verificar Schwab (solo lectura)</button>
+          <button class="btn btn-sm" id="brokerCloseRetry" hidden onclick="retryStoppedRealClose()" title="Reintenta cancelar órdenes y cerrar exposición REAL usando las verificaciones del bot">Reintentar cierre REAL</button>
         </div>
       </div>
     </div>
@@ -1666,7 +1667,11 @@ function afterLogin(){
 // ─────────────────────────────────────────────────────────
 // BOT TOGGLE
 // ─────────────────────────────────────────────────────────
+let botControlPending = false;
 async function toggleBot(el){
+  if(botControlPending) return;
+  botControlPending = true;
+  el.disabled = true;
   try {
     const ep = el.checked ? '/api/bot/start' : '/api/bot/stop';
     const r  = await api(ep, {
@@ -1676,7 +1681,8 @@ async function toggleBot(el){
     });
     const d  = await r.json();
     if(!r.ok){
-      el.checked = !el.checked;
+      if(typeof d.running === 'boolean') updateBotUI(d.running);
+      else await fetchStatus();
       toast('err','Control del Bot',d.message || 'Operación bloqueada');
       return;
     }
@@ -1685,7 +1691,8 @@ async function toggleBot(el){
     else if(d.automatic_resume === 'next_session')
       toast('info','Bot Detenido','Automático suspendido hasta la próxima sesión');
     else toast('info','Bot Detenido','El bot ha sido pausado');
-  } catch(e){ el.checked = !el.checked; toast('err','Error',String(e)); }
+  } catch(e){ await fetchStatus(); toast('err','Error',String(e)); }
+  finally{ botControlPending = false; el.disabled = false; }
 }
 function updateBotUI(running){
   S.botRunning = running;
@@ -1693,6 +1700,24 @@ function updateBotUI(running){
   const s = document.getElementById('botStatus');
   s.textContent = running ? 'ACTIVO' : 'PARADO';
   s.className = 'bot-status ' + (running ? 'on' : 'off');
+}
+
+async function retryStoppedRealClose(){
+  if(botControlPending || S.botRunning || Date.now()<schwabRetryUntil) return;
+  const btn=el('brokerCloseRetry');
+  botControlPending=true;
+  if(btn){btn.disabled=true;btn.textContent='Verificando cierre…';}
+  try{
+    const r=await api('/api/bot/stop', {method:'POST'});
+    const d=await r.json();
+    if(typeof d.running==='boolean') updateBotUI(d.running);
+    toast(r.ok?'ok':'err','Cierre REAL',d.message || 'Schwab no confirmó el cierre');
+  }catch(err){toast('err','Cierre REAL',String(err.message || err));}
+  finally{
+    botControlPending=false;
+    if(btn) btn.textContent='Reintentar cierre REAL';
+    await Promise.allSettled([fetchStatus(),fetchTrades()]);
+  }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1773,6 +1798,13 @@ function updateBrokerReconciliation(state){
   if(title) title.textContent = ok
     ? (flat ? '✅ Schwab reconciliado · FLAT' : '🔄 Schwab reconciliado · exposición conocida')
     : '⛔ REAL bloqueado · reconciliación Schwab pendiente';
+  if(!S.botRunning && (!ok || !flat) && title)
+    title.textContent='⛔ Motor parado · cierre REAL no confirmado';
+  const retry=el('brokerCloseRetry');
+  if(retry){
+    retry.hidden=!!S.botRunning || (ok && flat);
+    retry.disabled=botControlPending || Date.now()<schwabRetryUntil;
+  }
   const posText = positions.map(p => `${p.ticker} ${p.side} ${p.quantity}`).join(', ');
   const ordText = [...new Set(orders)].join(', ');
   if(detail) detail.textContent = [
@@ -2920,9 +2952,9 @@ let schwabRetryUntil = 0;
 function setSchwabRetryPause(seconds, persistenceError){
   const wait = Math.max(0, Number(seconds) || 0);
   schwabRetryUntil = Date.now() + wait * 1000;
-  ['schwabAuthOpenBtn','schwabConnectBtn','schwabTestBtn','schwabNetworkDiagBtn'].forEach(id=>{
+  ['schwabAuthOpenBtn','schwabConnectBtn','schwabTestBtn','schwabNetworkDiagBtn','brokerSyncRefresh','brokerCloseRetry'].forEach(id=>{
     const button=el(id);
-    if(button) button.disabled=wait>0;
+    if(button) button.disabled=wait>0 || (id==='brokerCloseRetry' && botControlPending);
   });
   const notice=el('schwabRetryNotice');
   if(notice){
@@ -4156,3 +4188,4 @@ setInterval(checkSchwabStatus, 30000);
 </dialog>
 </body>
 </html>
+
