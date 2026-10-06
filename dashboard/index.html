@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.14</div>
+      <div class="brand-ver" id="appVersionLabel">Trading Algorítmico · versión pendiente</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -783,10 +783,10 @@
         .exec-row-actions .btn{flex:1;justify-content:center;min-height:42px}.exec-mode-select,.exec-shares-input{width:100%;font-size:16px;min-height:44px}
       }
     </style>
-    <div class="card" id="tickerExecutionCard" data-editor-build="v3.3.14-ui1">
+    <div class="card" id="tickerExecutionCard" data-editor-build="v3.3.15-ui1">
       <div class="ticker-exec-head">
         <div>
-          <div class="exec-eyebrow">Control de ejecución · v3.3.14 · Editor 5</div>
+          <div class="exec-eyebrow" id="executionBuildLabel">Control de ejecución · versión pendiente · Editor 5</div>
           <h2 class="exec-heading">Tickers y tamaño de las órdenes</h2>
           <p class="exec-muted">Defina los límites de REAL y guarde la cantidad de cada ticker.</p>
         </div>
@@ -1498,6 +1498,7 @@
 // STATE
 // ─────────────────────────────────────────────────────────
 const S = {
+  appVersion: null,
   tickers: ['BA','AAPL','TSLA','NVDA','AMD'],
   signals: [],
   positions: [],
@@ -1723,11 +1724,21 @@ async function retryStoppedRealClose(){
 // ─────────────────────────────────────────────────────────
 // FETCH STATUS
 // ─────────────────────────────────────────────────────────
+function appVersionText(){
+  return S.appVersion ? `v${S.appVersion}` : 'versión no disponible';
+}
+function updateAppVersion(value){
+  S.appVersion = typeof value === 'string' && /^\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(value)
+    ? value : null;
+  el('appVersionLabel').textContent = `Trading Algorítmico · ${appVersionText()}`;
+  el('executionBuildLabel').textContent = `Control de ejecución · ${appVersionText()} · Editor 5`;
+}
 async function fetchStatus(){
   try {
     const r = await api('/api/status');
     const d = await r.json();
     if(d.status === 'ok'){
+      updateAppVersion(d.version);
       updateBotUI(d.bot.running);
       const stats = d.stats || {};
       el('stBuy').textContent   = stats.buy   || 0;
@@ -3554,7 +3565,7 @@ async function showExecutionDiagnostics(){
     const d=await (await api('/api/execution-diagnostics')).json();
     if(d.status!=='ok') throw new Error(d.message || 'No hay datos');
     const sum=d.summary||{};
-    showV330Dialog(`<h2>Calidad de ejecución · v3.3.14</h2><p>${escHtml(d.scope)}</p>
+    showV330Dialog(`<h2>Calidad de ejecución · ${escHtml(appVersionText())}</h2><p>${escHtml(d.scope)}</p>
       <p>PnL de señales: ${metricV330(sum.strategy_pnl_usd,' USD')} · PnL real comparable: ${metricV330(sum.actual_pnl_matched_usd,' USD')} · Coste de ejecución medido: ${metricV330(sum.execution_loss_usd,' USD')} · Spread medio: ${metricV330(sum.average_spread,' USD')}</p>
       <p>${escHtml(d.attribution_note)}</p><table class="ai-life-table"><thead><tr><th>Ticker</th><th>Modo / etapa</th><th>Señal</th><th>Solicitado</th><th>Límite</th><th>Fill</th><th>Spread</th><th>Slippage USD</th><th>Motivo</th></tr></thead><tbody>${(d.orders||[]).slice(-50).reverse().map(o=>`<tr><td>${escHtml(o.ticker)}</td><td>${escHtml(o.mode)} / ${escHtml(o.role)}</td><td>${metricV330(o.signal_price)}</td><td>${metricV330(o.requested_price)}</td><td>${metricV330(o.limit_price)}</td><td>${metricV330(o.fill_price)}</td><td>${metricV330(o.spread)}</td><td>${metricV330(o.slippage_usd)}</td><td>${escHtml(o.exit_reason||'—')}</td></tr>`).join('')}</tbody></table>`);
   } catch(e){ toast('err','Ejecución',String(e)); }
@@ -4188,4 +4199,3 @@ setInterval(checkSchwabStatus, 30000);
 </dialog>
 </body>
 </html>
-
