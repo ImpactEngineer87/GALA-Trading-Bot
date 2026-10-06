@@ -400,9 +400,11 @@ class ApplicationTests(unittest.TestCase):
         node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "schwab_request_metrics")
         node.decorator_list = []
         snapshot = Mock(return_value={"request_metrics": {"sent_total": 7}})
-        scope = {"schwab_request_pause": snapshot, "jsonify": lambda x: x}
+        scope = {"schwab_request_pause": snapshot, "jsonify": lambda x: x, "APP_VERSION": "3.3.15"}
         exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), "server.py", "exec"), scope)
-        self.assertEqual(scope["schwab_request_metrics"]()["request_metrics"]["sent_total"], 7)
+        result = scope["schwab_request_metrics"]()
+        self.assertEqual(result["request_metrics"]["sent_total"], 7)
+        self.assertEqual(result["version"], "3.3.15")
         snapshot.assert_called_once()
 
 

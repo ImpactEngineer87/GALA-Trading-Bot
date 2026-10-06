@@ -48,6 +48,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 from core.daily_loss_guard import DailyLossGuard
+from core.app_version import APP_VERSION
 from core.ticker_execution import TickerExecutionRegistry
 from core.live_capacity import max_real_tickers as real_ticker_limit
 from core.runtime_reliability import (
@@ -2356,7 +2357,7 @@ def schwab_network_diagnostics():
 
     result = {
         "status": "ok",
-        "version": "3.3.14",
+        "version": APP_VERSION,
         "generated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "host": host,
         "execution_host": socket.gethostname(),
@@ -2626,7 +2627,7 @@ def schwab_status():
 @app.route('/api/schwab/request-metrics')
 def schwab_request_metrics():
     """Read local counters only; never refresh OAuth or probe the broker."""
-    return jsonify(schwab_request_pause())
+    return jsonify({"version": APP_VERSION, **schwab_request_pause()})
 
 @app.route('/api/schwab/test')
 def schwab_test():
@@ -2951,6 +2952,7 @@ def get_status():
     )
     return jsonify({
         "status": "ok",
+        "version": APP_VERSION,
         "bot": {
             "running":          BOT_STATE["running"],
             "mode":             BOT_STATE["mode"],

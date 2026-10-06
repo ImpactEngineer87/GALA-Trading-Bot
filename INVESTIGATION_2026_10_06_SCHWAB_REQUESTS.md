@@ -101,8 +101,11 @@ to make a live trade pass; use measured traffic to review batching/caching next.
 The environment lacks the installed Flask/ML/requests dependency stack. The
 offline harness replaces requests exception types and extracts actual method
 bodies with AST; the full integration/pytest suite has **not** run. No broker
-traffic, credentials, real orders or VPS deployment were used. VERSION remains
-3.3.14; identify the installed source by its Git commit, not only that label.
+traffic, credentials, real orders or VPS deployment were used. The request fix
+initially kept VERSION at 3.3.14. The version follow-up sets it to 3.3.15 and
+reads it once when the server starts; the dashboard uses that running server's
+version. Restart the dashboard server after an update, and still identify the
+installed source by its Git commit rather than relying only on the label.
 
 ## VPS rollout and evidence
 
