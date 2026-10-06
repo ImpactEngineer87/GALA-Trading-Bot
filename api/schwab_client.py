@@ -22,6 +22,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from api.schwab_transport import (
     MIN_FORBIDDEN_PAUSE_SECONDS,
+    SchwabRequestDeferred,
     SchwabRequestPaused,
     schwab_request,
     schwab_request_pause,
@@ -459,7 +460,7 @@ class SchwabClient:
                         cooldown_seconds=60,
                     )
                 return False
-            except SchwabRequestPaused as exc:
+            except (SchwabRequestPaused, SchwabRequestDeferred) as exc:
                 self._marcar_degradado(str(exc), cooldown_seconds=exc.retry_after_seconds)
                 return False
             except requests.RequestException as exc:
@@ -544,7 +545,8 @@ class SchwabClient:
                 if self._auth_retry_after else 0
             )),
             "request_pause": pause,
-            "error": (str(SchwabRequestPaused(pause["retry_after_seconds"]))
+            "error": (str(SchwabRequestPaused(pause["retry_after_seconds"],
+                                              reason=pause.get("pause_reason") or "http_403"))
                       if pause["paused"] else self.auth_error),
         }
 
@@ -1149,8 +1151,10 @@ class SchwabClient:
                     "precio": float(p.get("averagePrice", 0) or 0),
                 })
             return out
+        except (SchwabRequestPaused, SchwabRequestDeferred) as e:
+            return self._broker_read_failed("positions", str(e))
         except Exception as e:
-            _log(f"[ERROR] obtener_posiciones: {e}")
+            _log(f"[ERROR] obtener_posiciones: {type(e).__name__}")
             return self._broker_read_failed(
                 "positions", type(e).__name__, getattr(e, "response", None)
             )
@@ -1193,15 +1197,10 @@ class SchwabClient:
             if not isinstance(data, list):
                 return self._broker_read_failed("orders", "INVALID_ORDERS_RESPONSE", r)
             return data
+        except (SchwabRequestPaused, SchwabRequestDeferred) as e:
+            return self._broker_read_failed("orders", str(e))
         except Exception as e:
-            cuerpo = ""
-            resp = getattr(e, "response", None)
-            if resp is not None:
-                try:
-                    cuerpo = f" | HTTP {resp.status_code} | {(resp.text or '').strip()[:300]}"
-                except Exception:
-                    cuerpo = ""
-            _log(f"[ERROR] obtener_ordenes_abiertas: {e}{cuerpo}")
+            _log(f"[ERROR] obtener_ordenes_abiertas: {type(e).__name__}")
             return self._broker_read_failed(
                 "orders", type(e).__name__, getattr(e, "response", None)
             )  # None = desconocido; nunca cuenta plana

@@ -41,7 +41,9 @@ from dataclasses import dataclass
 from dotenv import load_dotenv
 from core.risk_manager import OrdenTradingCalculada
 from api.order_sync import AsyncOrderSynchronizer, normalize_status
-from api.schwab_transport import schwab_request
+from api.schwab_transport import (
+    SchwabRequestDeferred, SchwabRequestPaused, schwab_control_requests, schwab_request,
+)
 
 load_dotenv()
 
@@ -367,6 +369,9 @@ class EjecutorHibridoDeOrdenes:
         # de posición plana y apertura contraria no pueden cruzarse con otro hilo.
         self._symbol_locks = {}
         self._symbol_locks_guard = threading.Lock()
+        # Background observation has a separate clock from short acknowledgement
+        # waits. A 100ms synchronizer setting must not become perpetual HTTP polling.
+        self.monitor_interval_ms = max(1000, int(sync_cfg.get("monitor_interval_ms", 2000)))
 
         if self.paper_trading:
             _ps("[HIBRIDO] Modo PAPER TRADING — ordenes simuladas")
@@ -962,23 +967,33 @@ class EjecutorHibridoDeOrdenes:
     def _buscar_orden_en_listado(self, account_number: str, order_id: str) -> Optional[dict]:
         """Obtiene UNA orden, usando primero el endpoint por id y luego el listado.
 
-        El GET por id reduce la latencia y el tamaño de respuesta. Como algunas
-        cuentas han mostrado errores 5xx intermitentes en ese endpoint, el listado
-        temporal se conserva como fallback de reconciliación.
+        El listado conserva el workaround de errores del endpoint por id, pero
+        el transporte permite solo un fallback por racha de fallo de la cuenta.
+        Una pausa local o un fallo sin recuperación queda desconocido.
         """
         if not order_id:
             return None
+        allow_fallback = False
         direct_url = f"{self.TRADER_URL}/accounts/{account_number}/orders/{order_id}"
         try:
             direct = schwab_request(self._http_session().get,
                 direct_url, timeout=self.request_timeout_s)
-            direct.raise_for_status()
-            data = direct.json()
-            if isinstance(data, dict) and data:
-                return data
+            if direct.status_code in (401, 403, 429):
+                return None  # Shared transport records both HTTP and broker status.
+            if direct.status_code == 400 or direct.status_code >= 500:
+                allow_fallback = True
+            else:
+                direct.raise_for_status()
+                data = direct.json()
+                if (isinstance(data, dict) and str(data.get("orderId", "")) == str(order_id)
+                        and isinstance(data.get("status"), str) and data["status"]):
+                    return data
+        except (SchwabRequestPaused, SchwabRequestDeferred):
+            return None
+        except requests.RequestException as exc:
+            if getattr(getattr(exc, "response", None), "status_code", None) != 404:
+                return None
         except Exception:
-            # El fallback de listado es deliberado; no se registra aquí para evitar
-            # ruido por cada poll. Si ambos caminos fallan sí se registra abajo.
             pass
 
         ahora = datetime.utcnow()
@@ -995,18 +1010,22 @@ class EjecutorHibridoDeOrdenes:
                 "fromEnteredTime": desde.strftime(fmt),
                 "toEnteredTime": hasta.strftime(fmt),
                 "maxResults": 500,
-            }, timeout=self.request_timeout_s)
+            }, timeout=self.request_timeout_s, allow_order_fallback=allow_fallback)
             r.raise_for_status()
             data = r.json()
             if not isinstance(data, list):
                 return None
             objetivo = str(order_id)
             for o in data:
-                if str(o.get("orderId", "")) == objetivo:
+                if (isinstance(o, dict) and str(o.get("orderId", "")) == objetivo
+                        and isinstance(o.get("status"), str) and o["status"]):
                     return o
             return None
-        except Exception as e:
-            _ps(f"[ERROR] listado ordenes ({order_id}): {_err_detalle(e)}")
+        except (SchwabRequestPaused, SchwabRequestDeferred):
+            return None
+        except Exception:
+            # The transport persists redacted HTTP failures once per sent call.
+            # No response body/account/order URL is printed on each local poll.
             return None
 
 
@@ -1025,12 +1044,14 @@ class EjecutorHibridoDeOrdenes:
         if self._working_orders_provider is not None:
             try:
                 data = self._working_orders_provider(account_number)
+            except (SchwabRequestPaused, SchwabRequestDeferred):
+                return None
             except Exception as exc:
-                _ps(f"[ERROR] provider órdenes WORKING: {_err_detalle(exc)}")
+                _ps(f"[ERROR] provider órdenes WORKING: {type(exc).__name__}")
                 return None
             if data is None:
                 return None
-            return data if isinstance(data, list) else []
+            return data if isinstance(data, list) else None
         ahora = datetime.utcnow()
         desde = ahora - timedelta(days=7)
         hasta = ahora + timedelta(days=1)
@@ -1049,9 +1070,11 @@ class EjecutorHibridoDeOrdenes:
             )
             r.raise_for_status()
             data = r.json()
-            return data if isinstance(data, list) else []
+            return data if isinstance(data, list) else None
+        except (SchwabRequestPaused, SchwabRequestDeferred):
+            return None
         except Exception as exc:
-            _ps(f"[ERROR] snapshot órdenes WORKING: {_err_detalle(exc)}")
+            _ps(f"[ERROR] snapshot órdenes WORKING: {type(exc).__name__}")
             return None
 
     @staticmethod
@@ -1182,8 +1205,12 @@ class EjecutorHibridoDeOrdenes:
                 "timeout": False,
                 "error": "",
             }
+        def fetch_control_state():
+            with schwab_control_requests():
+                return self.detalle_orden(account_number, order_id)
+
         result = self._sync.run_order(
-            lambda: self.detalle_orden(account_number, order_id),
+            fetch_control_state,
             desired_statuses=deseados,
             failure_statuses=fallos,
             timeout_s=self.ack_timeout_s if timeout_s is None else timeout_s,

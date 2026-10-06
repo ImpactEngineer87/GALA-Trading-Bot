@@ -20,6 +20,10 @@ from core.position_state import PositionState
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class LocalRequestPause(Exception):
+    pass
+
+
 def load_methods(path, class_name, names, namespace=None):
     tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name)
@@ -27,7 +31,8 @@ def load_methods(path, class_name, names, namespace=None):
     cls.bases = []
     cls.decorator_list = []
     scope = {"Optional": Optional, "threading": threading, "time": time,
-             "datetime": datetime, "timedelta": timedelta, "PositionState": PositionState}
+             "datetime": datetime, "timedelta": timedelta, "PositionState": PositionState,
+             "schwab_control_requests": nullcontext}
     scope.update(namespace or {})
     exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])),
                  str(ROOT / path), "exec"), scope)
@@ -276,6 +281,7 @@ class Response:
 Client = load_methods("api/schwab_client.py", "SchwabClient", {
     "obtener_posiciones", "obtener_ordenes_abiertas", "_broker_read_failed", "broker_read_error"
 }, {"TRADER_URL": "https://test.invalid", "_log": lambda msg: None,
+    "SchwabRequestPaused": LocalRequestPause, "SchwabRequestDeferred": LocalRequestPause,
     "schwab_request_pause": lambda: {"paused": False}})
 
 
