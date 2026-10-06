@@ -64,6 +64,7 @@ from core.position_state import (
 from core.trade_history import TradeHistoryLedger
 
 from api.schwab_client import SchwabClient
+from api.schwab_transport import schwab_control_requests
 from api.hybrid_order_executor import EjecutorHibridoDeOrdenes, ContextoMercado
 
 from gsco.sheets_client import SheetsClient
@@ -4034,7 +4035,7 @@ class ChocoletraBot:
         self._emit_log(
             "INFO",
             f"Monitor de órdenes activo cada "
-            f"{self.ejecutor_hibrido.poll_interval_ms}ms",
+            f"{getattr(self.ejecutor_hibrido, 'monitor_interval_ms', 2000)}ms",
         )
 
     def _detener_monitor_ordenes(self):
@@ -4049,7 +4050,7 @@ class ChocoletraBot:
             1,
             int(self.config.get("risk", {}).get("max_simultaneous_positions", 17)),
         )
-        poll_s = max(0.025, self.ejecutor_hibrido.poll_interval_ms / 1000.0)
+        poll_s = max(1.0, getattr(self.ejecutor_hibrido, "monitor_interval_ms", 2000) / 1000.0)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             while self._activo and not self._order_monitor_stop.is_set():
                 with self._lock:
@@ -5298,7 +5299,8 @@ class ChocoletraBot:
         last_error = ""
         for attempt in range(1, attempts + 1):
             try:
-                value = callback()
+                with schwab_control_requests():
+                    value = callback()
                 if value is None:
                     reader = getattr(getattr(self, "schwab", None), "broker_read_error", None)
                     detail = reader(operation) if operation and callable(reader) else ""
@@ -5311,6 +5313,10 @@ class ChocoletraBot:
                 return True, value, ""
             except Exception as exc:
                 last_error = str(exc)
+                if any(marker in last_error for marker in (
+                        "COOLDOWN_ACTIVE", "SchwabRequestPaused", "SchwabRequestDeferred")):
+                    self._emit_log("WARN", f"[Schwab] {label}: {last_error}; lectura desconocida, sin reintento inmediato")
+                    break
                 if attempt < attempts:
                     self._emit_log(
                         "WARN",

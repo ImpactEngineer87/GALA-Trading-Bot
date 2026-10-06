@@ -224,7 +224,7 @@ def test_cooldown_file_contains_no_request_or_credential_information(gate):
                   headers={"Authorization": "Bearer private-access"},
                   data={"refresh_token": "private-refresh"})
     state = guard.state_path.read_text()
-    assert set(json.loads(state)) == {"retry_at_epoch", "denial_count", "recovery_pending"}
+    assert set(json.loads(state)) == {"retry_at_epoch", "denial_count", "recovery_pending", "pause_reason"}
     for secret in ["private-access", "private-refresh", "private-account", URL]:
         assert secret not in state
 

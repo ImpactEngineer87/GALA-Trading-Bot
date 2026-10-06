@@ -1096,7 +1096,7 @@ def _schwab_auth_snapshot() -> dict:
     if pause["paused"] and state != "expired":
         state = "unavailable"
         message = (
-            f"Schwab en pausa tras HTTP 403; espere {pause['retry_after_seconds']}s. "
+            f"Schwab en pausa ({pause.get('pause_reason') or 'espera compartida'}); espere {pause['retry_after_seconds']}s. "
             "Se conservan los tokens. No repita conexiones ni sondas durante la espera."
         )
     expiry = BOT_STATE.get("schwab_token_expiry")
@@ -2313,8 +2313,8 @@ def schwab_network_diagnostics():
     if all(row.get("paused") for row in probes.values()):
         conclusion = "COOLDOWN_ACTIVE"
         recommendation = (
-            "Sondas omitidas: Schwab recomienda esperar al menos 10 minutos tras "
-            "HTTP 403. El bot mantiene la pausa compartida sin enviar tráfico. "
+            "Sondas omitidas: el bot mantiene la pausa compartida sin enviar tráfico. "
+            "Revise request_pause para consultar el motivo y la espera restante. "
             "No repita conexiones, sondas ni curl durante la espera."
         )
     elif edge_rows:
@@ -2622,6 +2622,11 @@ def schwab_connect():
 @app.route('/api/schwab/status')
 def schwab_status():
     return jsonify(_verify_schwab_connection())
+
+@app.route('/api/schwab/request-metrics')
+def schwab_request_metrics():
+    """Read local counters only; never refresh OAuth or probe the broker."""
+    return jsonify(schwab_request_pause())
 
 @app.route('/api/schwab/test')
 def schwab_test():

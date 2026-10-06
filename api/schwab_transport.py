@@ -7,13 +7,19 @@ credential-free runtime file preserves the pause when that process restarts.
 from __future__ import annotations
 
 import json
+import html
 import logging
+from logging.handlers import RotatingFileHandler
 import math
 import os
+import re
 import tempfile
 import threading
 import time
+from collections import Counter, deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -24,25 +30,86 @@ MIN_FORBIDDEN_PAUSE_SECONDS = 10 * 60
 MAX_FORBIDDEN_PAUSE_SECONDS = 60 * 60
 DEFAULT_STATE_PATH = Path(__file__).resolve().parents[1] / "data" / "schwab_request_cooldown.json"
 _LOG = logging.getLogger(__name__)
+_TRAFFIC_CONTEXT = threading.local()
+_DIAGNOSTIC_LOCK = threading.Lock()
+_DIAGNOSTIC_HANDLER = None
+
+
+class SchwabRequestDeferred(requests.RequestException):
+    """Local admission/backoff refusal; the request was never submitted."""
+
+    def __init__(self, seconds, reason):
+        self.request_sent = False
+        self.retry_after_seconds = max(1, math.ceil(seconds))
+        self.reason = reason
+        super().__init__(f"SchwabRequestDeferred: {reason}; espere {self.retry_after_seconds}s")
+
+
+@contextmanager
+def schwab_control_requests():
+    """Reserve capacity for bounded order confirmation and reconciliation reads.
+
+    Apply in the thread making the HTTP call, including synchronizer workers.
+    The reserve does not bypass the global budget, cooldown or read backoff.
+    """
+    previous = getattr(_TRAFFIC_CONTEXT, "control", False)
+    _TRAFFIC_CONTEXT.control = True
+    try:
+        yield
+    finally:
+        _TRAFFIC_CONTEXT.control = previous
+
+
+def _safe_endpoint(path):
+    parts = path.strip("/").split("/")
+    if len(parts) >= 4 and parts[:3] == ["trader", "v1", "accounts"]:
+        if parts[3] == "accountNumbers":
+            return "/trader/v1/accounts/accountNumbers"
+        if len(parts) >= 5 and parts[4] == "orders":
+            return "/trader/v1/accounts/{account}/orders" + ("/{order}" if len(parts) > 5 else "")
+        return "/trader/v1/accounts/{account}"
+    if path in ("/v1/oauth/token", "/trader/v1/accounts", "/trader/v1/orders",
+                "/marketdata/v1/quotes", "/marketdata/v1/pricehistory"):
+        return path
+    return "/other"  # No arbitrary paths, query strings or identifiers in logs.
+
+
+def _write_diagnostic(event):
+    global _DIAGNOSTIC_HANDLER
+    with _DIAGNOSTIC_LOCK:
+        try:
+            if _DIAGNOSTIC_HANDLER is None:
+                path = DEFAULT_STATE_PATH.parents[1] / "logs" / "schwab_http_errors.jsonl"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _DIAGNOSTIC_HANDLER = RotatingFileHandler(
+                    path, maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8")
+                _DIAGNOSTIC_HANDLER.setFormatter(logging.Formatter("%(message)s"))
+            record = logging.LogRecord(__name__, logging.WARNING, "", 0,
+                                       json.dumps(event, ensure_ascii=True), (), None)
+            _DIAGNOSTIC_HANDLER.emit(record)
+        except OSError:
+            _LOG.warning("No se pudo guardar el diagnóstico HTTP Schwab redactado.")
 
 
 class SchwabRequestPaused(requests.RequestException):
     """A request was stopped locally; no HTTP request/order was submitted."""
 
-    def __init__(self, seconds: int, *, recovery_check: bool = False):
+    def __init__(self, seconds: int, *, recovery_check: bool = False, reason="http_403"):
         self.retry_after_seconds = max(1, int(seconds))
         self.request_sent = False
         self.recovery_check = recovery_check
         message = (
             "Schwab en pausa: espere una verificación de conexión antes de enviar órdenes."
             if recovery_check else
-            f"Schwab en pausa tras HTTP 403; próximo intento permitido en {self.retry_after_seconds}s."
+            f"Schwab en pausa ({reason}); próximo intento permitido en {self.retry_after_seconds}s."
         )
         super().__init__(message)
 
 
 class SchwabRequestGate:
-    def __init__(self, state_path=DEFAULT_STATE_PATH, *, clock=None, monotonic=None):
+    def __init__(self, state_path=DEFAULT_STATE_PATH, *, clock=None, monotonic=None,
+                 requests_per_minute=90, control_reserve=30, burst_per_second=6,
+                 diagnostic_sink=None):
         self.state_path = Path(state_path)
         self._clock = clock or time.time
         self._monotonic = monotonic or time.monotonic
@@ -53,6 +120,17 @@ class SchwabRequestGate:
         self._recovery_pending = False
         self._probe_inflight = False
         self._persistence_error = ""
+        # Application defaults, NOT an assertion of Schwab's contractual quota.
+        self._budget = max(1, int(requests_per_minute))
+        self._reserve = max(0, min(self._budget - 1, int(control_reserve)))
+        self._burst = max(1, int(burst_per_second))
+        self._sent = deque()
+        self._responses = deque()
+        self._sent_total = 0
+        self._deferred = Counter()
+        self._read_failures = {}
+        self._pause_reason = "http_403"
+        self._diagnostic_sink = diagnostic_sink or _write_diagnostic
         self._load()
 
     def _load(self):
@@ -63,6 +141,7 @@ class SchwabRequestGate:
                 raise ValueError("invalid pause deadline")
             self._denials = max(0, min(8, int(state.get("denial_count", 0))))
             self._recovery_pending = bool(state.get("recovery_pending"))
+            self._pause_reason = "http_429" if state.get("pause_reason") == "http_429" else "http_403"
             self._until = until
             self._deadline = self._monotonic() + max(0, until - self._clock())
         except FileNotFoundError:
@@ -85,6 +164,7 @@ class SchwabRequestGate:
                 "retry_at_epoch": self._until,
                 "denial_count": self._denials,
                 "recovery_pending": self._recovery_pending,
+                "pause_reason": self._pause_reason,
             }
             with tempfile.NamedTemporaryFile(
                 mode="w", encoding="utf-8", dir=self.state_path.parent,
@@ -117,6 +197,7 @@ class SchwabRequestGate:
     def snapshot(self) -> dict:
         with self._lock:
             remaining = self.remaining()
+            self._prune()
             return {
                 "paused": remaining > 0 or self._probe_inflight,
                 "retry_after_seconds": max(remaining, int(self._probe_inflight)),
@@ -127,40 +208,154 @@ class SchwabRequestGate:
                 "denial_count": self._denials,
                 "recovery_pending": self._recovery_pending,
                 "persistence_error": self._persistence_error or None,
+                "pause_reason": self._pause_reason if remaining else None,
+                "request_metrics": {
+                    "scope": "this_process_since_start",
+                    "sent_total": self._sent_total,
+                    "sent_last_60_seconds": len(self._sent),
+                    "by_endpoint_last_60_seconds": dict(Counter(item[2] for item in self._sent)),
+                    "responses_last_60_seconds": dict(Counter(str(item[1]) for item in self._responses)),
+                    "locally_deferred_total": dict(self._deferred),
+                    "budget_per_60_seconds": self._budget,
+                    "control_reserve": self._reserve,
+                    "burst_per_second": self._burst,
+                },
             }
 
-    def _pause(self, *, new_denial: bool = False, retry_after=0):
+    def _prune(self):
+        cutoff = self._monotonic() - 60
+        while self._sent and self._sent[0][0] <= cutoff:
+            self._sent.popleft()
+        while self._responses and self._responses[0][0] <= cutoff:
+            self._responses.popleft()
+
+    def _retry_after(self, value):
+        try:
+            delay = float(value)
+            return max(0, delay) if math.isfinite(delay) else 0
+        except (ValueError, TypeError):
+            try:
+                return max(0, parsedate_to_datetime(value).timestamp() - self._clock())
+            except (ValueError, TypeError, OverflowError):
+                return 0
+
+    def _defer(self, seconds, reason):
+        self._deferred[reason] += 1
+        raise SchwabRequestDeferred(seconds, reason)
+
+    def _admit(self, path, control, read_key, allow_order_fallback=False):
+        self._prune()
+        now = self._monotonic()
+        failure = self._read_failures.get(read_key)
+        if failure and failure[0] > now:
+            if (allow_order_fallback and failure[2]
+                    and len(path.strip("/").split("/")) == 5):
+                # At most one listing fallback for the account's failure streak.
+                # Never bypass the HTTP pause, rolling budget or burst budget.
+                self._read_failures[read_key] = (failure[0], failure[1], False)
+            else:
+                self._defer(failure[0] - now, "order_read_backoff")
+        if len(self._sent) >= self._budget:
+            self._defer(self._sent[0][0] + 60 - now, "request_budget")
+        background = [entry for entry in self._sent if not entry[1]]
+        if not control and len(background) >= self._budget - self._reserve:
+            self._defer(background[0][0] + 60 - now, "control_capacity_reserved")
+        recent = [entry for entry in self._sent if entry[0] > now - 1]
+        background_recent = [entry for entry in recent if not entry[1]]
+        if len(recent) >= self._burst:
+            self._defer(recent[0][0] + 1 - now, "request_burst")
+        if not control and len(background_recent) >= max(1, self._burst - 2):
+            self._defer(background_recent[0][0] + 1 - now, "control_burst_reserved")
+        self._sent.append((now, control, _safe_endpoint(path)))
+        self._sent_total += 1
+
+    def _read_backoff(self, key, *, allow_fallback=False):
+        if key is None:
+            return
+        old = self._read_failures.get(key, (0, 0, False))
+        failures = min(5, old[1] + 1)
+        self._read_failures[key] = (self._monotonic() + min(60, 5 * 2 ** (failures - 1)),
+                                    failures, allow_fallback and old[1] == 0)
+
+    def _diagnose(self, path, method, response=None, exception=None):
+        event = {"time_utc": datetime.fromtimestamp(self._clock(), timezone.utc).isoformat(),
+                 "endpoint": _safe_endpoint(path), "method": method,
+                 "http_status": int(getattr(response, "status_code", 0) or 0)}
+        if exception is not None:
+            event["exception_type"] = type(exception).__name__
+        if response is not None:
+            try:
+                body = response.json()
+                errors = body.get("errors", []) if isinstance(body, dict) else []
+                if isinstance(errors, list):
+                    event["broker_statuses"] = [int(e["status"]) for e in errors[:5]
+                        if isinstance(e, dict) and str(e.get("status", "")).isdigit()][:5]
+                    event["correlation_ids"] = [e["id"] for e in errors[:5]
+                        if isinstance(e, dict) and re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", str(e.get("id", "")))]
+            except Exception:
+                pass
+            text = html.unescape(str(getattr(response, "text", ""))[:4096])
+            ref = re.search(r"Reference\s*#\s*([0-9]+\.[0-9a-fA-F]+\.[0-9]+\.[0-9a-fA-F]+)", text)
+            if ref:
+                event["akamai_reference"] = ref.group(1)
+        try:
+            self._diagnostic_sink(event)
+        except Exception:
+            _LOG.warning("Falló el registro HTTP Schwab redactado.")
+
+    def _pause(self, *, new_denial: bool = False, retry_after=0, reason=None):
         if new_denial:
             self._denials = min(8, self._denials + 1)
-        delay = min(MAX_FORBIDDEN_PAUSE_SECONDS,
-                    MIN_FORBIDDEN_PAUSE_SECONDS * 2 ** max(0, self._denials - 1))
-        try:
-            delay = max(delay, int(retry_after or 0))
-        except (TypeError, ValueError):
-            pass
+        reason = reason or self._pause_reason
+        delay = (60 if reason == "http_429" else min(MAX_FORBIDDEN_PAUSE_SECONDS,
+                    MIN_FORBIDDEN_PAUSE_SECONDS * 2 ** max(0, self._denials - 1)))
+        delay = max(delay, self._retry_after(retry_after))
+        if self._monotonic() + delay >= self._deadline:
+            self._pause_reason = reason
         self._until = max(self._until, self._clock() + delay)
         self._deadline = max(self._deadline, self._monotonic() + delay)
         self._recovery_pending = True
         self._save()
 
-    def request(self, send, url: str, *, recovery_safe: bool = True, **kwargs):
-        if (urlsplit(str(url)).hostname or "").lower() != "api.schwabapi.com":
+    def request(self, send, url: str, *, recovery_safe: bool = True,
+                allow_order_fallback: bool = False, **kwargs):
+        parsed = urlsplit(str(url))
+        if (parsed.hostname or "").lower() != "api.schwabapi.com":
             return send(url, **kwargs)
+        method = str(getattr(send, "__name__", "REQUEST")).upper()
+        if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}:
+            method = "REQUEST"
+        control = (not recovery_safe or parsed.path == "/v1/oauth/token"
+                   or getattr(_TRAFFIC_CONTEXT, "control", False))
+        parts = parsed.path.strip("/").split("/")
+        read_key = ("/".join(parts[:5]) if method == "GET" and len(parts) >= 5
+                    and parts[:3] == ["trader", "v1", "accounts"] and parts[4] == "orders" else None)
         with self._lock:
             remaining = self.remaining()
             if remaining or self._probe_inflight:
-                raise SchwabRequestPaused(remaining or 1)
+                self._deferred["http_pause"] += 1
+                raise SchwabRequestPaused(remaining or 1, reason=self._pause_reason)
             probe = self._recovery_pending
             if probe and not recovery_safe:
+                self._deferred["recovery_required"] += 1
                 raise SchwabRequestPaused(1, recovery_check=True)
+            self._admit(parsed.path, control, read_key, allow_order_fallback)
             if probe:
                 self._probe_inflight = True
         try:
             response = send(url, **kwargs)
             status = int(getattr(response, "status_code", 0) or 0)
             with self._lock:
+                self._responses.append((self._monotonic(), status))
+                if read_key and (status == 400 or status >= 500):
+                    self._read_backoff(read_key, allow_fallback=len(parts) > 5)
+                elif read_key and 200 <= status < 300:
+                    self._read_failures.pop(read_key, None)
                 if status == 403:
-                    self._pause(new_denial=True, retry_after=response.headers.get("Retry-After"))
+                    self._pause(new_denial=True, retry_after=response.headers.get("Retry-After"), reason="http_403")
+                elif status == 429:
+                    self._pause(retry_after=response.headers.get("Retry-After"),
+                                reason=self._pause_reason if probe else "http_429")
                 elif probe and (status == 0 or status == 429 or status >= 500):
                     # A failed recovery attempt must not create a busy loop.
                     self._pause(retry_after=response.headers.get("Retry-After"))
@@ -172,11 +367,16 @@ class SchwabRequestGate:
                     self._denials = 0
                     self._recovery_pending = False
                     self._save()
+            if status >= 400:
+                self._diagnose(parsed.path, method, response=response)
             return response
-        except requests.RequestException:
-            if probe:
-                with self._lock:
+        except requests.RequestException as exc:
+            with self._lock:
+                self._responses.append((self._monotonic(), "transport_error"))
+                self._read_backoff(read_key)
+                if probe:
                     self._pause()
+            self._diagnose(parsed.path, method, exception=exc)
             raise
         finally:
             if probe:
@@ -188,6 +388,9 @@ _GATE = SchwabRequestGate()
 
 
 def schwab_request(send, url: str, *, recovery_safe: bool = True, **kwargs):
+    # Every redirect hop would be another unbudgeted HTTP request. API callers
+    # must review a redirect response instead of following it automatically.
+    kwargs.setdefault("allow_redirects", False)
     return _GATE.request(send, url, recovery_safe=recovery_safe, **kwargs)
 
 
