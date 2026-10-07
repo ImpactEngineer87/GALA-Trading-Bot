@@ -66,6 +66,9 @@ class DatosMultiTemporal:
     ticker: str
     velas: Dict[str, pd.DataFrame] = field(default_factory=dict)
     sintetico: bool = False   # True = datos de fallback (demo); NO apto para operar en real
+    estado_datos: str = "READY"  # WAITING is never a synthetic/demo price source.
+    motivo_datos: str = ""
+    reintento_seg: int = 0
 
     def tf(self, clave: str) -> Optional[pd.DataFrame]:
         """Devuelve el DataFrame de la temporalidad o None si no existe."""

@@ -15,6 +15,8 @@ import os
 import sys
 import threading
 import tempfile
+import json
+import time
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -115,6 +117,9 @@ class SchwabClient:
         self._auth_retry_after: Optional[datetime] = None
         self._auth_lock = threading.RLock()
         self._broker_read_errors = threading.local()
+        self._market_cache_lock = threading.RLock()
+        self._history_cache = {}
+        self._mtf_frame_cache = {}
         self._auth_warning_emitted = False
         self._oauth_transient_failure = False
         self._oauth_backoff_seconds = 30
@@ -628,7 +633,8 @@ class SchwabClient:
         headers = self._headers()
         request_token = headers["Authorization"][len("Bearer "):]
         r = schwab_request(self._session.get,
-            url, params=params, headers=headers, timeout=timeout
+            url, params=params, headers=headers, timeout=timeout,
+            admission_wait_seconds=5 if str(url).endswith("/pricehistory") else 0,
         )
         if r.status_code != 401:
             return r
@@ -637,7 +643,8 @@ class SchwabClient:
         headers = self._headers()
         retried_token = headers["Authorization"][len("Bearer "):]
         response = schwab_request(self._session.get,
-            url, params=params, headers=headers, timeout=timeout
+            url, params=params, headers=headers, timeout=timeout,
+            admission_wait_seconds=5 if str(url).endswith("/pricehistory") else 0,
         )
         if response.status_code == 401:
             with self._auth_lock:
@@ -837,6 +844,17 @@ class SchwabClient:
         """
         if not self._asegurar_token():
             return None
+        # Reuse successful closed UTC-day windows with a bounded TTL.
+        # Never cache an empty/failed/live request.
+        day_ms = 24 * 60 * 60 * 1000
+        today_ms = (int(time.time() * 1000) // day_ms) * day_ms
+        cacheable = bool(params.get("endDate") and int(params["endDate"]) < today_ms)
+        cache_key = json.dumps(params, sort_keys=True) if cacheable else None
+        if cache_key:
+            with self._market_cache_lock:
+                cached = self._history_cache.get(cache_key)
+                if cached and time.monotonic() - cached[0] < 86400:
+                    return cached[1].copy()
         url = f"{BASE_URL}/pricehistory"
         try:
             r = self._get_autorizado(url, params=params, timeout=20)
@@ -851,9 +869,19 @@ class SchwabClient:
             df.set_index("datetime", inplace=True)
             df = df[["open", "high", "low", "close", "volume"]].astype(float)
             df.sort_index(inplace=True)
+            if cache_key:
+                with self._market_cache_lock:
+                    if len(self._history_cache) >= 512:
+                        oldest = min(self._history_cache, key=lambda key: self._history_cache[key][0])
+                        self._history_cache.pop(oldest, None)
+                    self._history_cache[cache_key] = (time.monotonic(), df.copy())
             return df
+        except (SchwabRequestPaused, SchwabRequestDeferred):
+            # The caller must retain successful warmup work and report a local
+            # wait, rather than replacing it with fabricated demo candles.
+            raise
         except Exception as e:
-            _log(f"[ERROR] pricehistory {params.get('symbol')} {params.get('frequencyType')}: {e}")
+            _log(f"[ERROR] pricehistory {params.get('symbol')} {params.get('frequencyType')}: {type(e).__name__}")
             return None
 
     def _fetch_minutos_chunked(self, ticker: str, frequency: int, dias: int,
@@ -865,14 +893,18 @@ class SchwabClient:
         (sin truncar en silencio).
         """
         ventana_ms = 10 * 24 * 60 * 60 * 1000
-        ahora_ms = int(datetime.now().timestamp() * 1000)
-        objetivo_ms = ahora_ms - dias * 24 * 60 * 60 * 1000
+        day_ms = 24 * 60 * 60 * 1000
+        ahora_ms = int(time.time() * 1000)
+        today_ms = (ahora_ms // day_ms) * day_ms
+        objetivo_ms = today_ms - dias * day_ms
 
         partes = []
         end = ahora_ms
         chunks = 0
         while end > objetivo_ms and chunks < max_chunks:
-            start = max(objetivo_ms, end - ventana_ms)
+            # The recent window is <=10 days. Older pages keep stable boundaries
+            # all UTC day, so a later cycle can reuse them after a local deferral.
+            start = max(objetivo_ms, today_ms - 9 * day_ms) if chunks == 0 else max(objetivo_ms, end - ventana_ms)
             params = {
                 "symbol": ticker,
                 "periodType": "day",
@@ -982,39 +1014,56 @@ class SchwabClient:
         cfg = config or {}
         dias_dia = cfg.get("ai", {}).get("dias_historia_schwab", 365)
 
-        # Evita seis solicitudes 401 por ticker cuando el OAuth no esta conectado.
-        # El objeto queda marcado como sintetico y el motor bloquea su uso en real.
+        # Live/PAPER engine data is never replaced with demo prices on an outage.
         if not self._asegurar_token():
-            _log(f"[WARN] {ticker}: Schwab sin OAuth — usando fallback sintetico (demo)")
-            return self._multitemporal_fallback(ticker)
+            return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING", motivo_datos="AUTH_UNAVAILABLE")
 
-        velas = {}
-        # Semanal y diario (nativos, 1 año+)
-        velas["1W"] = self.obtener_historico(ticker, "1W", dias_dia)
-        velas["1D"] = self.obtener_historico(ticker, "1D", dias_dia)
+        ttl = max(1, float(cfg.get("engine", {}).get("mtf_refresh_macro_sec", 300)))
+        generation = (int(dias_dia), self.include_extended_hours_data)
 
-        # 30m una sola vez -> 1H y 4H
-        base_30m = self._fetch_minutos_chunked(ticker, 30, 60)
-        velas["4H"] = self._resample(base_30m, "4h") if base_30m is not None else None
-        velas["1H"] = self._resample(base_30m, "1h") if base_30m is not None else None
+        def frame(name, fetch, *, fresh=False):
+            key = (ticker, name, generation)
+            with self._market_cache_lock:
+                cached = self._mtf_frame_cache.get(key)
+                if not fresh and cached and time.monotonic() - cached[0] < ttl:
+                    return cached[1].copy()
+            result = fetch()
+            if result is not None and len(result):
+                with self._market_cache_lock:
+                    if len(self._mtf_frame_cache) >= 256:
+                        oldest = min(self._mtf_frame_cache, key=lambda key: self._mtf_frame_cache[key][0])
+                        self._mtf_frame_cache.pop(oldest, None)
+                    self._mtf_frame_cache[key] = (time.monotonic(), result.copy())
+                return result
+            return None
 
-        # Micro (ejecucion y auditoria)
-        velas["15m"] = self.obtener_historico(ticker, "15m", 40)
-        velas["5m"] = self.obtener_historico(ticker, "5m", 20)
-        velas["1m"] = self.obtener_historico(ticker, "1m", 10)
-
-        # Filtrar temporalidades sin datos
-        velas = {k: v for k, v in velas.items() if v is not None and len(v) > 0}
-
-        # Fallback demo: si el mercado esta cerrado / sin token y faltan
-        # temporalidades clave, generar datos sinteticos coherentes para
-        # poder demostrar el pipeline (NUNCA se usan para operar en real:
-        # el modo real exige token valido y datos reales).
-        if len(velas) < 3:
-            _log(f"[WARN] {ticker}: datos multi-temporal insuficientes — usando fallback sintetico (demo)")
-            return self._multitemporal_fallback(ticker)
-
-        return DatosMultiTemporal(ticker=ticker, velas=velas)
+        try:
+            velas = {}
+            # Retain each successful source frame across a deferred warmup.
+            for name, fetch in (
+                    ("1W", lambda: self.obtener_historico(ticker, "1W", dias_dia)),
+                    ("1D", lambda: self.obtener_historico(ticker, "1D", dias_dia)),
+                    ("30m", lambda: self._fetch_minutos_chunked(ticker, 30, 60)),
+                    ("15m", lambda: self.obtener_historico(ticker, "15m", 40)),
+                    ("5m", lambda: self.obtener_historico(ticker, "5m", 20))):
+                result = frame(name, fetch)
+                if result is None:
+                    return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING",
+                                              motivo_datos=f"HISTORY_UNAVAILABLE_{name}")
+                velas[name] = result
+            base_30m = velas.pop("30m")
+            velas["4H"] = self._resample(base_30m, "4h")
+            velas["1H"] = self._resample(base_30m, "1h")
+            # Fetch live micro LAST, after warmup, so completion never marks an
+            # early/stale 1m response fresh just because other sources finished.
+            velas["1m"] = frame("1m", lambda: self.obtener_historico(ticker, "1m", 10), fresh=True)
+            if any(value is None or not len(value) for value in velas.values()):
+                return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING", motivo_datos="INCOMPLETE_MTF")
+            return DatosMultiTemporal(ticker=ticker, velas=velas)
+        except (SchwabRequestPaused, SchwabRequestDeferred) as exc:
+            reason = getattr(exc, "reason", "HTTP_PAUSE")
+            return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING",
+                                      motivo_datos=reason, reintento_seg=exc.retry_after_seconds)
 
     def _multitemporal_fallback(self, ticker: str):
         """
