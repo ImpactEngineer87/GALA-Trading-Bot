@@ -299,10 +299,12 @@ class ExecutorTests(GateFixture):
         super().setUp()
         self.Executor = load_methods("api/hybrid_order_executor.py", "EjecutorHibridoDeOrdenes",
             {"_buscar_orden_en_listado", "_working_orders_snapshot", "detalle_orden", "esperar_estado_orden",
-             "orden_trabajando", "_iter_order_nodes"},
-            {"schwab_request": self.gate.request, "_ps": Mock()})
+             "orden_trabajando", "_iter_order_nodes", "_orden_en", "_listado_ordenes"},
+            {"schwab_request": self.gate.request, "_ps": Mock(), "nullcontext": nullcontext,
+             "time": SimpleNamespace(monotonic=lambda: self.clock.mono)})
         self.Executor._iter_order_nodes.__globals__["EjecutorHibridoDeOrdenes"] = self.Executor
         self.executor = self.Executor()
+        self.executor._order_list_cache, self.executor._order_list_lock = None, threading.Lock()
         self.executor.TRADER_URL = "https://api.schwabapi.com/trader/v1"
         self.executor.request_timeout_s = 5
         self.executor.paper_trading = False

@@ -260,18 +260,12 @@ class SchwabRequestGate:
         self._deferred[reason] += 1
         raise SchwabRequestDeferred(seconds, reason)
 
-    def _admit(self, path, control, read_key, allow_order_fallback=False, warmup=None):
+    def _admit(self, path, control, read_key, warmup=None):
         self._prune()
         now = self._monotonic()
         failure = self._read_failures.get(read_key)
         if failure and failure[0] > now:
-            if (allow_order_fallback and failure[2]
-                    and len(path.strip("/").split("/")) == 5):
-                # At most one listing fallback for the account's failure streak.
-                # Never bypass the HTTP pause, rolling budget or burst budget.
-                self._read_failures[read_key] = (failure[0], failure[1], False)
-            else:
-                self._defer(failure[0] - now, "order_read_backoff")
+            self._defer(failure[0] - now, "order_read_backoff")
         if len(self._sent) >= self._budget:
             self._defer(self._sent[0][0] + 60 - now, "request_budget")
         background = [entry for entry in self._sent if not entry[1]]
@@ -292,13 +286,11 @@ class SchwabRequestGate:
         self._sent.append((now, control, _safe_endpoint(path)))
         self._sent_total += 1
 
-    def _read_backoff(self, key, *, allow_fallback=False):
+    def _read_backoff(self, key):
         if key is None:
             return
-        old = self._read_failures.get(key, (0, 0, False))
-        failures = min(5, old[1] + 1)
-        self._read_failures[key] = (self._monotonic() + min(60, 5 * 2 ** (failures - 1)),
-                                    failures, allow_fallback and old[1] == 0)
+        failures = min(5, self._read_failures.get(key, (0, 0))[1] + 1)
+        self._read_failures[key] = (self._monotonic() + min(60, 5 * 2 ** (failures - 1)), failures)
 
     def _diagnose(self, path, method, response=None, exception=None):
         event = {"time_utc": datetime.fromtimestamp(self._clock(), timezone.utc).isoformat(),
@@ -341,7 +333,7 @@ class SchwabRequestGate:
         self._save()
 
     def request(self, send, url: str, *, recovery_safe: bool = True,
-                allow_order_fallback: bool = False, admission_wait_seconds=0, **kwargs):
+                admission_wait_seconds=0, **kwargs):
         parsed = urlsplit(str(url))
         if (parsed.hostname or "").lower() != "api.schwabapi.com":
             return send(url, **kwargs)
@@ -352,8 +344,13 @@ class SchwabRequestGate:
                    or getattr(_TRAFFIC_CONTEXT, "control", False))
         warmup = getattr(_TRAFFIC_CONTEXT, "warmup", None)
         parts = parsed.path.strip("/").split("/")
-        read_key = ("/".join(parts[:5]) if method == "GET" and len(parts) >= 5
-                    and parts[:3] == ["trader", "v1", "accounts"] and parts[4] == "orders" else None)
+        # Single-order reads and the order list back off separately: Schwab's
+        # per-order endpoint can fail persistently while the list still works,
+        # and entry checks/reconciliation depend on the list (v3.3.18).
+        read_key = None
+        if (method == "GET" and len(parts) >= 5
+                and parts[:3] == ["trader", "v1", "accounts"] and parts[4] == "orders"):
+            read_key = "/".join(parts[:5]) + ("/{order}" if len(parts) > 5 else "")
         # Only history GETs may wait briefly for local admission. Mutations are
         # never queued/replayed; 403/429 pauses are never waited out here.
         can_wait = recovery_safe and method == "GET" and parsed.path == "/marketdata/v1/pricehistory"
@@ -370,7 +367,7 @@ class SchwabRequestGate:
                     if probe and not recovery_safe:
                         self._deferred["recovery_required"] += 1
                         raise SchwabRequestPaused(1, recovery_check=True)
-                    self._admit(parsed.path, control, read_key, allow_order_fallback, warmup)
+                    self._admit(parsed.path, control, read_key, warmup)
                     if probe:
                         self._probe_inflight = True
                 break
@@ -387,7 +384,7 @@ class SchwabRequestGate:
             with self._lock:
                 self._responses.append((self._monotonic(), status))
                 if read_key and (status == 400 or status >= 500):
-                    self._read_backoff(read_key, allow_fallback=len(parts) > 5)
+                    self._read_backoff(read_key)
                 elif read_key and 200 <= status < 300:
                     self._read_failures.pop(read_key, None)
                 if status == 403:

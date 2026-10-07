@@ -2381,11 +2381,20 @@ class ChocoletraBot:
         """Download one complete bundle; return seconds to wait before the next."""
         listos = sum(self._mtf_listo(t) for t in self.tickers)
         era_listo = self._mtf_listo(ticker)
+        # Paused while a cycle runs, so the slots freed by the previous bar's
+        # 1m reads go to this bar's. Eight more stay free per rolling minute
+        # for status/reconciliation reads and newly ready tickers.
+        margen = 8
+        with self._lock:
+            reales = any(p and not self._is_paper_ticker(t, pos=p)
+                         for t, p in list(self._posiciones.items()))
+        if reales and not era_listo:
+            # A cold download takes every slot it can; with REAL exposure it
+            # also leaves the position monitor's order-list reads (v3.3.18).
+            edad = max(1.0, float(getattr(self.ejecutor_hibrido, "monitor_status_max_age_s", 5) or 5))
+            margen += int(60 / edad) + 2
         try:
-            # Paused while a cycle runs, so the slots freed by the previous
-            # bar's 1m reads go to this bar's. Eight more stay free per rolling
-            # minute for status/reconciliation reads and newly ready tickers.
-            with schwab_warmup_requests(8, self._mtf_ciclo_libre):
+            with schwab_warmup_requests(margen, self._mtf_ciclo_libre):
                 datos = self.schwab.obtener_multitemporal(ticker, self.config)
         except Exception as exc:
             self._emit_log("WARN", f"[{ticker}] Descarga de históricos falló: {type(exc).__name__}")
@@ -3105,16 +3114,18 @@ class ChocoletraBot:
         # ningún stop/orden de cierre viejo de este símbolo vivo en el broker.
         # Schwab RECHAZA una apertura si una orden de cierre previa sigue activa
         # (la interpreta como 'sobrevendido/sobrecomprado'). Se cancelan primero.
-        if not self._asegurar_ticker_limpio(ticker):
-            decision.execution_skip_reason = "BROKER_SYMBOL_NOT_CLEAN"
+        limpieza = {}
+        if not self._asegurar_ticker_limpio(ticker, limpieza):
+            estado = limpieza.get("estado", "SYMBOL_NOT_CLEAN")
+            decision.execution_skip_reason = f"BROKER_{estado}"
             self._audit_event(
                 "ENTRY_BLOCKED", ticker=ticker, lado=prop.tipo,
-                estado="SYMBOL_NOT_CLEAN", cantidad=orden.cantidad,
+                estado=estado, cantidad=orden.cantidad,
                 precio=orden.precio_limite,
-                motivo="Persisten órdenes activas del símbolo",
+                motivo=limpieza.get("motivo", "Persisten órdenes activas del símbolo"),
             )
             self._set_ticker_processing(
-                ticker, "BLOCKED", "BROKER", "BROKER_SYMBOL_NOT_CLEAN",
+                ticker, "BLOCKED", "BROKER", decision.execution_skip_reason,
                 execution="NOT_EXECUTED",
             )
             return False
@@ -3850,14 +3861,17 @@ class ChocoletraBot:
             return regime
         return "AI_THRESHOLD"
 
-    def _asegurar_ticker_limpio(self, ticker: str) -> bool:
+    def _asegurar_ticker_limpio(self, ticker: str, detalle: Optional[dict] = None) -> bool:
         """Secuencia 'liberar acciones' EXACTA antes de ABRIR una entrada real:
         CANCELA de forma explícita cualquier orden de trabajo del símbolo (un stop u
         orden de cierre previo) → ESPERA y CONFIRMA que ya no está viva → recién
         entonces autoriza la orden nueva. Schwab RECHAZA abrir/cerrar/modificar si un
         stop (u OCO) activo tiene esas acciones 'comprometidas', sobre todo al
         REVERTIR. Devuelve True = símbolo confirmado limpio (abrir ya); False = no se
-        pudo confirmar (posponer al próximo ciclo, nunca abrir con un stop vivo)."""
+        pudo confirmar (posponer al próximo ciclo, nunca abrir con un stop vivo).
+        ``detalle`` (optional dict) receives why it was not confirmed:
+        ORDERS_UNREADABLE (Schwab orders not read) or SYMBOL_NOT_CLEAN."""
+        detalle = {} if detalle is None else detalle
         if self._is_paper_ticker(ticker):
             return True
         for _intento in range(4):
@@ -3873,6 +3887,8 @@ class ChocoletraBot:
                     f"[{ticker}] No se pudo confirmar las órdenes del broker "
                     f"({err_orders}); se pospone la operación",
                 )
+                detalle.update(estado="ORDERS_UNREADABLE",
+                               motivo=f"No se pudieron leer las órdenes de Schwab ({err_orders})")
                 return False
             propias = []
             seen = set()
@@ -3898,6 +3914,8 @@ class ChocoletraBot:
             # polling por estado; la siguiente lectura verifica la foto completa.
         self._emit_log("WARN", f"[{ticker}] No se confirmó la cancelación de órdenes previas; se "
                                f"pospone la apertura para no chocar con un stop activo en Schwab")
+        detalle.update(estado="SYMBOL_NOT_CLEAN",
+                       motivo=f"Persisten {len(propias)} orden(es) activa(s) del símbolo tras cancelar")
         return False
 
     def _reconciliar_huerfanas(self):
@@ -5087,14 +5105,19 @@ class ChocoletraBot:
                             == "RECONCILIAR"
                         )
 
+        # Polling every open position must not cost a request per order: reuse
+        # one recent account order list (fresh reads still confirm actions).
+        edad_max = getattr(self.ejecutor_hibrido, "monitor_status_max_age_s", 0)
         # TP1 llenado → mover a breakeven una vez
         if pos["salida_parcial"] and not pos["tp1_hit"] and pos["tp1_order_id"]:
-            if self.ejecutor_hibrido._estado_orden(self.account_number, pos["tp1_order_id"]) == "FILLED":
+            if self.ejecutor_hibrido._estado_orden(
+                    self.account_number, pos["tp1_order_id"], edad_max) == "FILLED":
                 self._ejecutar_parcial(ticker, pos)
                 return
         # SL/remanente llenado → finalizar
         if pos["sl_order_id"]:
-            if self.ejecutor_hibrido._estado_orden(self.account_number, pos["sl_order_id"]) == "FILLED":
+            if self.ejecutor_hibrido._estado_orden(
+                    self.account_number, pos["sl_order_id"], edad_max) == "FILLED":
                 self._cerrar_posicion(ticker, pos["sl_actual"], motivo="SL(real)")
                 return
 

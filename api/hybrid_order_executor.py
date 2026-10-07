@@ -34,7 +34,8 @@ import os
 import re
 import requests
 import threading
-from contextlib import contextmanager
+import time
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta
 from typing import Optional, Tuple
 from dataclasses import dataclass
@@ -372,6 +373,13 @@ class EjecutorHibridoDeOrdenes:
         # Background observation has a separate clock from short acknowledgement
         # waits. A 100ms synchronizer setting must not become perpetual HTTP polling.
         self.monitor_interval_ms = max(1000, int(sync_cfg.get("monitor_interval_ms", 2000)))
+        # v3.3.18: the open-position monitor reuses one account order list for
+        # this long (every position and exit order shares it). Confirmations
+        # and other callers always read fresh.
+        self.monitor_status_max_age_s = max(
+            self.monitor_interval_ms, int(sync_cfg.get("monitor_status_max_age_ms", 5000))) / 1000.0
+        self._order_list_cache = None   # (monotonic, account, orders)
+        self._order_list_lock = threading.Lock()
 
         if self.paper_trading:
             _ps("[HIBRIDO] Modo PAPER TRADING — ordenes simuladas")
@@ -964,69 +972,102 @@ class EjecutorHibridoDeOrdenes:
         resultado["intentos_chase"] = self.chase_max_reintentos
         return resultado
 
-    def _buscar_orden_en_listado(self, account_number: str, order_id: str) -> Optional[dict]:
+    @staticmethod
+    def _orden_en(orders, order_id) -> Optional[dict]:
+        objetivo = str(order_id)
+        for o in orders or []:
+            if (isinstance(o, dict) and str(o.get("orderId", "")) == objetivo
+                    and isinstance(o.get("status"), str) and o["status"]):
+                return o
+        return None
+
+    def _listado_ordenes(self, account_number: str, max_age_s: float = 0,
+                         visto=None) -> Optional[list]:
+        """Account orders of the last two days, any status; None if unreadable.
+
+        With ``max_age_s`` a list read that recently is reused, and concurrent
+        callers wait for one shared read instead of each sending their own.
+        ``visto`` is a list the caller already searched; it is never reused.
+        """
+        with (self._order_list_lock if max_age_s > 0 else nullcontext()):
+            cached = self._order_list_cache
+            if (max_age_s > 0 and cached and cached[1] == account_number
+                    and cached[2] is not visto
+                    and time.monotonic() - cached[0] <= max_age_s):
+                return cached[2]
+            ahora = datetime.utcnow()
+            desde = ahora - timedelta(days=2)
+            # El límite SUPERIOR se adelanta 1 día: si el reloj del VPS va ATRASADO,
+            # la 'enteredTime' real (reloj de Schwab) de una orden recién puesta sería
+            # POSTERIOR a 'ahora' y quedaría FUERA de la ventana. El colchón evita que
+            # un reloj desfasado oculte órdenes recientes de la consulta.
+            hasta = ahora + timedelta(days=1)
+            fmt = "%Y-%m-%dT%H:%M:%S.000Z"
+            url = f"{self.TRADER_URL}/accounts/{account_number}/orders"
+            try:
+                r = schwab_request(self._http_session().get, url, params={
+                    "fromEnteredTime": desde.strftime(fmt),
+                    "toEnteredTime": hasta.strftime(fmt),
+                    "maxResults": 500,
+                }, timeout=self.request_timeout_s)
+                r.raise_for_status()
+                data = r.json()
+            except (SchwabRequestPaused, SchwabRequestDeferred):
+                return None
+            except Exception:
+                # The transport persists redacted HTTP failures once per sent call.
+                # No response body/account/order URL is printed on each local poll.
+                return None
+            if not isinstance(data, list):
+                return None
+            self._order_list_cache = (time.monotonic(), account_number, data)
+            return data
+
+    def _buscar_orden_en_listado(self, account_number: str, order_id: str,
+                                 max_age_s: float = 0) -> Optional[dict]:
         """Obtiene UNA orden, usando primero el endpoint por id y luego el listado.
 
-        El listado conserva el workaround de errores del endpoint por id, pero
-        el transporte permite solo un fallback por racha de fallo de la cuenta.
+        El listado conserva el workaround de errores del endpoint por id. Since
+        v3.3.18 each has its own transport backoff, so while the per-order
+        endpoint is backing off a lookup goes straight to the list instead of
+        staying unknown. ``max_age_s`` lets the position monitor reuse a recent
+        list; confirmations pass 0 and always read fresh.
         Una pausa local o un fallo sin recuperación queda desconocido.
         """
         if not order_id:
             return None
-        allow_fallback = False
+        visto = None
+        if max_age_s > 0:
+            cached = self._order_list_cache
+            if (cached and cached[1] == account_number
+                    and time.monotonic() - cached[0] <= max_age_s):
+                found = self._orden_en(cached[2], order_id)
+                if found is not None:
+                    return found
+                visto = cached[2]   # The order is newer than this list.
         direct_url = f"{self.TRADER_URL}/accounts/{account_number}/orders/{order_id}"
         try:
             direct = schwab_request(self._http_session().get,
                 direct_url, timeout=self.request_timeout_s)
             if direct.status_code in (401, 403, 429):
                 return None  # Shared transport records both HTTP and broker status.
-            if direct.status_code == 400 or direct.status_code >= 500:
-                allow_fallback = True
-            else:
+            if not (direct.status_code == 400 or direct.status_code >= 500):
                 direct.raise_for_status()
                 data = direct.json()
                 if (isinstance(data, dict) and str(data.get("orderId", "")) == str(order_id)
                         and isinstance(data.get("status"), str) and data["status"]):
                     return data
-        except (SchwabRequestPaused, SchwabRequestDeferred):
+        except SchwabRequestPaused:
             return None
+        except SchwabRequestDeferred as exc:
+            if exc.reason != "order_read_backoff":
+                return None  # Rolling/burst limits would refuse the list as well.
         except requests.RequestException as exc:
             if getattr(getattr(exc, "response", None), "status_code", None) != 404:
                 return None
         except Exception:
             pass
-
-        ahora = datetime.utcnow()
-        desde = ahora - timedelta(days=2)
-        # El límite SUPERIOR se adelanta 1 día: si el reloj del VPS va ATRASADO,
-        # la 'enteredTime' real (reloj de Schwab) de una orden recién puesta sería
-        # POSTERIOR a 'ahora' y quedaría FUERA de la ventana. El colchón evita que
-        # un reloj desfasado oculte órdenes recientes de la consulta.
-        hasta = ahora + timedelta(days=1)
-        fmt = "%Y-%m-%dT%H:%M:%S.000Z"
-        url = f"{self.TRADER_URL}/accounts/{account_number}/orders"
-        try:
-            r = schwab_request(self._http_session().get, url, params={
-                "fromEnteredTime": desde.strftime(fmt),
-                "toEnteredTime": hasta.strftime(fmt),
-                "maxResults": 500,
-            }, timeout=self.request_timeout_s, allow_order_fallback=allow_fallback)
-            r.raise_for_status()
-            data = r.json()
-            if not isinstance(data, list):
-                return None
-            objetivo = str(order_id)
-            for o in data:
-                if (isinstance(o, dict) and str(o.get("orderId", "")) == objetivo
-                        and isinstance(o.get("status"), str) and o["status"]):
-                    return o
-            return None
-        except (SchwabRequestPaused, SchwabRequestDeferred):
-            return None
-        except Exception:
-            # The transport persists redacted HTTP failures once per sent call.
-            # No response body/account/order URL is printed on each local poll.
-            return None
+        return self._orden_en(self._listado_ordenes(account_number, max_age_s, visto), order_id)
 
 
     def _working_orders_snapshot(self, account_number: str) -> Optional[list]:
@@ -1225,11 +1266,11 @@ class EjecutorHibridoDeOrdenes:
             "error": result.error,
         }
 
-    def _estado_orden(self, account_number: str, order_id: str) -> str:
+    def _estado_orden(self, account_number: str, order_id: str, max_age_s: float = 0) -> str:
         """Consulta el estado de una orden (WORKING/FILLED/...) vía el LISTADO."""
         if not order_id:
             return "DESCONOCIDO"
-        d = self._buscar_orden_en_listado(account_number, order_id)
+        d = self._buscar_orden_en_listado(account_number, order_id, max_age_s)
         if not d:
             return "DESCONOCIDO"
         return str(d.get("status", "DESCONOCIDO")).upper()

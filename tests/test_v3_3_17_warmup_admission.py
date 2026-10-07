@@ -37,6 +37,7 @@ def make_bot(clock, client, *, tickers=("AAPL",), real=(), background=False, sle
     bot._mtf_lock, bot._mtf_ciclo_libre = threading.Lock(), threading.Event()
     bot._mtf_ciclo_libre.set()
     bot._mtf_fallos, bot._mtf_reintento = {}, {}
+    bot._lock, bot._posiciones = threading.RLock(), {}   # v3.3.18: REAL-exposure headroom
     bot._mtf_refresco_hilo = SimpleNamespace(is_alive=lambda: bot._activo) if background else None
     bot._real_tickers = lambda names: [t for t in names if t in set(real)]
     bot._emit_log = Mock()
