@@ -64,7 +64,7 @@ from core.position_state import (
 from core.trade_history import TradeHistoryLedger
 
 from api.schwab_client import SchwabClient
-from api.schwab_transport import schwab_control_requests
+from api.schwab_transport import SchwabRequestDeferred, SchwabRequestPaused, schwab_control_requests
 from api.hybrid_order_executor import EjecutorHibridoDeOrdenes, ContextoMercado
 
 from gsco.sheets_client import SheetsClient
@@ -1533,6 +1533,15 @@ class ChocoletraBot:
                 detail=type(exc).__name__,
             )
             return
+        if getattr(datos, "estado_datos", "READY") != "READY":
+            reason = getattr(datos, "motivo_datos", "MARKET_DATA_UNAVAILABLE")
+            retry = int(getattr(datos, "reintento_seg", 0) or 0)
+            self._emit_log("WARN", f"[{ticker}] Datos Schwab pendientes: {reason}; reintento en próximo ciclo ({retry}s mínimo)")
+            self._set_ticker_processing(
+                ticker, "WAITING", "MARKET_DATA", reason,
+                market_data="PENDING", retry_after_seconds=retry,
+            )
+            return
         datos_confirmados = self._datos_micro_confirmados(datos)
         # GALA10 y el dimensionamiento inmediato trabajan sobre 1m. Las TF mayores
         # siguen disponibles para los agentes como contexto/veto.
@@ -2250,6 +2259,9 @@ class ChocoletraBot:
             ticker=datos.ticker,
             velas=velas,
             sintetico=datos.sintetico,
+            estado_datos=getattr(datos, "estado_datos", "READY"),
+            motivo_datos=getattr(datos, "motivo_datos", ""),
+            reintento_seg=getattr(datos, "reintento_seg", 0),
         )
 
     def _senal_estrategia(self, datos: DatosMultiTemporal, ticker: str,
@@ -2298,38 +2310,38 @@ class ChocoletraBot:
         se atrasa frente a la pantalla real y no se satura la API con muchos tickers."""
         ahora = time.time()
         if not self.schwab._asegurar_token():
-            # Demo: genera una nueva ventana con timestamps actuales en cada cierre
-            # de minuto, sin disparar solicitudes 401. Real: el marcador sintetico
-            # bloquea cualquier entrada y el monitor de órdenes queda fail-closed.
-            datos = self.schwab._multitemporal_fallback(ticker)
-            self._mtf_cache[ticker] = (ahora, datos, ahora)
-            return datos
+            return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING", motivo_datos="AUTH_UNAVAILABLE")
         ent = self._mtf_cache.get(ticker)     # (t_macro, datos, t_micro)
-        if ent and (ahora - ent[0]) < self._mtf_ttl_macro:
+        if (ent and not ent[1].sintetico and getattr(ent[1], "estado_datos", "READY") == "READY"
+                and (ahora - ent[0]) < self._mtf_ttl_macro):
             datos = ent[1]
             if (ahora - ent[2]) >= self._mtf_ttl:
                 m1 = None
                 try:
                     m1 = self.schwab.obtener_1m_reciente(ticker)
+                except (SchwabRequestPaused, SchwabRequestDeferred) as exc:
+                    return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING",
+                                              motivo_datos=getattr(exc, "reason", "HTTP_PAUSE"),
+                                              reintento_seg=exc.retry_after_seconds)
                 except Exception as e:
-                    self._emit_log("WARN", f"[{ticker}] Error refrescando el precio 1m: {e}")
+                    self._emit_log("WARN", f"[{ticker}] Error refrescando el precio 1m: {type(e).__name__}")
                 if m1 is not None and len(m1) > 40:
-                    from api.schwab_client import SchwabClient
                     datos.velas["1m"] = m1
-                    m5 = SchwabClient._resample(m1, "5min")
+                    m5 = self.schwab._resample(m1, "5min")
                     if m5 is not None and len(m5) > 0:
                         datos.velas["5m"] = m5
                     # Solo marcar el micro como FRESCO si el 1m se actualizó de verdad.
-                    self._mtf_cache[ticker] = (ent[0], datos, ahora)
+                    self._mtf_cache[ticker] = (ent[0], datos, time.time())
                 else:
-                    # Fetch falló o vino corto: NO se toca t_micro, así el próximo ciclo
-                    # REINTENTA (no se congela el precio en silencio) y se avisa. La
-                    # antigüedad máxima queda acotada por el refresco macro (mtf_refresh_macro_sec).
-                    self._emit_log("WARN", f"[{ticker}] Precio 1m no se actualizó "
-                                           f"(API sin datos) — se usa el último y se reintenta")
+                    # Keep the good macro cache for recovery, but never publish
+                    # an old/synthetic micro frame as today's usable price.
+                    return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING",
+                                              motivo_datos="MICRO_REFRESH_UNAVAILABLE")
             return datos
         datos = self.schwab.obtener_multitemporal(ticker, self.config)
-        self._mtf_cache[ticker] = (ahora, datos, ahora)
+        if not datos.sintetico and getattr(datos, "estado_datos", "READY") == "READY":
+            completed = time.time()
+            self._mtf_cache[ticker] = (completed, datos, completed)
         return datos
 
     # ==========================================================

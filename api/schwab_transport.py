@@ -109,10 +109,11 @@ class SchwabRequestPaused(requests.RequestException):
 class SchwabRequestGate:
     def __init__(self, state_path=DEFAULT_STATE_PATH, *, clock=None, monotonic=None,
                  requests_per_minute=90, control_reserve=30, burst_per_second=6,
-                 diagnostic_sink=None):
+                 diagnostic_sink=None, wait=None):
         self.state_path = Path(state_path)
         self._clock = clock or time.time
         self._monotonic = monotonic or time.monotonic
+        self._wait = wait or time.sleep
         self._lock = threading.RLock()
         self._until = 0.0
         self._deadline = 0.0
@@ -318,7 +319,7 @@ class SchwabRequestGate:
         self._save()
 
     def request(self, send, url: str, *, recovery_safe: bool = True,
-                allow_order_fallback: bool = False, **kwargs):
+                allow_order_fallback: bool = False, admission_wait_seconds=0, **kwargs):
         parsed = urlsplit(str(url))
         if (parsed.hostname or "").lower() != "api.schwabapi.com":
             return send(url, **kwargs)
@@ -330,18 +331,32 @@ class SchwabRequestGate:
         parts = parsed.path.strip("/").split("/")
         read_key = ("/".join(parts[:5]) if method == "GET" and len(parts) >= 5
                     and parts[:3] == ["trader", "v1", "accounts"] and parts[4] == "orders" else None)
-        with self._lock:
-            remaining = self.remaining()
-            if remaining or self._probe_inflight:
-                self._deferred["http_pause"] += 1
-                raise SchwabRequestPaused(remaining or 1, reason=self._pause_reason)
-            probe = self._recovery_pending
-            if probe and not recovery_safe:
-                self._deferred["recovery_required"] += 1
-                raise SchwabRequestPaused(1, recovery_check=True)
-            self._admit(parsed.path, control, read_key, allow_order_fallback)
-            if probe:
-                self._probe_inflight = True
+        # Only history GETs may wait briefly for local admission. Mutations are
+        # never queued/replayed; 403/429 pauses are never waited out here.
+        can_wait = recovery_safe and method == "GET" and parsed.path == "/marketdata/v1/pricehistory"
+        wait_seconds = max(0, min(5, float(admission_wait_seconds or 0))) if can_wait else 0
+        wait_deadline = self._monotonic() + wait_seconds
+        while True:
+            try:
+                with self._lock:
+                    remaining = self.remaining()
+                    if remaining or self._probe_inflight:
+                        self._deferred["http_pause"] += 1
+                        raise SchwabRequestPaused(remaining or 1, reason=self._pause_reason)
+                    probe = self._recovery_pending
+                    if probe and not recovery_safe:
+                        self._deferred["recovery_required"] += 1
+                        raise SchwabRequestPaused(1, recovery_check=True)
+                    self._admit(parsed.path, control, read_key, allow_order_fallback)
+                    if probe:
+                        self._probe_inflight = True
+                break
+            except SchwabRequestDeferred as exc:
+                available = wait_deadline - self._monotonic()
+                if available <= 0 or exc.reason not in {
+                        "request_budget", "control_capacity_reserved", "request_burst", "control_burst_reserved"}:
+                    raise
+                self._wait(min(available, exc.retry_after_seconds))
         try:
             response = send(url, **kwargs)
             status = int(getattr(response, "status_code", 0) or 0)
