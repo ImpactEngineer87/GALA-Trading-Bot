@@ -3060,6 +3060,7 @@ async function diagnoseSchwabNetwork(){
       EDGE_ROUTE_BLOCKED:'Schwab/Akamai rechazó una sonda del servidor',
       DNS_OR_NETWORK_FAILURE:'Fallo de DNS o conexión desde el servidor',
       NETWORK_PROBE_FAILED:'No se pudo completar la prueba de red',
+      LOCAL_BUDGET_BUSY:'Sondas no enviadas: límite local de solicitudes ocupado',
       ROUTE_INCONCLUSIVE:'Prueba sin resultado concluyente',
       OAUTH_ENDPOINT_REACHABLE:'Endpoint OAuth accesible en esta prueba; credenciales sin verificar'
     };
@@ -3068,6 +3069,7 @@ async function diagnoseSchwabNetwork(){
       EDGE_ROUTE_BLOCKED:'Espere al menos 10 minutos sin repetir conexiones ni sondas. Mantenga estable la ruta del VPS. Si persiste, contacte con soporte Schwab y el proveedor del VPS e incluya el Reference ID y la hora del bloqueo.',
       DNS_OR_NETWORK_FAILURE:'Revise DNS, conectividad HTTPS, firewall y proxy en el servidor del bot con el proveedor del VPS; repita el diagnóstico después de corregir el fallo.',
       NETWORK_PROBE_FAILED:'Revise el error de las sondas y los registros del servidor. Repita la prueba cuando el servicio de diagnóstico esté disponible.',
+      LOCAL_BUDGET_BUSY:'No es un fallo de red, DNS ni credenciales: el bot reservó sus solicitudes (por ejemplo, para la descarga inicial de históricos). Repita el diagnóstico tras la espera indicada o con el motor detenido.',
       ROUTE_INCONCLUSIVE:'Revise las respuestas de las sondas y los registros del servidor. Este resultado no demuestra que el intercambio OAuth vaya a funcionar.',
       OAUTH_ENDPOINT_REACHABLE:'La sonda no autentica la cuenta ni verifica el Client ID/Secret. Si necesita reconectar, genere un código OAuth nuevo y envíelo una sola vez desde el dashboard; el intercambio real confirmará el resultado.'
     };
@@ -3075,6 +3077,7 @@ async function diagnoseSchwabNetwork(){
     const fmt=(name,row)=>{
       row=row||{};
       if(row.paused) return name+': no enviada · espera activa';
+      if(row.deferred) return name+': no enviada · límite local ocupado ('+(row.local_retry_after_seconds||1)+' s)';
       const edge=row.edge_access_denied?' · acceso rechazado por Schwab/Akamai':'';
       const net=row.network_error?' · '+row.network_error:'';
       return name+': HTTP '+(row.http_status||'—')+edge+net;
@@ -3088,7 +3091,7 @@ async function diagnoseSchwabNetwork(){
     if(box){
       box.textContent='Origen: '+origin+' · Host: '+host+'\nResultado: '+(conclusions[conclusion] || conclusions.ROUTE_INCONCLUSIVE)+' ('+conclusion+')\nCredenciales OAuth: no verificadas por esta prueba\n'+fmt('Authorize',probes.authorize)+'\n'+fmt('Token (sonda sin credenciales)',probes.token_endpoint)+'\n'+fmt('Trader',probes.trader)+dns+refs+pause+'\n\n'+(recoveries[conclusion] || recoveries.ROUTE_INCONCLUSIVE)+'\n\nEl inicio de sesión en el portátil no prueba la ruta del VPS. Las solicitudes de tokens salen del host indicado.';
       box.style.display='block';
-      box.style.borderColor=conclusion==='OAUTH_ENDPOINT_REACHABLE'?'rgba(34,197,94,.35)':(conclusion==='ROUTE_INCONCLUSIVE'?'rgba(255,176,32,.45)':'rgba(239,68,68,.45)');
+      box.style.borderColor=conclusion==='OAUTH_ENDPOINT_REACHABLE'?'rgba(34,197,94,.35)':(conclusion==='ROUTE_INCONCLUSIVE'||conclusion==='LOCAL_BUDGET_BUSY'?'rgba(255,176,32,.45)':'rgba(239,68,68,.45)');
     }
     if(conclusion==='EDGE_ROUTE_BLOCKED') toast('err','Acceso Schwab rechazado','Revise la ruta del servidor del bot y conserve el Reference ID para soporte.');
     else if(conclusion==='DNS_OR_NETWORK_FAILURE' || conclusion==='NETWORK_PROBE_FAILED') toast('err','Diagnóstico Schwab',conclusions[conclusion]);
