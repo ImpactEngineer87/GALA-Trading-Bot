@@ -234,13 +234,17 @@ class ProviderRecoveryTests(unittest.TestCase):
 class EngineRecoveryTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
-        cls = load_methods("engine/bot_engine.py", "ChocoletraBot", {"_obtener_mtf"}, {
+        cls = load_methods("engine/bot_engine.py", "ChocoletraBot",
+                           {"_obtener_mtf", "_mtf_listo", "_mtf_refresco_activo"}, {
             "DatosMultiTemporal": DatosMultiTemporal,
             "time": SimpleNamespace(time=lambda: self.clock.wall)})
         self.bot = cls()
         self.bot.config = {}
         self.bot._mtf_cache = {}
         self.bot._mtf_ttl, self.bot._mtf_ttl_macro = 30, 300
+        # v3.3.17: no background refresher here, so the cycle path downloads.
+        self.bot._mtf_macro_max_stale = 600
+        self.bot._mtf_lock, self.bot._mtf_refresco_hilo = threading.Lock(), None
         self.bot._emit_log = Mock()
         self.client = make_client(self.clock)
         self.bot.schwab = self.client

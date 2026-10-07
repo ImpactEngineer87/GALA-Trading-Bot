@@ -69,6 +69,7 @@ from api.schwab_oauth import (
 )
 from api.schwab_transport import (
     MIN_FORBIDDEN_PAUSE_SECONDS,
+    SchwabRequestDeferred,
     SchwabRequestPaused,
     schwab_request,
     schwab_request_pause,
@@ -96,6 +97,8 @@ SCHWAB_MKT_URL   = "https://api.schwabapi.com/marketdata/v1"
 SCHWAB_TRADE_URL = "https://api.schwabapi.com/trader/v1"
 SCHWAB_AUTH_NOTIFICATION_SECONDS = 5 * 60
 SCHWAB_STATUS_CACHE_SECONDS = 20
+# A locally deferred check (nothing sent) keeps a "connected" result this recent.
+SCHWAB_DEFERRED_VERIFY_GRACE_SECONDS = 5 * 60
 
 # =============================================================
 # SHARED STATE  (Bot engine reads/writes this directly)
@@ -1089,6 +1092,15 @@ def _set_schwab_auth_state(state: str, message: str = "", *,
         BOT_STATE["schwab_reauthorization_required"] = True
 
 
+def _schwab_verified_age_seconds() -> float:
+    """Seconds since the last confirmed verification; infinite if none."""
+    try:
+        verified = datetime.fromisoformat(str(BOT_STATE.get("schwab_auth_verified_at") or ""))
+        return max(0.0, (datetime.now(timezone.utc) - verified).total_seconds())
+    except (TypeError, ValueError):
+        return float("inf")
+
+
 def _schwab_auth_snapshot() -> dict:
     """Return the dashboard contract without exposing OAuth credentials."""
     state = str(BOT_STATE.get("schwab_auth_state") or "unknown")
@@ -1448,6 +1460,17 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
         _set_schwab_auth_state("unavailable", str(exc), verified=False,
                               cache_seconds=exc.retry_after_seconds)
         return False
+    except SchwabRequestDeferred as exc:
+        # Refused by the local request limit before sending: not a network
+        # failure or a Schwab pause, so no backoff and the token is unused.
+        _set_schwab_auth_state(
+            "unavailable",
+            f"Renovación Schwab pospuesta por el límite local de solicitudes "
+            f"({exc.reason}); no se envió nada. Reintento en {exc.retry_after_seconds}s.",
+            verified=False,
+            cache_seconds=exc.retry_after_seconds,
+        )
+        return False
     except requests.RequestException as exc:
         backoff = max(
             30, min(300, int(
@@ -1612,6 +1635,22 @@ def _verify_schwab_connection(*, force: bool = False) -> dict:
         except SchwabRequestPaused as exc:
             _set_schwab_auth_state("unavailable", str(exc), verified=False,
                                   cache_seconds=exc.retry_after_seconds)
+        except SchwabRequestDeferred as exc:
+            # Nothing was sent, so this says nothing about the connection. A
+            # recent confirmed result stands; recheck after the local wait.
+            recheck = max(SCHWAB_STATUS_CACHE_SECONDS, exc.retry_after_seconds)
+            if (BOT_STATE.get("schwab_auth_state") == "connected"
+                    and _schwab_verified_age_seconds() <= SCHWAB_DEFERRED_VERIFY_GRACE_SECONDS):
+                BOT_STATE["schwab_auth_next_check_monotonic"] = time.monotonic() + recheck
+            else:
+                _set_schwab_auth_state(
+                    "unavailable",
+                    "Verificación Schwab pospuesta: el límite local de solicitudes está "
+                    f"ocupado ({exc.reason}); no se envió ninguna solicitud y no indica "
+                    f"un fallo de red. Reintento en {recheck}s.",
+                    verified=False,
+                    cache_seconds=recheck,
+                )
         except requests.RequestException as exc:
             _set_schwab_auth_state(
                 "unavailable",
@@ -2243,6 +2282,12 @@ def _probe_schwab_route(
                 "request_sent": False, "paused": True,
                 "retry_after_seconds": exc.retry_after_seconds,
                 "edge_access_denied": False, "edge_reference": None, "edge_url": None}
+    except SchwabRequestDeferred as exc:
+        # Local request limit; no packet left this server, so not a network result.
+        return {"ok": False, "oauth_response": False, "http_status": 0,
+                "request_sent": False, "deferred": True, "deferred_reason": exc.reason,
+                "local_retry_after_seconds": exc.retry_after_seconds,
+                "edge_access_denied": False, "edge_reference": None, "edge_url": None}
     except requests.RequestException as exc:
         return {
             "ok": False,
@@ -2339,6 +2384,14 @@ def schwab_network_diagnostics():
             "El servidor del bot no resolvió api.schwabapi.com. Revise DNS/Internet "
             "del VPS. Este diagnóstico no valida credenciales."
         )
+    elif any(row.get("deferred") for row in probes.values()):
+        conclusion = "LOCAL_BUDGET_BUSY"
+        recommendation = (
+            "Una o más sondas no se enviaron: el límite local de solicitudes del bot "
+            "está ocupado (por ejemplo, la descarga inicial de históricos). No es un "
+            "fallo de red, DNS ni credenciales. Repita el diagnóstico después de la "
+            "espera indicada o con el motor detenido."
+        )
     elif token_endpoint.get("oauth_response") and all(row.get("ok") for row in probes.values()):
         conclusion = "OAUTH_ENDPOINT_REACHABLE"
         recommendation = (
@@ -2368,6 +2421,8 @@ def schwab_network_diagnostics():
         "conclusion": conclusion,
         "same_network_retry_recommended": conclusion == "OAUTH_ENDPOINT_REACHABLE",
         "retry_after_seconds": _schwab_retry_remaining(),
+        "local_retry_after_seconds": max(
+            int(row.get("local_retry_after_seconds") or 0) for row in probes.values()),
         "references": references,
         "recommendation": recommendation,
         "probes": probes,
@@ -2588,6 +2643,19 @@ def schwab_connect():
             # mark the authorization code as consumed or replace saved tokens.
             BOT_STATE["schwab_oauth_last_code_fingerprint"] = previous_fingerprint
             return _schwab_pause_response(exc.retry_after_seconds)
+        except SchwabRequestDeferred as exc:
+            # Same: refused by the local request limit before the POST, so the
+            # single-use code is still unused and may be submitted again.
+            BOT_STATE["schwab_oauth_last_code_fingerprint"] = previous_fingerprint
+            response = jsonify({
+                "status": "error", "request_sent": False,
+                "message": "El límite local de solicitudes está ocupado; el código OAuth "
+                           f"no se envió. Reintente con el mismo código en {exc.retry_after_seconds}s.",
+                "local_retry_after_seconds": exc.retry_after_seconds,
+            })
+            response.status_code = 503
+            response.headers["Retry-After"] = str(exc.retry_after_seconds)
+            return response
         except requests.RequestException as exc:
             _set_schwab_auth_state(
                 "unavailable",

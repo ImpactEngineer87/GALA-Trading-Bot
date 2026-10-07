@@ -60,6 +60,22 @@ def schwab_control_requests():
         _TRAFFIC_CONTEXT.control = previous
 
 
+@contextmanager
+def schwab_warmup_requests(headroom, allowed=None):
+    """Mark background history downloads in this thread.
+
+    They may not use the last ``headroom`` background slots of the rolling
+    minute, which stay free for per-cycle reads, and are refused while the
+    ``allowed`` event is clear. OAuth and other control traffic is unaffected.
+    """
+    previous = getattr(_TRAFFIC_CONTEXT, "warmup", None)
+    _TRAFFIC_CONTEXT.warmup = (max(0, int(headroom)), allowed)
+    try:
+        yield
+    finally:
+        _TRAFFIC_CONTEXT.warmup = previous
+
+
 def _safe_endpoint(path):
     parts = path.strip("/").split("/")
     if len(parts) >= 4 and parts[:3] == ["trader", "v1", "accounts"]:
@@ -244,7 +260,7 @@ class SchwabRequestGate:
         self._deferred[reason] += 1
         raise SchwabRequestDeferred(seconds, reason)
 
-    def _admit(self, path, control, read_key, allow_order_fallback=False):
+    def _admit(self, path, control, read_key, allow_order_fallback=False, warmup=None):
         self._prune()
         now = self._monotonic()
         failure = self._read_failures.get(read_key)
@@ -261,6 +277,12 @@ class SchwabRequestGate:
         background = [entry for entry in self._sent if not entry[1]]
         if not control and len(background) >= self._budget - self._reserve:
             self._defer(background[0][0] + 60 - now, "control_capacity_reserved")
+        if warmup is not None and not control:
+            headroom, allowed = warmup
+            if allowed is not None and not allowed.is_set():
+                self._defer(1, "warmup_paused")
+            if len(background) >= max(1, self._budget - self._reserve - headroom):
+                self._defer(background[0][0] + 60 - now, "warmup_headroom_reserved")
         recent = [entry for entry in self._sent if entry[0] > now - 1]
         background_recent = [entry for entry in recent if not entry[1]]
         if len(recent) >= self._burst:
@@ -328,6 +350,7 @@ class SchwabRequestGate:
             method = "REQUEST"
         control = (not recovery_safe or parsed.path == "/v1/oauth/token"
                    or getattr(_TRAFFIC_CONTEXT, "control", False))
+        warmup = getattr(_TRAFFIC_CONTEXT, "warmup", None)
         parts = parsed.path.strip("/").split("/")
         read_key = ("/".join(parts[:5]) if method == "GET" and len(parts) >= 5
                     and parts[:3] == ["trader", "v1", "accounts"] and parts[4] == "orders" else None)
@@ -347,14 +370,15 @@ class SchwabRequestGate:
                     if probe and not recovery_safe:
                         self._deferred["recovery_required"] += 1
                         raise SchwabRequestPaused(1, recovery_check=True)
-                    self._admit(parsed.path, control, read_key, allow_order_fallback)
+                    self._admit(parsed.path, control, read_key, allow_order_fallback, warmup)
                     if probe:
                         self._probe_inflight = True
                 break
             except SchwabRequestDeferred as exc:
                 available = wait_deadline - self._monotonic()
                 if available <= 0 or exc.reason not in {
-                        "request_budget", "control_capacity_reserved", "request_burst", "control_burst_reserved"}:
+                        "request_budget", "control_capacity_reserved", "warmup_headroom_reserved",
+                        "request_burst", "control_burst_reserved"}:
                     raise
                 self._wait(min(available, exc.retry_after_seconds))
         try:

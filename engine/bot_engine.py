@@ -64,7 +64,9 @@ from core.position_state import (
 from core.trade_history import TradeHistoryLedger
 
 from api.schwab_client import SchwabClient
-from api.schwab_transport import SchwabRequestDeferred, SchwabRequestPaused, schwab_control_requests
+from api.schwab_transport import (
+    SchwabRequestDeferred, SchwabRequestPaused, schwab_control_requests, schwab_warmup_requests,
+)
 from api.hybrid_order_executor import EjecutorHibridoDeOrdenes, ContextoMercado
 
 from gsco.sheets_client import SheetsClient
@@ -378,6 +380,18 @@ class ChocoletraBot:
         # Refresco MACRO (30m/1H/4H/1D/1W): se re-bajan cada varios minutos (cambian
         # lento). Así el precio va fresco SIN saturar la API cuando hay muchos tickers.
         self._mtf_ttl_macro = self.config.get("engine", {}).get("mtf_refresh_macro_sec", 300)
+        # v3.3.17: macro frames may be used up to this age while 1m stays fresh.
+        self._mtf_macro_max_stale = max(float(self._mtf_ttl_macro), float(
+            self.config.get("engine", {}).get("mtf_macro_max_stale_sec", 2 * self._mtf_ttl_macro)))
+        # v3.3.17: a cold download needs ~19 history pages per ticker and a
+        # macro refresh ~6. One background thread does both, so a cycle sends
+        # one 1m read per ticker and never waits on (or competes with) warmup.
+        self._mtf_lock = threading.Lock()
+        self._mtf_ciclo_libre = threading.Event()   # clear while a cycle runs
+        self._mtf_ciclo_libre.set()
+        self._mtf_refresco_hilo: Optional[threading.Thread] = None
+        self._mtf_fallos: Dict[str, int] = {}
+        self._mtf_reintento: Dict[str, float] = {}
 
         # Hooks del dashboard (los inyecta server.py)
         self._hooks: Dict[str, Callable] = {}
@@ -1111,6 +1125,7 @@ class ChocoletraBot:
         # ciego. Las protecciones (SL/TP) siguen vivas en el broker.
         self._reconciliar_al_iniciar()
         self._iniciar_monitor_ordenes()
+        self._iniciar_refresco_mtf()
 
         guard = self._daily_guard()
         if guard is not None:
@@ -1180,6 +1195,8 @@ class ChocoletraBot:
                     self._esperar_cierre_confirmado(bar_delay_ms)
                     if not self._activo:
                         break
+                # Background history downloads pause while this cycle runs.
+                self._mtf_ciclo_libre.clear()
                 try:
                     # Kill switch por cierre de mercado
                     if self.ks_liquidar_cierre and self._es_hora_cierre():
@@ -1214,6 +1231,7 @@ class ChocoletraBot:
                     # pase lo que pase en las rutas individuales (invariante: el broker
                     # es la fuente de verdad y se reconcilia cada ciclo).
                     self._reconciliar_huerfanas()
+                    self._resumen_historicos_mtf()
                     n_workers = max(1, min(len(self.tickers), max_workers))
                     with ThreadPoolExecutor(max_workers=n_workers) as pool:
                         futuros = {pool.submit(self._procesar_ticker, t): t for t in self.tickers}
@@ -1244,6 +1262,8 @@ class ChocoletraBot:
                     # el siguiente ciclo. Antes cualquier fallo transitorio de la API se
                     # escapaba del while y el motor se apagaba solo (había que reencender).
                     self._emit_log("ERROR", f"Error en el ciclo (se continúa, no se apaga): {e}")
+                finally:
+                    self._mtf_ciclo_libre.set()
 
                 # Non-1m modes retain their configured fixed interval. The 1m
                 # mode waits at the top of the next iteration so its first cycle
@@ -1536,7 +1556,8 @@ class ChocoletraBot:
         if getattr(datos, "estado_datos", "READY") != "READY":
             reason = getattr(datos, "motivo_datos", "MARKET_DATA_UNAVAILABLE")
             retry = int(getattr(datos, "reintento_seg", 0) or 0)
-            self._emit_log("WARN", f"[{ticker}] Datos Schwab pendientes: {reason}; reintento en próximo ciclo ({retry}s mínimo)")
+            if reason != "WARMUP_PENDING":   # resumido una vez por ciclo
+                self._emit_log("WARN", f"[{ticker}] Datos Schwab pendientes: {reason}; reintento en próximo ciclo ({retry}s mínimo)")
             self._set_ticker_processing(
                 ticker, "WAITING", "MARKET_DATA", reason,
                 market_data="PENDING", retry_after_seconds=retry,
@@ -2303,45 +2324,175 @@ class ChocoletraBot:
             self._emit_log("WARN", f"[{ticker}] Estrategia no disponible: {e}")
             return None
 
+    def _mtf_listo(self, ticker: str) -> bool:
+        """True once the ticker has a complete, real multi-timeframe bundle."""
+        ent = self._mtf_cache.get(ticker)
+        return bool(ent and not ent[1].sintetico
+                    and getattr(ent[1], "estado_datos", "READY") == "READY")
+
+    def _mtf_refresco_activo(self) -> bool:
+        hilo = self._mtf_refresco_hilo
+        return bool(hilo and hilo.is_alive())
+
+    def _iniciar_refresco_mtf(self):
+        if self._mtf_refresco_activo():
+            return
+        self._mtf_ciclo_libre.set()
+        self._mtf_refresco_hilo = threading.Thread(
+            target=self._refresco_mtf_loop, name="mtf-history-refresh", daemon=True)
+        self._mtf_refresco_hilo.start()
+
+    def _resumen_historicos_mtf(self):
+        """One log line per cycle while tickers still lack complete history."""
+        tickers = list(self.tickers)
+        pendientes = [t for t in tickers if not self._mtf_listo(t)]
+        if pendientes:
+            self._emit_log(
+                "INFO",
+                f"Históricos en segundo plano: {len(tickers) - len(pendientes)}/{len(tickers)} "
+                f"tickers listos | pendientes: {', '.join(pendientes[:6])}"
+                + ("…" if len(pendientes) > 6 else ""),
+            )
+
+    def _siguiente_refresco_mtf(self) -> Optional[str]:
+        """Next background download.
+
+        A cold ticker cannot trade at all; a warm one keeps trading on its last
+        macro frames until the maximum age. Order: macro refreshes past halfway
+        to that age (oldest first), cold tickers (REAL first, then configured
+        order), then any other due macro refresh.
+        """
+        ahora = time.time()
+        tickers = [t for t in self.tickers if self._mtf_reintento.get(t, 0.0) <= ahora]
+        edades = {t: ahora - self._mtf_cache[t][0] for t in tickers if self._mtf_listo(t)}
+
+        def mas_antiguo(minimo):
+            vencidos = [t for t, edad in edades.items() if edad >= minimo]
+            return max(vencidos, key=edades.get) if vencidos else None
+
+        urgente = mas_antiguo((self._mtf_ttl_macro + self._mtf_macro_max_stale) / 2)
+        if urgente:
+            return urgente
+        real = set(self._real_tickers(tickers))
+        frios = sorted((t for t in tickers if t not in edades), key=lambda t: t not in real)
+        return frios[0] if frios else mas_antiguo(self._mtf_ttl_macro)
+
+    def _refrescar_mtf_fondo(self, ticker: str) -> float:
+        """Download one complete bundle; return seconds to wait before the next."""
+        listos = sum(self._mtf_listo(t) for t in self.tickers)
+        era_listo = self._mtf_listo(ticker)
+        try:
+            # Paused while a cycle runs, so the slots freed by the previous
+            # bar's 1m reads go to this bar's. Eight more stay free per rolling
+            # minute for status/reconciliation reads and newly ready tickers.
+            with schwab_warmup_requests(8, self._mtf_ciclo_libre):
+                datos = self.schwab.obtener_multitemporal(ticker, self.config)
+        except Exception as exc:
+            self._emit_log("WARN", f"[{ticker}] Descarga de históricos falló: {type(exc).__name__}")
+            datos = None
+        if (datos is not None and not datos.sintetico
+                and getattr(datos, "estado_datos", "READY") == "READY"):
+            completed = time.time()
+            with self._mtf_lock:
+                self._mtf_cache[ticker] = (completed, datos, completed)
+            self._mtf_fallos.pop(ticker, None)
+            self._mtf_reintento.pop(ticker, None)
+            if not era_listo:
+                self._emit_log("INFO", f"[{ticker}] Históricos completos "
+                                       f"({listos + 1}/{len(self.tickers)} tickers listos)")
+            return 0.0
+        motivo = str(getattr(datos, "motivo_datos", "") or "")
+        if motivo == "AUTH_UNAVAILABLE":
+            return 15.0
+        if datos is None or datos.sintetico or motivo.startswith(("HISTORY_UNAVAILABLE_", "INCOMPLETE_MTF")):
+            # Ticker-specific failure: back off this ticker and serve the others.
+            fallos = self._mtf_fallos.get(ticker, 0) + 1
+            self._mtf_fallos[ticker] = fallos
+            self._mtf_reintento[ticker] = time.time() + min(300, 30 * 2 ** (fallos - 1))
+            return 0.0
+        # Local admission wait, cycle pause or HTTP pause: pages already
+        # downloaded are cached, so retrying shortly continues the work.
+        return min(15.0, max(1.0, float(getattr(datos, "reintento_seg", 0) or 0)))
+
+    def _refresco_mtf_loop(self):
+        while self._activo:
+            if not self._mtf_ciclo_libre.is_set():
+                time.sleep(0.25)
+                continue
+            ticker = self._siguiente_refresco_mtf()
+            espera = 1.0 if ticker is None else self._refrescar_mtf_fondo(ticker)
+            while espera > 0 and self._activo:
+                time.sleep(min(1.0, espera))
+                espera -= 1.0
+
     def _obtener_mtf(self, ticker: str) -> DatosMultiTemporal:
         """Datos multi-temporal con DOBLE refresco: el 1m/5m se re-baja en cada ciclo
         (barato) para que el precio y la señal estén al día como el bróker; las
         temporalidades mayores se cachean más tiempo (cambian lento). Así el precio no
-        se atrasa frente a la pantalla real y no se satura la API con muchos tickers."""
+        se atrasa frente a la pantalla real y no se satura la API con muchos tickers.
+
+        With the background refresher running, the cycle only reads 1m: the
+        refresher owns cold downloads and macro refreshes. Without it (thread
+        not started or stopped) the cycle downloads synchronously as before."""
         ahora = time.time()
         if not self.schwab._asegurar_token():
             return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING", motivo_datos="AUTH_UNAVAILABLE")
         ent = self._mtf_cache.get(ticker)     # (t_macro, datos, t_micro)
-        if (ent and not ent[1].sintetico and getattr(ent[1], "estado_datos", "READY") == "READY"
-                and (ahora - ent[0]) < self._mtf_ttl_macro):
-            datos = ent[1]
-            if (ahora - ent[2]) >= self._mtf_ttl:
-                m1 = None
-                try:
-                    m1 = self.schwab.obtener_1m_reciente(ticker)
-                except (SchwabRequestPaused, SchwabRequestDeferred) as exc:
-                    return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING",
-                                              motivo_datos=getattr(exc, "reason", "HTTP_PAUSE"),
-                                              reintento_seg=exc.retry_after_seconds)
-                except Exception as e:
-                    self._emit_log("WARN", f"[{ticker}] Error refrescando el precio 1m: {type(e).__name__}")
-                if m1 is not None and len(m1) > 40:
-                    datos.velas["1m"] = m1
-                    m5 = self.schwab._resample(m1, "5min")
-                    if m5 is not None and len(m5) > 0:
-                        datos.velas["5m"] = m5
-                    # Solo marcar el micro como FRESCO si el 1m se actualizó de verdad.
-                    self._mtf_cache[ticker] = (ent[0], datos, time.time())
-                else:
-                    # Keep the good macro cache for recovery, but never publish
-                    # an old/synthetic micro frame as today's usable price.
-                    return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING",
-                                              motivo_datos="MICRO_REFRESH_UNAVAILABLE")
+        fondo = self._mtf_refresco_activo()
+        if not self._mtf_listo(ticker):
+            if fondo:
+                return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING",
+                                          motivo_datos="WARMUP_PENDING")
+            datos = self.schwab.obtener_multitemporal(ticker, self.config)
+            if not datos.sintetico and getattr(datos, "estado_datos", "READY") == "READY":
+                completed = time.time()
+                with self._mtf_lock:
+                    self._mtf_cache[ticker] = (completed, datos, completed)
             return datos
-        datos = self.schwab.obtener_multitemporal(ticker, self.config)
-        if not datos.sintetico and getattr(datos, "estado_datos", "READY") == "READY":
-            completed = time.time()
-            self._mtf_cache[ticker] = (completed, datos, completed)
+        edad = ahora - ent[0]
+        if edad >= self._mtf_macro_max_stale and fondo:
+            return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING",
+                                      motivo_datos="MACRO_STALE")
+        if edad >= self._mtf_ttl_macro and not fondo:
+            datos = self.schwab.obtener_multitemporal(ticker, self.config)
+            if not datos.sintetico and getattr(datos, "estado_datos", "READY") == "READY":
+                completed = time.time()
+                with self._mtf_lock:
+                    self._mtf_cache[ticker] = (completed, datos, completed)
+                return datos
+            if edad >= self._mtf_macro_max_stale:
+                return datos
+            # Keep the last complete macro frames (bounded age); the normal 1m
+            # refresh below still applies. The macro refresh retries next cycle.
+            self._emit_log("INFO", f"[{ticker}] Refresco macro pospuesto "
+                                   f"({getattr(datos, 'motivo_datos', '')}); se usan temporalidades "
+                                   f"mayores de hace {int(edad)}s con 1m actualizado")
+        datos = ent[1]
+        if (ahora - ent[2]) >= self._mtf_ttl:
+            m1 = None
+            try:
+                m1 = self.schwab.obtener_1m_reciente(ticker)
+            except (SchwabRequestPaused, SchwabRequestDeferred) as exc:
+                return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING",
+                                          motivo_datos=getattr(exc, "reason", "HTTP_PAUSE"),
+                                          reintento_seg=exc.retry_after_seconds)
+            except Exception as e:
+                self._emit_log("WARN", f"[{ticker}] Error refrescando el precio 1m: {type(e).__name__}")
+            if m1 is not None and len(m1) > 40:
+                datos.velas["1m"] = m1
+                m5 = self.schwab._resample(m1, "5min")
+                if m5 is not None and len(m5) > 0:
+                    datos.velas["5m"] = m5
+                # Solo marcar el micro como FRESCO si el 1m se actualizó de verdad.
+                # A bundle the refresher stored meanwhile is newer: keep it.
+                with self._mtf_lock:
+                    if self._mtf_cache.get(ticker) is ent:
+                        self._mtf_cache[ticker] = (ent[0], datos, time.time())
+            else:
+                # Keep the good macro cache for recovery, but never publish
+                # an old/synthetic micro frame as today's usable price.
+                return DatosMultiTemporal(ticker=ticker, estado_datos="WAITING",
+                                          motivo_datos="MICRO_REFRESH_UNAVAILABLE")
         return datos
 
     # ==========================================================
