@@ -3060,6 +3060,20 @@ class ChocoletraBot:
         # PAPER: llenado inmediato simulado (comportamiento demostrado)
         # -----------------------------------------------------------------
         if paper_ticker:
+            try:
+                raw_bar_ts = df_micro.index[-1]
+                if not isinstance(raw_bar_ts, (datetime, pd.Timestamp, str)):
+                    raise ValueError("non-datetime candle index")
+                entry_bar_ts = pd.to_datetime(raw_bar_ts, utc=True, errors="coerce")
+                if pd.isna(entry_bar_ts):
+                    raise ValueError("unknown candle timestamp")
+            except (TypeError, ValueError, AttributeError, IndexError):
+                decision.execution_skip_reason = "PAPER_BAR_TIME_UNAVAILABLE"
+                self._set_ticker_processing(
+                    ticker, "BLOCKED", "PAPER_EXECUTION",
+                    decision.execution_skip_reason, execution="NOT_EXECUTED",
+                )
+                return False
             resultado = self.ejecutor_paper.ejecutar_con_persecucion(
                 orden=orden, contexto=contexto, account_number=self.account_number,
                 cotizar_fn=None,
@@ -3084,7 +3098,10 @@ class ChocoletraBot:
                 resultado.get("orden_ajustada", orden),
                 decision,
                 entry_order_id=resultado.get("order_id", ""),
-                execution_context=resultado,
+                execution_context={
+                    **resultado,
+                    "paper_entry_bar_ts": entry_bar_ts.isoformat(),
+                },
             )
             self._set_ticker_processing(
                 ticker, "EXECUTED", "PAPER_EXECUTION", "PAPER_FILLED",
@@ -3479,6 +3496,10 @@ class ChocoletraBot:
                 "tp1_order_id": tp1_id if prot else "",
                 "tp1_reconcile_pending": bool(tp1_reconcile_pending),
                 "abierta_ts": self._ahora_et(),
+                "paper_entry_bar_ts": (
+                    str((execution_context or {}).get("paper_entry_bar_ts", "") or "")
+                    if paper_ticker else ""
+                ),
             }
             if orden.tipo == "BUY":
                 self._resumen["buy"] += 1
@@ -4323,6 +4344,59 @@ class ChocoletraBot:
             self._gestionar_real(ticker, pos, precio_actual)
 
     def _gestionar_paper(self, ticker: str, pos: dict, df_micro):
+        """Process each eligible closed PAPER candle once, after entry."""
+        bar_ts = self._paper_exit_bar_timestamp(pos, df_micro)
+        if bar_ts is None:
+            return
+        self._gestionar_paper_bar(ticker, pos, df_micro)
+        # Commit only after the bar's handling succeeds. Exceptions may retry;
+        # a normal TP1 return must not reuse the same pre-breakeven OHLC later.
+        pos["paper_last_managed_bar_ts"] = bar_ts.isoformat()
+
+    def _paper_exit_bar_timestamp(self, pos: dict, df_micro):
+        """A signal candle's earlier range cannot close its own new PAPER entry.
+
+        Source candles use opening timestamps, with naive market indices in UTC.
+        New positions retain the exact signal bar. Legacy positions fall back to
+        their opening instant; a bar wholly before that instant is ineligible.
+        A minute is a conservative minimum duration for the engine's micro bars.
+        """
+        try:
+            if df_micro is None or len(df_micro) == 0:
+                return None
+            raw = df_micro.index[-1]
+            if not isinstance(raw, (datetime, pd.Timestamp, str)):
+                return None
+            bar_ts = pd.to_datetime(raw, utc=True, errors="coerce")
+            if pd.isna(bar_ts):
+                return None
+            entry_bar = pos.get("paper_entry_bar_ts")
+            if entry_bar:
+                entry_ts = pd.to_datetime(entry_bar, utc=True, errors="coerce")
+                if pd.isna(entry_ts) or bar_ts <= entry_ts:
+                    return None
+            opened = pos.get("abierta_ts")
+            if opened is not None:
+                opened_ts = pd.Timestamp(opened)
+                if pd.isna(opened_ts):
+                    return None
+                if opened_ts.tzinfo is None:
+                    opened_ts = opened_ts.tz_localize("America/New_York")
+                opened_ts = opened_ts.tz_convert("UTC")
+                if bar_ts + pd.Timedelta(minutes=1) <= opened_ts:
+                    return None
+            elif not entry_bar:
+                return None
+            previous = pos.get("paper_last_managed_bar_ts")
+            if previous:
+                previous_ts = pd.to_datetime(previous, utc=True, errors="coerce")
+                if pd.isna(previous_ts) or bar_ts <= previous_ts:
+                    return None
+            return bar_ts
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _gestionar_paper_bar(self, ticker: str, pos: dict, df_micro):
         """
         Simula el ciclo de vida contra la última vela real: salida parcial
         del 70% en TP1, movimiento a breakeven, y cierre por SL o TP final.
