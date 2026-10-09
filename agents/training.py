@@ -82,8 +82,11 @@ class EntrenadorAgentes:
 
     def __init__(self, config: dict):
         from core.model_identity import ManualRealAuthorization
+        from core.ai_threshold_overrides import shared_threshold_overrides
         self.manual_real_authorization = ManualRealAuthorization(
             (config.get('live_trading', {}) or {}).get('manual_authorization', {}) or {})
+        # v3.3.19: per-ticker threshold set by the operator from the dashboard.
+        self.umbrales_operador = shared_threshold_overrides()
         self._production_snapshots = {}
         self._shadow_snapshots = {}
         agents_cfg = config.get("agents", {})
@@ -216,6 +219,14 @@ class EntrenadorAgentes:
             modelo = self._modelos.get(ticker)
             umbral = self._umbrales.get(ticker, self.umbral_meta)
             decision.ai_model_snapshot = dict(getattr(self, '_production_snapshots', {}).get(ticker, {}))
+        manual = self._umbral_operador(ticker)
+        if manual is not None and modelo is not None:
+            # The snapshot is what the dashboard and audit report, so it must
+            # carry the threshold this decision actually uses.
+            decision.ai_model_snapshot.update(
+                model_threshold=decision.ai_model_snapshot.get("threshold", umbral),
+                threshold=manual, threshold_source="OPERATOR")
+            umbral = manual
 
         if modelo is None:
             # Sin artefacto aprobado no hay inferencia válida. En PAPER se deja
@@ -304,6 +315,21 @@ class EntrenadorAgentes:
         """True only when an approved artifact is loaded for this ticker."""
         with self._lock:
             return bool(ticker and ticker in self._modelos)
+
+    def _umbral_operador(self, ticker: str) -> Optional[float]:
+        store = getattr(self, "umbrales_operador", None)
+        try:
+            return None if store is None else store.get(str(ticker or "").upper())
+        except Exception:
+            return None
+
+    def umbral_decision(self, ticker: str) -> Optional[float]:
+        """Threshold applied to this ticker's decisions: operator's, else the model's."""
+        manual = self._umbral_operador(ticker)
+        if manual is not None:
+            return manual
+        with self._lock:
+            return self._umbrales.get(ticker, self.umbral_meta)
 
     def production_snapshot(self, ticker):
         with self._lock:

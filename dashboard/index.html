@@ -3575,7 +3575,7 @@ async function showExecutionDiagnostics(){
 }
 async function showModelDetails(ticker){
   try {
-    const [d,h]=await Promise.all([api('/api/live-authorization/'+encodeURIComponent(ticker)).then(r=>r.json()),api('/api/ai/history/'+encodeURIComponent(ticker)).then(r=>r.json())]);
+    const [d,h,t]=await Promise.all([api('/api/live-authorization/'+encodeURIComponent(ticker)).then(r=>r.json()),api('/api/ai/history/'+encodeURIComponent(ticker)).then(r=>r.json()),api('/api/ai/threshold/'+encodeURIComponent(ticker)).then(r=>r.json()).catch(()=>({}))]);
     if(d.status!=='ok') throw new Error(d.message || 'No se pudo cargar el modelo');
     S.v330Authorization={ticker,model:d.model||{}};
     const m=d.model||{}, a=d.authorization, sm=h.shadow_model||{};
@@ -3594,9 +3594,42 @@ async function showModelDetails(ticker){
         <label>Escriba AUTHORIZE REAL ${escHtml(ticker)} <input id="v330Confirm" class="exec-mode-select" style="width:100%" required></label>
         <p>El override conserva los vetos de estrategia, datos y régimen, además de los controles de capital, riesgo y broker. Caduca si cambia el modelo.</p>
         <div><button class="btn btn-blue btn-sm" type="submit" ${m.loaded?'':'disabled'}>Autorizar modelo</button> <button class="btn btn-sm" type="button" onclick="revokeModelAuthorization()">Revocar</button></div>
-      </form><h3>Historial de candidatos</h3><table class="ai-life-table"><thead><tr><th>Fecha</th><th>Resultado</th><th>BA candidato</th><th>BA producción</th><th>Gate</th><th>Motivo</th></tr></thead><tbody>${(h.evaluations||[]).filter(e=>e.event==='CANDIDATE_EVALUATED').reverse().map(e=>`<tr><td>${escHtml(e.timestamp_utc)}</td><td>${escHtml(e.result)}</td><td>${metricV330((e.metrics||{}).balanced_accuracy,'%')}</td><td>${metricV330((e.metrics||{}).production_incumbent_balanced_accuracy,'%')}</td><td>${(e.metrics||{}).production_gate_passed===true?'PASS':(e.metrics||{}).production_gate_passed===false?'FAIL':'N/A'}</td><td>${escHtml(e.reason)}</td></tr>`).join('')||'<tr><td colspan="6">Sin evaluaciones registradas.</td></tr>'}</tbody></table>
+      </form>${aiThresholdSection(ticker,t)}<h3>Historial de candidatos</h3><table class="ai-life-table"><thead><tr><th>Fecha</th><th>Resultado</th><th>BA candidato</th><th>BA producción</th><th>Gate</th><th>Motivo</th></tr></thead><tbody>${(h.evaluations||[]).filter(e=>e.event==='CANDIDATE_EVALUATED').reverse().map(e=>`<tr><td>${escHtml(e.timestamp_utc)}</td><td>${escHtml(e.result)}</td><td>${metricV330((e.metrics||{}).balanced_accuracy,'%')}</td><td>${metricV330((e.metrics||{}).production_incumbent_balanced_accuracy,'%')}</td><td>${(e.metrics||{}).production_gate_passed===true?'PASS':(e.metrics||{}).production_gate_passed===false?'FAIL':'N/A'}</td><td>${escHtml(e.reason)}</td></tr>`).join('')||'<tr><td colspan="6">Sin evaluaciones registradas.</td></tr>'}</tbody></table>
       <h3>Promociones y autorizaciones</h3>${[...(h.promotions||[]),...(d.history||[])].sort((a,b)=>String(b.timestamp_utc||'').localeCompare(String(a.timestamp_utc||''))).map(e=>`<p>${escHtml(e.timestamp_utc||e.promoted_utc||'')} · ${escHtml(e.event)} · ${escHtml(e.reason||'')}</p>`).join('')||'<p>Sin eventos.</p>'}`);
   } catch(e){ toast('err','Modelo',String(e)); }
+}
+function aiThresholdSection(ticker,t){
+  if(!t||t.status!=='ok') return '<h3>Umbral IA del ticker</h3><p class="section-note">No disponible.</p>';
+  const pct=v=>v==null?'N/A':(Number(v)*100).toFixed(0)+'%';
+  const o=t.override, lo=Math.round(Number(t.min_threshold)*100), hi=Math.round(Number(t.max_threshold)*100);
+  return `<h3>Umbral IA del ticker</h3>
+    <p>Umbral del modelo: ${pct(t.model_threshold)} · Umbral aplicado: <b>${pct(t.applied_threshold)}</b> ${o?'(manual · '+escHtml(o.updated_by||'')+' · '+escHtml(o.updated_utc||'')+' · '+escHtml(o.reason||'')+')':'(del modelo)'}</p>
+    ${t.load_error?'<p class="section-note">'+escHtml(t.load_error)+'</p>':''}
+    <form onsubmit="event.preventDefault();saveAIThreshold('${escHtml(ticker)}')" style="display:grid;gap:10px;max-width:680px">
+      <label>Nuevo umbral (%) <input id="aiThrValue" type="number" min="${lo}" max="${hi}" step="1" class="exec-mode-select" style="width:120px" value="${o?Math.round(o.threshold*100):''}" required></label>
+      <label>Motivo <input id="aiThrReason" class="exec-mode-select" style="width:100%" required></label>
+      <p class="section-note">Entre ${lo}% y ${hi}%, con el motor detenido. Un umbral más bajo aprueba más señales de este ticker en PAPER y REAL. Los vetos de rango/macro, régimen, estrategia, capital, pérdida diaria y broker siguen aplicando.${t.model_loaded?'':' Sin modelo PRODUCTION cargado: el umbral se aplicará cuando haya uno.'}</p>
+      <div><button class="btn btn-blue btn-sm" type="submit">Guardar umbral</button> <button class="btn btn-sm" type="button" onclick="clearAIThreshold('${escHtml(ticker)}')" ${o?'':'disabled'}>Usar umbral del modelo</button></div>
+    </form>`;
+}
+async function saveAIThreshold(ticker){
+  try {
+    const value=Number(el('aiThrValue').value);
+    const r=await api('/api/ai/threshold/'+encodeURIComponent(ticker),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({threshold:value/100,reason:el('aiThrReason').value})});
+    const d=await r.json(); if(d.status!=='ok') throw new Error(d.message);
+    toast('ok','Umbral IA',`${ticker}: umbral aplicado ${(Number(d.applied_threshold)*100).toFixed(0)}%`);
+    if(typeof fetchAIStatus==='function') fetchAIStatus();
+    await showModelDetails(ticker);
+  } catch(e){toast('err','Umbral IA',String(e.message||e));}
+}
+async function clearAIThreshold(ticker){
+  try {
+    const d=await (await api('/api/ai/threshold/'+encodeURIComponent(ticker),{method:'DELETE'})).json();
+    if(d.status!=='ok') throw new Error(d.message);
+    toast('ok','Umbral IA',`${ticker}: vuelve al umbral del modelo`);
+    if(typeof fetchAIStatus==='function') fetchAIStatus();
+    await showModelDetails(ticker);
+  } catch(e){toast('err','Umbral IA',String(e.message||e));}
 }
 async function saveModelAuthorization(){
   const state=S.v330Authorization;
@@ -3735,7 +3768,7 @@ function renderTickerExecution(){
     const ai=aiRowForTicker(ticker),production=!!ai?.production_model_loaded,shadow=!!ai?.shadow_model_loaded;
     const model=el('exec-model-'+ticker);model.className='exec-model-badge '+(production?'production':shadow?'shadow':'');
     model.textContent=production?(ai.production_manual_override?'● Producción · override':'● Producción'):shadow?'● En validación':'○ Sin modelo';
-    el('exec-ai-'+ticker).textContent=(ai?.production_threshold!=null?`Umbral ${(Number(ai.production_threshold)*100).toFixed(0)}% · `:'')+`Aprendizaje ${ai?.new_observations??0}/${ai?.retrain_samples??50}`;
+    el('exec-ai-'+ticker).textContent=(ai?.production_threshold!=null?`Umbral ${(Number(ai.production_threshold)*100).toFixed(0)}%${ai?.operator_threshold!=null?' (manual)':''} · `:'')+`Aprendizaje ${ai?.new_observations??0}/${ai?.retrain_samples??50}`;
     const save=el('exec-save-'+ticker);save.disabled=running||saving||!draft||!!issue;save.textContent=saving?'Guardando…':'Guardar';
     const discard=el('exec-discard-'+ticker);discard.hidden=!draft;discard.disabled=saving;
     const notice=S.execNotices[ticker];

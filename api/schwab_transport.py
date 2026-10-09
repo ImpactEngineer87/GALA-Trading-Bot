@@ -292,10 +292,12 @@ class SchwabRequestGate:
         failures = min(5, self._read_failures.get(key, (0, 0))[1] + 1)
         self._read_failures[key] = (self._monotonic() + min(60, 5 * 2 ** (failures - 1)), failures)
 
-    def _diagnose(self, path, method, response=None, exception=None):
+    def _diagnose(self, path, method, response=None, exception=None, orders_query=""):
         event = {"time_utc": datetime.fromtimestamp(self._clock(), timezone.utc).isoformat(),
                  "endpoint": _safe_endpoint(path), "method": method,
                  "http_status": int(getattr(response, "status_code", 0) or 0)}
+        if orders_query.startswith("status="):
+            event["orders_query"] = orders_query    # WORKING or ALL; no identifiers
         if exception is not None:
             event["exception_type"] = type(exception).__name__
         if response is not None:
@@ -344,13 +346,21 @@ class SchwabRequestGate:
                    or getattr(_TRAFFIC_CONTEXT, "control", False))
         warmup = getattr(_TRAFFIC_CONTEXT, "warmup", None)
         parts = parsed.path.strip("/").split("/")
-        # Single-order reads and the order list back off separately: Schwab's
-        # per-order endpoint can fail persistently while the list still works,
-        # and entry checks/reconciliation depend on the list (v3.3.18).
+        # Order reads back off per endpoint query (single order, WORKING list,
+        # full list) and per traffic class. Schwab's single-order and full-list
+        # reads can fail persistently for an account while the WORKING list
+        # works; a failing background poll must never pause the reads that
+        # closes, the kill switch and entry checks depend on (v3.3.19).
         read_key = None
+        orders_query = ""
         if (method == "GET" and len(parts) >= 5
                 and parts[:3] == ["trader", "v1", "accounts"] and parts[4] == "orders"):
-            read_key = "/".join(parts[:5]) + ("/{order}" if len(parts) > 5 else "")
+            if len(parts) > 5:
+                orders_query = "{order}"
+            else:
+                params = kwargs.get("params") or {}
+                orders_query = "status=" + str(params.get("status") or "ALL").upper()
+            read_key = ("/".join(parts[:5]), orders_query, control)
         # Only history GETs may wait briefly for local admission. Mutations are
         # never queued/replayed; 403/429 pauses are never waited out here.
         can_wait = recovery_safe and method == "GET" and parsed.path == "/marketdata/v1/pricehistory"
@@ -404,7 +414,7 @@ class SchwabRequestGate:
                     self._recovery_pending = False
                     self._save()
             if status >= 400:
-                self._diagnose(parsed.path, method, response=response)
+                self._diagnose(parsed.path, method, response=response, orders_query=orders_query)
             return response
         except requests.RequestException as exc:
             with self._lock:
@@ -412,7 +422,7 @@ class SchwabRequestGate:
                 self._read_backoff(read_key)
                 if probe:
                     self._pause()
-            self._diagnose(parsed.path, method, exception=exc)
+            self._diagnose(parsed.path, method, exception=exc, orders_query=orders_query)
             raise
         finally:
             if probe:

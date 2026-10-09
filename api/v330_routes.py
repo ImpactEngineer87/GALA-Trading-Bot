@@ -102,6 +102,54 @@ def register(app, host):
                 return jsonify(status='error', message=str(exc)), 400
             return jsonify(status='ok', authorization=row)
 
+    @app.route('/api/ai/threshold/<ticker>', methods=['GET', 'POST', 'DELETE'])
+    def ai_threshold_v3319(ticker):
+        """Operator AI threshold for one ticker (v3.3.19)."""
+        from core.ai_threshold_overrides import MAX_THRESHOLD, MIN_THRESHOLD, validate_threshold
+        ticker = ticker.strip().upper()
+        if ticker not in host['BOT_STATE'].get('tickers', []):
+            return jsonify(status='error', message='Unknown ticker'), 404
+        with host['_ENGINE_CONTROL_LOCK']:
+            trainer = host['_ai_trainer_for_status']()
+            store = trainer.umbrales_operador
+            with trainer._lock:
+                model_threshold = trainer._umbrales.get(ticker)
+            def payload(**extra):
+                return jsonify(status='ok', ticker=ticker, model_threshold=model_threshold,
+                    override=store.row(ticker), applied_threshold=trainer.umbral_decision(ticker),
+                    model_loaded=trainer.modelo_disponible(ticker), min_threshold=MIN_THRESHOLD,
+                    max_threshold=MAX_THRESHOLD, load_error=store.load_error or None, **extra)
+            if request.method == 'GET':
+                return payload()
+            if host['BOT_STATE'].get('running'):
+                return jsonify(status='error', message='Detenga el motor antes de cambiar el umbral de IA.'), 409
+            cfg = host['_read_config_runtime']()
+            audit = EventHistory(cfg.get('live_trading', {}).get(
+                'authorization_audit_path', 'data/real_mode_audit.jsonl'))
+            # Audit first (as live-settings does): no change without a record.
+            try:
+                if request.method == 'DELETE':
+                    previous = store.row(ticker)
+                    if previous:
+                        audit.append({'event': 'AI_THRESHOLD_OVERRIDE_CLEARED', 'ticker': ticker,
+                                      'actor': session.get('username'), 'previous': previous})
+                        store.clear(ticker)
+                    return payload()
+                data = request.get_json(silent=True) or {}
+                threshold = validate_threshold(data.get('threshold'))
+                reason = str(data.get('reason', '') or '').strip()
+                if not reason:
+                    raise ValueError('Indique el motivo del cambio de umbral')
+                audit.append({'event': 'AI_THRESHOLD_OVERRIDE_SET', 'ticker': ticker,
+                              'actor': session.get('username'), 'threshold': threshold,
+                              'model_threshold': model_threshold, 'previous': store.row(ticker),
+                              'reason': reason[:300]})
+                store.set(ticker, threshold, actor=session.get('username'), reason=reason,
+                          model_threshold=model_threshold)
+            except (ValueError, OSError) as exc:
+                return jsonify(status='error', message=str(exc)), 400
+            return payload()
+
     @app.route('/api/ai/history/<ticker>')
     def ai_history_v330(ticker):
         ticker = ticker.strip().upper()

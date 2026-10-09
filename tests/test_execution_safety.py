@@ -109,6 +109,7 @@ class ExecutionModeSafetyTests(unittest.TestCase):
         )
         bot.ejecutor_hibrido = types.SimpleNamespace(
             _estado_orden=lambda *args: "WORKING",
+            estado_orden_vigilada=lambda *args: "WORKING",   # v3.3.19 monitor read
             colocar_salida=lambda *args: {"status": "OK", "order_id": "stop"},
         )
         pos = {

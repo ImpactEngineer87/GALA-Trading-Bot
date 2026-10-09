@@ -5047,6 +5047,15 @@ def ai_retraining_status():
             row.update(veto_by_ticker.get(ticker, {}))
             row.update(learning_by_ticker.get(ticker, {}))
             threshold = production_thresholds.get(ticker)
+            row["model_threshold"] = (
+                round(float(threshold), 4) if threshold is not None else None
+            )
+            # v3.3.19: the operator's per-ticker threshold replaces the model's.
+            operator = getattr(trainer, "umbrales_operador", None)
+            operator_row = operator.row(ticker) if operator is not None else None
+            row["operator_threshold"] = (operator_row or {}).get("threshold")
+            if row["operator_threshold"] is not None and threshold is not None:
+                threshold = row["operator_threshold"]
             row["production_threshold"] = (
                 round(float(threshold), 4) if threshold is not None else None
             )

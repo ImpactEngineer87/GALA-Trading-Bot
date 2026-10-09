@@ -380,6 +380,8 @@ class EjecutorHibridoDeOrdenes:
             self.monitor_interval_ms, int(sync_cfg.get("monitor_status_max_age_ms", 5000))) / 1000.0
         self._order_list_cache = None   # (monotonic, account, orders)
         self._order_list_lock = threading.Lock()
+        self._working_cache = None      # (monotonic, account, WORKING orders)
+        self._working_lock = threading.Lock()
 
         if self.paper_trading:
             _ps("[HIBRIDO] Modo PAPER TRADING — ordenes simuladas")
@@ -1127,6 +1129,42 @@ class EjecutorHibridoDeOrdenes:
             children = order.get("childOrderStrategies", []) or []
             yield from EjecutorHibridoDeOrdenes._iter_order_nodes(children)
 
+    def _working_snapshot_reciente(self, account_number: str, max_age_s: float = 0) -> Optional[list]:
+        """WORKING snapshot reused for ``max_age_s``; one shared read at a time."""
+        if max_age_s <= 0:
+            return self._working_orders_snapshot(account_number)
+        with self._working_lock:
+            cached = self._working_cache
+            if (cached and cached[1] == account_number
+                    and time.monotonic() - cached[0] <= max_age_s):
+                return cached[2]
+            data = self._working_orders_snapshot(account_number)
+            if data is not None:
+                self._working_cache = (time.monotonic(), account_number, data)
+            return data
+
+    def estado_orden_vigilada(self, account_number: str, order_id: str,
+                              max_age_s: float = 0) -> str:
+        """Order status for the open-position monitor from reliable sources.
+
+        WORKING while the order is in a recent WORKING list (one read shared by
+        every position for ``max_age_s``). Once it leaves that list, its final
+        status if Schwab returns the order, otherwise NOT_WORKING: the caller
+        must then use the broker position to tell a fill from a cancellation.
+        DESCONOCIDO only when the WORKING list itself cannot be read (v3.3.19:
+        Schwab's single-order and full-list reads can fail for an account).
+        """
+        if not order_id:
+            return "DESCONOCIDO"
+        snapshot = self._working_snapshot_reciente(account_number, max_age_s)
+        if snapshot is None:
+            return "DESCONOCIDO"
+        objetivo = str(order_id)
+        if any(str(o.get("orderId", "") or "") == objetivo for o in self._iter_order_nodes(snapshot)):
+            return "WORKING"
+        d = self._buscar_orden_en_listado(account_number, order_id)
+        return str((d or {}).get("status", "") or "").upper() or "NOT_WORKING"
+
     def orden_trabajando(
         self, account_number: str, order_id: str
     ) -> Optional[bool]:
@@ -1853,6 +1891,17 @@ class EjecutorHibridoDeOrdenes:
             }
 
     def cancelar_orden_confirmada(
+        self, account_number: str, order_id: str, ticker: str = ""
+    ) -> dict:
+        """Cancel and confirm with the order-action request reserve (v3.3.19).
+
+        A busy background budget or a failing background poll must not leave a
+        cancellation, and the close or kill switch waiting on it, unconfirmed.
+        """
+        with schwab_control_requests():
+            return self._cancelar_orden_confirmada_impl(account_number, order_id, ticker)
+
+    def _cancelar_orden_confirmada_impl(
         self, account_number: str, order_id: str, ticker: str = ""
     ) -> dict:
         """

@@ -2050,8 +2050,11 @@ class ChocoletraBot:
             return None
         ticker = str(ticker or "").upper()
         try:
-            with trainer._lock:
-                value = trainer._umbrales.get(ticker, trainer.umbral_meta)
+            if callable(getattr(trainer, "umbral_decision", None)):
+                value = trainer.umbral_decision(ticker)   # operator override first
+            else:
+                with trainer._lock:
+                    value = trainer._umbrales.get(ticker, trainer.umbral_meta)
         except Exception:
             value = getattr(trainer, "umbral_meta", None)
         try:
@@ -2110,16 +2113,7 @@ class ChocoletraBot:
             if not ticker or tipo not in ("BUY", "SELL"):
                 return learning_row
 
-            threshold = None
-            trainer = getattr(self.orquestador, "entrenador", None)
-            if trainer is not None:
-                try:
-                    with trainer._lock:
-                        threshold = trainer._umbrales.get(
-                            ticker, trainer.umbral_meta
-                        )
-                except Exception:
-                    threshold = getattr(trainer, "umbral_meta", None)
+            threshold = self._ai_threshold_for_ticker(ticker)   # operator override first
 
             hard_reason = str(getattr(decision, "hard_veto_reason", "") or "")
             reason = (
@@ -4326,7 +4320,7 @@ class ChocoletraBot:
                 self._cerrar_posicion(ticker, pos["tp_final"], motivo="TP")
                 return
 
-    def _ejecutar_parcial(self, ticker: str, pos: dict):
+    def _ejecutar_parcial(self, ticker: str, pos: dict, tp1_por_posicion: bool = False):
         state = PositionState.LONG if pos.get("tipo") == "BUY" else PositionState.SHORT
         context = {
             "correlation_id": pos.get("correlation_id", ""),
@@ -4341,9 +4335,9 @@ class ChocoletraBot:
             "order_action": exit_action_for_state(state),
         }
         with self._lifecycle_scope(context):
-            return self._ejecutar_parcial_impl(ticker, pos)
+            return self._ejecutar_parcial_impl(ticker, pos, tp1_por_posicion)
 
-    def _ejecutar_parcial_impl(self, ticker: str, pos: dict):
+    def _ejecutar_parcial_impl(self, ticker: str, pos: dict, tp1_por_posicion: bool = False):
         """
         Cierra el 70% en TP1 y RE-PROTEGE el 30% restante.
 
@@ -4382,7 +4376,12 @@ class ChocoletraBot:
             if callable(detail_reader):
                 fill = detail_reader(self.account_number, pos['tp1_order_id'])
                 if str(fill.get('status', '')).upper() != 'FILLED':
-                    return
+                    if not tp1_por_posicion:
+                        return
+                    # v3.3.19: the broker position already shows TP1 executed but
+                    # Schwab returned no order detail. Re-protect the remainder;
+                    # TP1 accounting waits for the actual fill price below.
+                    fill = {}
                 actual_tp1_price = float(fill.get('avg_price', 0) or 0)
                 if actual_tp1_price > 0:
                     tp1 = actual_tp1_price
@@ -4411,7 +4410,11 @@ class ChocoletraBot:
         if not paper_ticker and actual_tp1_price is not None and actual_tp1_price <= 0:
             # Protect the remainder immediately, but do not fabricate realized PnL
             # from the requested limit while execution prices are unavailable.
+            # TP1 did execute: mark it so the monitor does not re-protect on every
+            # poll and the remainder is managed (v3.3.19).
             with self._lock:
+                pos['tp1_hit'] = True
+                pos['partial_exit_at'] = self._ahora_et()
                 pos['sl_order_id'] = nuevo_sl_id if reproteccion_ok else ''
                 pos['sl_actual'] = nuevo_sl_price
                 pos['partial_price_pending'] = True
@@ -4778,7 +4781,14 @@ class ChocoletraBot:
                     if float(detail.get("avg_price", 0.0) or 0.0) > 0:
                         actual_exit_price = float(detail["avg_price"])
                         exit_price_verified = True
-                    filled = str(detail.get("status", "")).upper() == "FILLED"
+                    detail_status = str(detail.get("status", "") or "").upper()
+                    filled = detail_status == "FILLED"
+                    if not filled and detail_status in ("", "DESCONOCIDO", "NOT_WORKING"):
+                        # v3.3.19: Schwab may not return the order detail. The
+                        # STOP gone from the WORKING list with the broker flat
+                        # is the same fact; the exit price stays unverified.
+                        filled = self.ejecutor_hibrido.orden_trabajando(
+                            self.account_number, close_order_id) is False
                     broker_remaining = self._cantidad_real_broker(ticker, tipo) if filled else None
                     exit_confirmed = bool(filled and broker_remaining == 0)
                 else:
@@ -5105,21 +5115,32 @@ class ChocoletraBot:
                             == "RECONCILIAR"
                         )
 
-        # Polling every open position must not cost a request per order: reuse
-        # one recent account order list (fresh reads still confirm actions).
+        # v3.3.19: poll from the WORKING list (one read shared by every open
+        # position) plus the broker position. Schwab's single-order and full
+        # order-list reads can fail for this account, so an order that left the
+        # WORKING list with no readable detail is NOT_WORKING, and the position
+        # quantity decides whether it filled.
         edad_max = getattr(self.ejecutor_hibrido, "monitor_status_max_age_s", 0)
-        # TP1 llenado → mover a breakeven una vez
+        est_tp1 = est_sl = ""
         if pos["salida_parcial"] and not pos["tp1_hit"] and pos["tp1_order_id"]:
-            if self.ejecutor_hibrido._estado_orden(
-                    self.account_number, pos["tp1_order_id"], edad_max) == "FILLED":
-                self._ejecutar_parcial(ticker, pos)
-                return
-        # SL/remanente llenado → finalizar
+            est_tp1 = self.ejecutor_hibrido.estado_orden_vigilada(
+                self.account_number, pos["tp1_order_id"], edad_max)
         if pos["sl_order_id"]:
-            if self.ejecutor_hibrido._estado_orden(
-                    self.account_number, pos["sl_order_id"], edad_max) == "FILLED":
-                self._cerrar_posicion(ticker, pos["sl_actual"], motivo="SL(real)")
-                return
+            est_sl = self.ejecutor_hibrido.estado_orden_vigilada(
+                self.account_number, pos["sl_order_id"], edad_max)
+        broker_qty = None
+        if "NOT_WORKING" in (est_tp1, est_sl):
+            broker_qty = self._cantidad_real_broker(ticker, pos["tipo"])
+        resto = int(pos.get("cantidad_resto", 0) or 0)
+        # TP1 llenado → mover a breakeven una vez
+        if est_tp1 == "FILLED" or (
+                est_tp1 == "NOT_WORKING" and broker_qty is not None and 0 < broker_qty <= resto):
+            self._ejecutar_parcial(ticker, pos, tp1_por_posicion=est_tp1 != "FILLED")
+            return
+        # SL/remanente llenado → finalizar
+        if est_sl == "FILLED" or (est_sl == "NOT_WORKING" and broker_qty == 0):
+            self._cerrar_posicion(ticker, pos["sl_actual"], motivo="SL(real)")
+            return
 
         # Tras TP1 el 30% restante conserva el STOP de breakeven, pero el objetivo
         # final se ejecuta desde el motor al observar el precio. El cierre usa la

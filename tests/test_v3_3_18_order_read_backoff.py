@@ -235,6 +235,7 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(bot._asegurar_ticker_limpio("NVDA"))
 
     def test_position_monitor_polls_with_the_shared_list_age(self):
+        # v3.3.19: the monitor polls the WORKING list (estado_orden_vigilada).
         Bot = load_methods("engine/bot_engine.py", "ChocoletraBot", {"_gestionar_real"}, {})
         bot = Bot()
         bot._activo, bot._lock, bot.account_number = True, threading.RLock(), ACCOUNT
@@ -243,9 +244,9 @@ class EngineTests(unittest.TestCase):
         bot._posiciones = {"META": pos}
         bot._asegurar_token_trading = lambda: True
         bot.ejecutor_hibrido = SimpleNamespace(monitor_status_max_age_s=5.0,
-                                               _estado_orden=Mock(return_value="WORKING"))
+                                               estado_orden_vigilada=Mock(return_value="WORKING"))
         bot._gestionar_real("META", pos, 100.0)
-        self.assertEqual([c.args for c in bot.ejecutor_hibrido._estado_orden.call_args_list],
+        self.assertEqual([c.args for c in bot.ejecutor_hibrido.estado_orden_vigilada.call_args_list],
                          [(ACCOUNT, "tp1", 5.0), (ACCOUNT, "sl", 5.0)])
 
 

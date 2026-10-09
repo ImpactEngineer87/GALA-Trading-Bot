@@ -332,11 +332,14 @@ class ExecutorTests(GateFixture):
         self.executor._buscar_orden_en_listado.__func__.__globals__["schwab_request"] = self.gate.request
 
     def test_failed_detail_plus_working_snapshot_stays_unknown(self):
-        self.results = [Response(400), Response(400)]
+        # v3.3.19: the WORKING list has its own pause, so it is still asked
+        # after the single-order and full-list reads fail; all three failing
+        # leaves the order unknown.
+        self.results = [Response(400), Response(400), Response(400)]
         result = self.executor.detalle_orden("private-account", "private-order")
         self.assertEqual(result["status"], "DESCONOCIDO")
         self.assertEqual(result["filled"], 0)
-        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.calls), 3)
 
     def test_server_failure_has_one_recovery_fallback(self):
         self.results = [Response(503), Response(200, [{"orderId": "private-order", "status": "WORKING"}])]
