@@ -5758,6 +5758,28 @@ class ChocoletraBot:
             if symbol in real_tickers:
                 order_symbols.append(symbol)
 
+        # A pending close may be QUEUED while absent from status=WORKING. Do
+        # not let read-only reconciliation retire that exposure/journal or mark
+        # the engine safe to restart until an all-status snapshot is readable.
+        for ticker, pos in list(getattr(self, "_posiciones", {}).items()):
+            if (ticker not in real_tickers or not isinstance(pos, dict) or not pos.get("exit_pending")
+                    or any(row["ticker"] == ticker for row in positions)
+                    or ticker in order_symbols):
+                continue
+            provider = getattr(getattr(self, "ejecutor_hibrido", None), "ordenes_trabajando_ticker", None)
+            try:
+                pending_ids = provider(self.account_number, ticker) if callable(provider) else None
+            except Exception:
+                pending_ids = None
+            if pending_ids is None:
+                return self._set_broker_reconciliation(
+                    ok=False, flat=False, context=context,
+                    message=f"No se pudo confirmar todas las órdenes de salida pendientes: {ticker}",
+                    positions=positions, open_order_symbols=order_symbols,
+                )
+            if pending_ids:
+                order_symbols.append(ticker)
+
         flat = not positions and not order_symbols
         ok = bool(flat) if require_flat else True
         message = (
