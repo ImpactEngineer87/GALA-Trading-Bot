@@ -1530,6 +1530,12 @@ class EjecutorHibridoDeOrdenes:
 
     def liquidar_posicion(self, ticker: str, tipo_entrada: str, cantidad: int,
                           account_number: str, motivo: str = "") -> dict:
+        with schwab_control_requests():
+            return self._liquidar_posicion_controlada(
+                ticker, tipo_entrada, cantidad, account_number, motivo)
+
+    def _liquidar_posicion_controlada(self, ticker: str, tipo_entrada: str, cantidad: int,
+                                    account_number: str, motivo: str = "") -> dict:
         if self.paper_trading or not self.execution_v2_config.get('enabled', False):
             return self._liquidar_market_legacy(ticker, tipo_entrada, cantidad, account_number, motivo)
         from core.execution_v2 import SmartExit

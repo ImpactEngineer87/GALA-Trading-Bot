@@ -33,6 +33,7 @@ import sys
 import time
 import os
 import json
+import math
 import yaml
 import threading
 import uuid
@@ -66,6 +67,7 @@ from core.trade_history import TradeHistoryLedger
 from api.schwab_client import SchwabClient
 from api.schwab_transport import (
     SchwabRequestDeferred, SchwabRequestPaused, schwab_control_requests, schwab_warmup_requests,
+    schwab_request_pause,
 )
 from api.hybrid_order_executor import EjecutorHibridoDeOrdenes, ContextoMercado
 
@@ -342,6 +344,8 @@ class ChocoletraBot:
         # Tickers con un cierre EN CURSO (guarda anti-doble-cierre entre hilos:
         # un worker y el kill switch podrían cerrar el mismo ticker a la vez).
         self._cerrando = set()
+        self._exit_recovery = {}
+        self._exit_recovery_thread = None
         self._order_monitor_stop = threading.Event()
         self._order_monitor_thread = None
 
@@ -1219,7 +1223,8 @@ class ChocoletraBot:
                         self._emit_log(
                             "WARN",
                             "Entradas bloqueadas por límite diario hasta la próxima sesión NY. "
-                            "No se repetirán órdenes de liquidación automáticamente.",
+                            "Los cierres pendientes se recuperan de forma limitada y pausada; "
+                            "sin nuevas entradas.",
                         )
                         # No reconciliar/adoptar ni ejecutar señales mientras el
                         # bloqueo diario esté activo.
@@ -1537,6 +1542,13 @@ class ChocoletraBot:
 
     def _procesar_ticker(self, ticker: str):
         """Pipeline completo para un ticker (se ejecuta en un hilo)."""
+        # A consumed signal must not erase a failed close. Recovery is close-only
+        # and independent of macro warmup, inference and subsequent signals.
+        with self._lock:
+            pending_exit = bool((self._posiciones.get(ticker) or {}).get('exit_pending'))
+        if pending_exit:
+            self._retry_pending_exit(ticker)
+            return
         paper_ticker = self._is_paper_ticker(ticker)
         self._set_ticker_processing(
             ticker, "PROCESSING", "START",
@@ -1562,6 +1574,8 @@ class ChocoletraBot:
                 ticker, "WAITING", "MARKET_DATA", reason,
                 market_data="PENDING", retry_after_seconds=retry,
             )
+            if reason in ('WARMUP_PENDING', 'MACRO_STALE'):
+                self._check_opposite_exit_without_macro(ticker, reason)
             return
         datos_confirmados = self._datos_micro_confirmados(datos)
         # GALA10 y el dimensionamiento inmediato trabajan sobre 1m. Las TF mayores
@@ -1950,6 +1964,33 @@ class ChocoletraBot:
         # 6) Reversión o apertura
         with self.ejecutor_hibrido.secuencia_simbolo(ticker):
             self._abrir_o_revertir(decision, precio_actual, df_micro)
+
+    def _check_opposite_exit_without_macro(self, ticker, reason):
+        """Macro warmup blocks entries, not an exit from fresh native 1m bars."""
+        with self.ejecutor_hibrido.secuencia_simbolo(ticker):
+            with self._lock:
+                pos = self._posiciones.get(ticker)
+                if (not self._activo or not pos or pos.get('reservado') or pos.get('pendiente')
+                        or pos.get('exit_pending') or self._is_paper_ticker(ticker, pos=pos)):
+                    return False
+            try:
+                with schwab_control_requests():
+                    frame = self.schwab.obtener_1m_reciente(ticker)
+                frame = self._solo_velas_cerradas(frame)
+                if frame is None or len(frame) < 35:
+                    return False
+                last = pd.Timestamp(frame.index[-1])
+                last = last.tz_localize('UTC') if last.tzinfo is None else last.tz_convert('UTC')
+                age = (pd.Timestamp.now(tz='UTC') - (last + pd.Timedelta(minutes=1))).total_seconds()
+                price = float(frame['close'].iloc[-1])
+                if not 0 <= age <= 120 or not math.isfinite(price) or price <= 0:
+                    return False
+                data = DatosMultiTemporal(ticker=ticker, velas={'1m': frame}, sintetico=False)
+                side = self._senal_estrategia(data, ticker, price)
+                return self._close_opposite_without_entry(ticker, side, price, reason)
+            except Exception as exc:
+                self._emit_log('WARN', f'[{ticker}] Salida sin macro pendiente: {type(exc).__name__}')
+                return False
 
     def _close_opposite_without_entry(self, ticker, side, price, entry_block_reason):
         """An unavailable entry auditor must not suppress a verified signal exit.
@@ -4252,6 +4293,9 @@ class ChocoletraBot:
                 return
             if self._is_paper_ticker(ticker, pos=pos):
                 return
+            if pos.get('exit_pending'):
+                self._retry_pending_exit(ticker)
+                return
             if pos.get("pendiente"):
                 self._gestionar_entrada_pendiente(
                     ticker, pos, pos["orden"].precio_limite)
@@ -4563,21 +4607,145 @@ class ChocoletraBot:
         """Cierra una posición SERIALIZANDO por ticker: si otro hilo ya está
         cerrando este ticker (worker vs kill switch), no se ejecuta un segundo
         cierre (evita doble MARKET / sobreventa)."""
-        with self._lock:
-            pos = self._posiciones.get(ticker)
-        lifecycle = self._position_lifecycle_context(ticker, pos or {})
-        lifecycle['exit_signal_price'] = precio_salida
-        with self._lifecycle_scope(lifecycle):
-            with self.ejecutor_hibrido.secuencia_simbolo(ticker):
+        with self.ejecutor_hibrido.secuencia_simbolo(ticker):
+            with self._lock:
+                pos = self._posiciones.get(ticker)
+                intents = getattr(self, '_exit_recovery', None)
+                if intents is None:
+                    self._exit_recovery = intents = {}
+                intent = intents.get(ticker)
+                if intent and intent['position'] is not pos:
+                    intents.pop(ticker, None)
+                    intent = None
+                if intent and 'kill switch' in str(motivo).lower():
+                    intent['reason'] = motivo  # Escalate a prior signal exit to emergency close.
+                    pos['exit_reason'] = motivo
+                if intent and time.monotonic() < intent['next_retry']:
+                    return False
+                recoverable = bool(pos and not pos.get('reservado')
+                                   and (not pos.get('pendiente') or 'kill switch' in str(motivo).lower())
+                                   and not self._is_paper_ticker(ticker, pos=pos))
+                if recoverable and intent is None:
+                    intent = intents[ticker] = {
+                        'position': pos, 'side': pos.get('tipo'),
+                        'position_id': pos.get('position_id'), 'account': self.account_number,
+                        'session': self._ahora_et().date(), 'deadline': time.monotonic() + 3600,
+                        'next_retry': 0.0, 'attempts': 0, 'reason': motivo, 'price': precio_salida,
+                    }
+                if intent:
+                    intent['attempts'] += 1
+                    pos['exit_pending'] = True
+                    pos['exit_reason'] = intent['reason']
+            lifecycle = self._position_lifecycle_context(ticker, pos or {})
+            lifecycle['exit_signal_price'] = precio_salida
+            with self._lifecycle_scope(lifecycle), schwab_control_requests():
                 with self._lock:
                     if ticker in self._cerrando:
                         return False
                     self._cerrando.add(ticker)
+                closed = False
                 try:
-                    return self._cerrar_posicion_impl(ticker, precio_salida, motivo)
+                    closed = bool(self._cerrar_posicion_impl(ticker, precio_salida, motivo))
+                    return closed
                 finally:
                     with self._lock:
                         self._cerrando.discard(ticker)
+                        if intent:
+                            current = self._posiciones.get(ticker)
+                            if (not closed and pos.get('pendiente') and current is not pos
+                                    and current and not current.get('pendiente')
+                                    and not current.get('reservado')
+                                    and current.get('tipo') == intent['side']):
+                                # Cancel/reconcile can confirm a late fill and
+                                # replace this pending entry with its adopted
+                                # position under the same symbol lock. Preserve
+                                # the kill intent for that confirmed transition.
+                                pos.pop('exit_pending', None)
+                                pos = current
+                                intent['position'] = pos
+                                intent['position_id'] = pos.get('position_id')
+                                pos['exit_pending'] = True
+                                pos['exit_reason'] = intent['reason']
+                            if closed or self._posiciones.get(ticker) is not pos:
+                                intents.pop(ticker, None)
+                                pos.pop('exit_pending', None)
+                            else:
+                                # No fast repeated cancel/POST/read sequence. Respect
+                                # an upstream pause in addition to the 30s cadence.
+                                pause = schwab_request_pause()
+                                delay = max(30, float(pause.get('retry_after_seconds', 0) or 0))
+                                intent['next_retry'] = time.monotonic() + delay
+                                pos['exit_retry_after_seconds'] = delay
+                                pos['exit_attempts'] = intent['attempts']
+                    if intent and not closed:
+                        self._start_exit_recovery()
+
+    def _start_exit_recovery(self):
+        """Bounded close-only worker survives strategy/monitor shutdown.
+
+        Intents belong to this engine and the exact position object. They never
+        transfer to another engine, account, position or New York session.
+        Durable SmartExit records still guard accepted/ambiguous submissions.
+        """
+        with self._lock:
+            thread = getattr(self, '_exit_recovery_thread', None)
+            if thread is not None and thread.is_alive():
+                return
+            if not getattr(self, '_exit_recovery', {}):
+                return
+            self._exit_recovery_thread = threading.Thread(
+                target=self._exit_recovery_loop, name='schwab-exit-recovery', daemon=True)
+            self._exit_recovery_thread.start()
+
+    def _exit_recovery_loop(self):
+        while True:
+            # One paced scan, never strategy evaluation or entry submission.
+            threading.Event().wait(30)
+            with self._lock:
+                tickers = list(self._exit_recovery)
+            for ticker in tickers:
+                try:
+                    self._retry_pending_exit(ticker)
+                except Exception as exc:
+                    self._emit_log('ERROR', f'[{ticker}] Recuperación de cierre: {type(exc).__name__}')
+            with self._lock:
+                eligible = any(not x.get('expired') for x in self._exit_recovery.values())
+                if not eligible:
+                    self._exit_recovery_thread = None
+                    return
+
+    def _retry_pending_exit(self, ticker):
+        with self.ejecutor_hibrido.secuencia_simbolo(ticker):
+            with self._lock:
+                intent = getattr(self, '_exit_recovery', {}).get(ticker)
+                if intent is None:
+                    return False
+                pos = self._posiciones.get(ticker)
+                if (pos is not intent['position'] or self.account_number != intent['account']
+                        or pos.get('tipo') != intent['side']
+                        or pos.get('position_id') != intent['position_id']):
+                    self._exit_recovery.pop(ticker, None)
+                    return False
+                if (self._ahora_et().date() != intent['session']
+                        or time.monotonic() >= intent['deadline']):
+                    if not intent.get('expired'):
+                        intent['expired'] = True
+                        pos['exit_recovery_expired'] = True
+                        self._emit_log('ERROR', f'[{ticker}] Cierre REAL sin confirmar; recuperación '
+                                       'automática agotada. Revisar exposición/órdenes en Schwab.')
+                    return False
+                if intent.get('expired') or time.monotonic() < intent['next_retry']:
+                    return False
+                price, reason = intent['price'], intent['reason']
+            self._emit_log('WARN', f'[{ticker}] EXIT_RECOVERY: reintentando SOLO cierre pendiente')
+            closed = self._cerrar_posicion(ticker, price, motivo=reason)
+        if closed and not self._activo:
+            state = self._refresh_broker_reconciliation(context='EXIT_RECOVERY', require_flat=True)
+            flat = bool(state.get('ok') and state.get('flat'))
+            self._stop_result = {'stopped': True, 'broker_flat': flat, 'ok': flat,
+                                 'message': str(state.get('message', '') or ''),
+                                 'broker_state': dict(state)}
+        return bool(closed)
 
     def _cerrar_posicion_impl(self, ticker: str, precio_salida: float, motivo: str = "") -> bool:
         """
@@ -5832,8 +6000,13 @@ class ChocoletraBot:
             for ticker, pos in items:
                 if pos.get("pendiente"):
                     # Entrada sin llenar: cancelar la orden, no hay nada que liquidar
-                    self._cancelar_pendiente(ticker)
-                    continue
+                    reference = pos.get('entrada') or getattr(pos.get('orden'), 'precio_limite', 0.0)
+                    if self._cerrar_posicion(ticker, float(reference or 0.0), motivo=motivo):
+                        continue
+                    with self._lock:
+                        pos = self._posiciones.get(ticker)
+                    if not pos or pos.get('pendiente'):
+                        continue
                 fallback = pos.get("entrada")
                 if fallback is None and pos.get("orden") is not None:
                     fallback = pos["orden"].precio_limite
@@ -5849,7 +6022,8 @@ class ChocoletraBot:
         # de tickers del bot para no tocar posiciones ajenas de la cuenta.
         if self._has_real_tickers() and self.account_number:
             try:
-                reales = self.schwab.obtener_posiciones(self.account_number)
+                with schwab_control_requests():
+                    reales = self.schwab.obtener_posiciones(self.account_number)
             except Exception:
                 reales = []
             ahora = datetime.now()
@@ -5859,6 +6033,12 @@ class ChocoletraBot:
                     not tk or cant <= 0 or tp not in ("BUY", "SELL")
                     or tk not in self._real_tickers(self.tickers)
                 ):
+                    continue
+                with self._lock:
+                    tracked = self._posiciones.get(tk)
+                if tracked and tracked.get('exit_pending'):
+                    # The exact tracked position already has a paced recovery.
+                    # Do not bypass its retry deadline through the final sweep.
                     continue
                 # NO re-liquidar un ticker que el bucle de reintentos ACABA de cerrar
                 # con MARKET: su orden se está asentando y 'posiciones' aún lo muestra
@@ -6008,6 +6188,10 @@ class ChocoletraBot:
                 "reversal_id": str(pos.get("reversal_id", "")),
                 "correlation_id": str(pos.get("correlation_id", "")),
                 "status": lifecycle,
+                "exit_pending": bool(pos.get('exit_pending')),
+                "exit_reason": str(pos.get('exit_reason', '')),
+                "exit_attempts": int(pos.get('exit_attempts', 0)),
+                "exit_recovery_expired": bool(pos.get('exit_recovery_expired')),
                 "initial_quantity": initial_qty,
                 "remaining_quantity": remaining_qty,
                 "partial_quantity_executed": executed_partial,

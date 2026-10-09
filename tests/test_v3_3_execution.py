@@ -2,6 +2,15 @@ import time
 from types import SimpleNamespace
 import pytest
 from core.execution_v2 import SmartExit, marketable_price
+from api.schwab_transport import SchwabRequestGate
+
+
+@pytest.fixture(autouse=True)
+def isolated_request_gate(tmp_path, monkeypatch):
+    # SmartExit now shares the transport gate. Keep test traffic/pause state
+    # isolated from other tests and any runtime recovery file.
+    monkeypatch.setattr('api.schwab_transport._GATE', SchwabRequestGate(
+        tmp_path / 'request_pause.json', diagnostic_sink=lambda event: None))
 
 
 class Broker:
@@ -27,7 +36,8 @@ class Broker:
     def _http_session(self):
         return self
 
-    def post(self, url, json, timeout):
+    def post(self, url, json, timeout, allow_redirects=False):
+        assert allow_redirects is False
         self.posts.append(json)
         oid = str(len(self.posts))
         qty = json['orderLegCollection'][0]['quantity']
@@ -218,7 +228,8 @@ def test_v2_entry_keeps_reserved_quantity_price_and_limit_type(tmp_path,shares):
     from core.risk_manager import OrdenTradingCalculada
     ex=EjecutorHibridoDeOrdenes(False,config={'execution_engine':{'enabled':True},'risk':{'sizing_mode':'atr'}})
     requests=[]
-    def post(url,json,timeout):
+    def post(url,json,timeout,allow_redirects=False):
+        assert allow_redirects is False
         requests.append(json)
         return SimpleNamespace(headers={'Location':'/orders/entry'},raise_for_status=lambda:None)
     ex._http_session=lambda:SimpleNamespace(post=post)

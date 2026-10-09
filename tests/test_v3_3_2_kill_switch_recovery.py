@@ -1,8 +1,16 @@
 import hashlib
 import json
+import pytest
 from types import SimpleNamespace
 
 from core.execution_v2 import SmartExit
+from api.schwab_transport import SchwabRequestGate
+
+
+@pytest.fixture(autouse=True)
+def isolated_request_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr('api.schwab_transport._GATE', SchwabRequestGate(
+        tmp_path / 'request_pause.json', diagnostic_sink=lambda event: None))
 
 
 class RecoveryBroker:
@@ -63,7 +71,8 @@ class RecoveryBroker:
     def _http_session(self):
         return self
 
-    def post(self, url, json, timeout):
+    def post(self, url, json, timeout, allow_redirects=False):
+        assert allow_redirects is False
         self.posts.append(json)
         oid = 'new'
         qty = int(json['orderLegCollection'][0]['quantity'])
