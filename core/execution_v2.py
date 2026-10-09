@@ -12,6 +12,7 @@ import uuid
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 
 from core.runtime_store import JsonState, EventHistory, utc_now
+from api.schwab_transport import schwab_control_requests, schwab_request
 
 TERMINAL = {'FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED', 'REJECTED'}
 EMERGENCY_WORDS = ('stop', 'kill', 'emergen', 'seguridad', 'huérfana', 'huerfana',
@@ -292,6 +293,12 @@ class SmartExit:
         return new_state
 
     def close(self, ticker, side, quantity, account, reason, reference_price=None):
+        # Quotes, position reads, submission and confirmation are all part of
+        # closing risk. They share the control reserve and the global caps/pause.
+        with schwab_control_requests():
+            return self._close_impl(ticker, side, quantity, account, reason, reference_price)
+
+    def _close_impl(self, ticker, side, quantity, account, reason, reference_price=None):
         key = hashlib.sha256(str(account).encode()).hexdigest()[:16] + ':' + ticker
         emergency = self._is_emergency(reason)
         # This method is called within the executor's symbol lock.
@@ -465,10 +472,11 @@ class SmartExit:
                         'quantity': actual, 'instrument': {'symbol': ticker, 'assetType': 'EQUITY'}}]}
             if is_limit:
                 body['price'] = format(state['limit'], '.2f')
+            response = None
             try:
-                response = self.executor._http_session().post(
+                response = schwab_request(self.executor._http_session().post,
                     f'{self.executor.TRADER_URL}/accounts/{account}/orders', json=body,
-                    timeout=self.executor.request_timeout_s)
+                    timeout=self.executor.request_timeout_s, recovery_safe=False)
                 response.raise_for_status()
                 leg['order_id'] = response.headers.get('Location', '').rstrip('/').split('/')[-1]
                 leg['status'] = 'SUBMITTED'
@@ -480,6 +488,16 @@ class SmartExit:
                     'bid': state['quote'].get('bid'), 'ask': state['quote'].get('ask'),
                     'recovered_stale_exit': bool(state.get('recovery_from'))})
             except Exception as exc:
+                locally_unsent = getattr(exc, 'request_sent', None) is False
+                denied = getattr(response, 'status_code', None) in (401, 403, 429)
+                if locally_unsent or denied:
+                    # Local refusal proves POST never ran; 401/403/429 prove
+                    # authentication/access/rate rejection. Retire only that
+                    # leg. Ambiguous timeout/other HTTP outcomes retain intent.
+                    state['legs'].remove(leg)
+                    self.pending.put(key, state)
+                    return self._pending_result(state, 'Exit locally deferred; no order sent'
+                                                if locally_unsent else 'Exit rejected by authentication/access/rate control')
                 return self._pending_result(state, f'Exit submission uncertain: {type(exc).__name__}')
             if not leg['order_id']:
                 return self._pending_result(state, 'Accepted exit has no order ID; manual reconciliation required')
