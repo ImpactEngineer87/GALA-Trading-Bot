@@ -1168,55 +1168,80 @@ class EjecutorHibridoDeOrdenes:
     def orden_trabajando(
         self, account_number: str, order_id: str
     ) -> Optional[bool]:
-        """True/False only when the current WORKING snapshot was read successfully.
+        """Whether an order may still execute; ``None`` means unverified.
 
-        ``False`` means the order is no longer working. It may have been canceled,
-        rejected, expired, or filled; callers must still reconcile the broker
-        position before deciding whether a replacement/close is safe.
+        A WORKING snapshot proves presence, never terminality by absence. Queued,
+        pending-activation and other nonterminal orders can be absent from that
+        filtered list. Return False only after reading a terminal broker status.
+        Callers must still reconcile positions before replacing a terminal order.
         """
         if not order_id:
-            return False
+            return None
         snapshot = self._working_orders_snapshot(account_number)
         if snapshot is None:
             return None
         objetivo = str(order_id)
-        return any(
+        if any(
             str(order.get("orderId", "") or "") == objetivo
             for order in self._iter_order_nodes(snapshot)
-        )
+        ):
+            return True
+        detail = self._buscar_orden_en_listado(account_number, order_id)
+        status = str((detail or {}).get("status", "") or "").upper()
+        if not status or status in ("DESCONOCIDO", "UNKNOWN", "NOT_WORKING"):
+            return None
+        return status not in TERMINAL_ORDER_STATES
 
     def ordenes_trabajando_ticker(
         self, account_number: str, ticker: str
     ) -> Optional[list]:
-        """Return WORKING order ids for one symbol, or ``None`` if unreadable.
+        """Return all potentially executable symbol order ids, or None if unknown.
 
-        v3.3.2 uses this as a safety barrier before retiring a stale local exit
-        record.  An empty list is authoritative evidence that no broker order is
-        currently reserving/closing shares for the symbol.
+        The legacy method name is retained for callers. The recent unfiltered
+        list includes QUEUED/conditional/pending orders, not just status=WORKING.
+        A capped or malformed list cannot prove absence. Known older orders also
+        need their individual terminal status from ``orden_trabajando``.
         """
-        snapshot = self._working_orders_snapshot(account_number)
-        if snapshot is None:
+        snapshot = self._listado_ordenes(account_number)
+        if not isinstance(snapshot, list) or len(snapshot) >= 500:
+            return None
+        if any(not isinstance(order, dict) for order in snapshot):
             return None
         wanted = str(ticker or "").upper()
         ids = []
         seen = set()
         for order in self._iter_order_nodes(snapshot):
             try:
+                children = order.get("childOrderStrategies", []) or []
+                if not isinstance(children, list) or any(not isinstance(c, dict) for c in children):
+                    return None
+                status = str(order.get("status", "") or "").upper()
+                if not status or status in ("DESCONOCIDO", "UNKNOWN", "NOT_WORKING"):
+                    return None
+                if status in TERMINAL_ORDER_STATES:
+                    continue
                 legs = order.get("orderLegCollection", []) or []
-                symbol = ""
+                if not isinstance(legs, list) or any(not isinstance(leg, dict) for leg in legs):
+                    return None
+                if not legs and not children:
+                    return None
+                symbols = set()
                 for leg in legs:
                     instrument = (leg or {}).get("instrument", {}) or {}
                     symbol = str(instrument.get("symbol", "") or "").upper()
-                    if symbol:
-                        break
-                if symbol != wanted:
+                    if not symbol:
+                        return None
+                    symbols.add(symbol)
+                if wanted not in symbols:
                     continue
                 oid = str(order.get("orderId", "") or "")
-                if oid and oid not in seen:
+                if not oid:
+                    return None
+                if oid not in seen:
                     seen.add(oid)
                     ids.append(oid)
             except Exception:
-                continue
+                return None
         return ids
 
     def detalle_orden(self, account_number: str, order_id: str) -> dict:
@@ -1911,19 +1936,11 @@ class EjecutorHibridoDeOrdenes:
         self, account_number: str, order_id: str, ticker: str = ""
     ) -> dict:
         """
-        Request cancellation and confirm that the order is no longer WORKING.
+        Request cancellation and require terminal broker evidence.
 
-        The old path required the historical/detail endpoint to expose a terminal
-        status.  In the Aug-24 incident that endpoint stayed ``DESCONOCIDO`` while
-        the current WORKING snapshot was still the reliable broker view.  v3.0.2
-        therefore uses two independent facts:
-
-        * terminal status from ``detalle_orden`` when available;
-        * absence/presence in a successfully-read current WORKING snapshot.
-
-        ``NOT_WORKING`` is safe for order-conflict purposes, but it is *not*
-        interpreted as CANCELED vs FILLED.  The engine must still read the actual
-        broker position before sending a liquidation or releasing local state.
+        ``orden_trabajando=False`` now also requires a terminal order read; absence
+        from WORKING alone is insufficient. ``NOT_WORKING`` does not distinguish
+        cancellation from a fill. Position reconciliation remains mandatory.
         """
         if self.paper_trading:
             result = {
@@ -1979,10 +1996,8 @@ class EjecutorHibridoDeOrdenes:
             )
             return result
 
-        # If the current broker WORKING snapshot is readable and the order is
-        # already absent, do not send repeated DELETEs against an order that has
-        # already transitioned.  Position reconciliation below the engine decides
-        # whether that transition was a cancel/reject/expire or a fill.
+        # A terminal order read proves that another DELETE is unnecessary.
+        # Position reconciliation still distinguishes a cancellation from a fill.
         working_before = self.orden_trabajando(account_number, order_id)
         if working_before is False:
             result = {
@@ -1993,15 +2008,16 @@ class EjecutorHibridoDeOrdenes:
                 "filled": float(antes.get("filled", 0) or 0),
                 "error": "",
                 "solicitud_aceptada": False,
-                "terminal_by_absence": True,
+                "terminal_by_absence": False,
+                "terminal_by_order_read": True,
             }
             self._audit(
-                "CANCEL_CONFIRMED_BY_ABSENCE",
+                "CANCEL_CONFIRMED",
                 ticker=ticker,
                 estado="NOT_WORKING",
                 order_id=order_id,
                 cantidad=result["filled"],
-                motivo="order_id ausente del snapshot WORKING actual",
+                motivo="Estado terminal confirmado por lectura de la orden",
             )
             return result
 
@@ -2056,8 +2072,7 @@ class EjecutorHibridoDeOrdenes:
         resultado["cancel_http_status"] = solicitud.get("http_status")
         resultado["terminal_by_absence"] = False
 
-        # The detail endpoint may remain unknown while the live WORKING snapshot
-        # already proves the order cannot conflict with a replacement/close.
+        # A fresh terminal order read can confirm a transition missed by the wait.
         if not resultado.get("confirmado"):
             working_after = self.orden_trabajando(account_number, order_id)
             if working_after is False:
@@ -2065,7 +2080,8 @@ class EjecutorHibridoDeOrdenes:
                     "confirmado": True,
                     "broker_status": "NOT_WORKING",
                     "timeout": False,
-                    "terminal_by_absence": True,
+                    "terminal_by_absence": False,
+                    "terminal_by_order_read": True,
                     "error": "",
                 })
             elif working_after is True and solicitud.get("error"):

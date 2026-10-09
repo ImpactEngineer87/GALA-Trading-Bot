@@ -1,9 +1,8 @@
 """Recoverable smart exits. A cancel request is never proof of cancellation.
 
-v3.3.2 adds emergency recovery for stale durable exit records.  During a kill
-switch the broker's *current* position and WORKING-order snapshot are the final
-authority; an old ``execution_pending.json`` row may never permanently block a
-verified emergency flatten.
+Recovery requires current broker exposure and order evidence. Absence from a
+WORKING-only list cannot prove that an accepted order is terminal: it may still
+be queued or pending activation. Unverified orders retain durable exit intent.
 """
 import hashlib
 import math
@@ -256,7 +255,7 @@ class SmartExit:
 
         v3.3.5 extends stale-journal recovery to reversals/TP/opposite-signal
         closes, but only after the caller has already proved: the historical
-        order is not WORKING, the ticker has no other WORKING order, and the
+        order is terminal, the ticker has no other recent executable order, and the
         current broker side matches the position the engine intends to close.
         """
         old_ids = [str(x.get('order_id', '') or '') for x in state.get('legs', [])]
@@ -318,10 +317,8 @@ class SmartExit:
             )
             self.pending.put(key, state)
 
-        # Resume accepted orders on retries/restarts.  v3.3.2 recovery rule:
-        # an old journal row may block a replacement only while its broker order
-        # is actually WORKING (or broker state cannot be read).  If it is no longer
-        # WORKING, reconcile current exposure before deciding what to do next.
+        # Resume accepted orders on retries/restarts. A false _working_order
+        # result requires a terminal broker read, not just WORKING-list absence.
         stale_nonworking_seen = False
         for leg in state.get('legs', []):
             terminal = self._refresh(account, leg)
@@ -349,13 +346,12 @@ class SmartExit:
                 continue
             if working is True:
                 return self._pending_result(
-                    state, 'Prior exit is still WORKING; no duplicate order sent'
+                    state, 'Prior exit is still WORKING or queued/pending; no duplicate order sent'
                 )
             if working is None:
-                # Preserve fail-closed behavior when the broker cannot answer the
-                # current WORKING-order question.
+                # Unknown order state must never authorize replacement.
                 return self._pending_result(
-                    state, 'Prior exit state cannot be verified against WORKING orders'
+                    state, 'Prior exit terminal state unverified; no duplicate order sent'
                 )
             stale_nonworking_seen = True
 
@@ -366,11 +362,11 @@ class SmartExit:
             working_ids = self._working_orders_for_ticker(account, ticker)
             if working_ids is None:
                 return self._pending_result(
-                    state, 'Ticker WORKING-order snapshot unavailable; stale exit retained'
+                    state, 'Ticker all-status order snapshot unavailable; stale exit retained'
                 )
             if working_ids:
                 return self._pending_result(
-                    state, 'Ticker still has WORKING broker order(s); stale exit retained'
+                    state, 'Ticker still has WORKING broker order(s) or queued/pending order(s); stale exit retained'
                 )
 
             snap, broker_side, broker_qty = self._snapshot_exposure(account, ticker)
@@ -396,8 +392,8 @@ class SmartExit:
                     )
                 # v3.3.5: a historical journal row is not allowed to permanently
                 # block an ordinary reversal/TP/opposite-signal close once Schwab
-                # proves that the old order is no longer WORKING, that no other
-                # order for the ticker is WORKING, and that current exposure still
+                # proves that the old order is terminal, that no other recent
+                # order for the ticker is executable, and that current exposure still
                 # matches the side the engine intends to close. Rebuild from the
                 # broker-confirmed remaining quantity and continue with the normal
                 # marketable-LIMIT policy.
@@ -416,7 +412,7 @@ class SmartExit:
         while True:
             snap = self.executor._position_snapshot(account, ticker)
             if snap is None:
-                return self._pending_result(state, 'Broker position unavailable after exit')
+                return self._pending_result(state, 'Broker position unavailable during exit reconciliation')
             expected = state['quantity'] - sum(leg.get('filled', 0) for leg in state['legs'])
             actual = int(snap.get('long', 0)) if state['side'] == 'BUY' else int(snap.get('short', 0))
             opposite = int(snap.get('short', 0)) if state['side'] == 'BUY' else int(snap.get('long', 0))
@@ -426,12 +422,12 @@ class SmartExit:
                     if working_ids is None:
                         return self._pending_result(
                             state,
-                            'Position/fill mismatch and WORKING-order snapshot is unavailable',
+                            'Position/fill mismatch and all-status order snapshot is unavailable',
                         )
                     if working_ids:
                         return self._pending_result(
                             state,
-                            'Position/fill mismatch while broker order(s) are still WORKING',
+                            'Position/fill mismatch while broker order(s) are still WORKING or queued/pending',
                         )
                     snap_now, broker_side, broker_qty = self._snapshot_exposure(account, ticker)
                     if snap_now is None:
@@ -486,6 +482,7 @@ class SmartExit:
                     motivo=reason, estado='SUBMITTED', detalle={'tipo_orden': leg['type'],
                     'signal_price': state['reference_price'], 'limit_price': leg['limit_price'],
                     'bid': state['quote'].get('bid'), 'ask': state['quote'].get('ask'),
+                    'session': body['session'], 'duration': body['duration'],
                     'recovered_stale_exit': bool(state.get('recovery_from'))})
             except Exception as exc:
                 locally_unsent = getattr(exc, 'request_sent', None) is False
@@ -515,7 +512,9 @@ class SmartExit:
                     terminal = self._refresh(account, leg)
             self.pending.put(key, state)
             if not terminal:
-                return self._pending_result(state, 'Exit still working or cancellation unconfirmed')
+                return self._pending_result(
+                    state, 'Exit fill/cancellation unconfirmed; NORMAL session executes only during regular market hours'
+                )
             # A fresh authoritative snapshot follows every terminal status.
             if leg['status'] == 'FILLED':
                 self.executor.esperar_posicion_plana(account, ticker, timeout_s=self.executor.flat_timeout_s)
