@@ -1409,7 +1409,7 @@
         </div>
         <div class="cfg-row">
           <div class="cfg-label">Kill Switch por Pérdida Diaria Neta</div>
-          <div class="cfg-hint">Incluye PnL realizado + no realizado. Al tocar el límite cancela órdenes, liquida a MARKET y bloquea entradas hasta la próxima sesión NY.</div>
+          <div class="cfg-hint">Incluye PnL realizado + no realizado. Al tocar el límite cancela órdenes, liquida a MARKET y bloquea entradas hasta la próxima sesión NY. En modo MIXTO se vigilan ambos límites: tocar el de PAPER o el de REAL liquida TODAS las posiciones (PAPER y REAL).</div>
           <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
             <span class="pill paper" id="cfgDailyPaper">PAPER -$250</span>
             <span class="pill real" id="cfgDailyLive">REAL -$200</span>
@@ -1782,9 +1782,14 @@ function updateDailyRisk(risk){
     : (enabled ? '🛡️ Kill Switch diario preparado' : '⚠️ Kill Switch diario desactivado');
   const realized = Number(risk.realized_pnl || 0);
   const unrealized = Number(risk.unrealized_pnl || 0);
+  // v3.3.23: a MIXED session enforces both limits; show the PAPER book too.
+  const paperBook = (risk.books || {}).PAPER;
+  const paperLine = risk.mixed_mode && paperBook && !blocked
+    ? ` · PAPER ${money(Number(paperBook.net_pnl || 0))} de ${money(Number(paperBook.limit_usd || 0))}`
+    : '';
   el('dailyRiskDetail').textContent = blocked
     ? `${risk.trigger_mode || risk.mode || 'PAPER'} · ${risk.reason || ''} · reinicio ${risk.next_reset_at_ny || 'próxima sesión NY'}`
-    : `${risk.mode || 'PAPER'} · Realizado ${money(realized)} · No realizado ${money(unrealized)}${risk.pricing_complete === false ? ' · valoración incompleta' : ''}`;
+    : `${risk.mode || 'PAPER'} · Realizado ${money(realized)} · No realizado ${money(unrealized)}${risk.pricing_complete === false ? ' · valoración incompleta' : ''}${paperLine}`;
   card.classList.toggle('blocked', blocked);
 }
 

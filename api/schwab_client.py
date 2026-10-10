@@ -803,13 +803,15 @@ class SchwabClient:
                 return {}
             r.raise_for_status()
             bal = r.json().get("securitiesAccount", {}).get("currentBalances", {})
+            available = bal.get("availableFunds", bal.get("cashAvailableForTrading"))
             return {
                 "source": "BROKER",
                 "as_of_epoch": __import__('time').time(),
-                "available_funds": bal.get("availableFunds", bal.get("cashAvailableForTrading")),
+                "available_funds": available,
                 "equity":       bal.get("equity",       0),
                 "cash":         bal.get("cashBalance",   0),
-                "buying_power": bal.get("buyingPower",   0),
+                # Cash accounts report no buyingPower; 0 blocked every REAL entry.
+                "buying_power": bal.get("buyingPower", available if available is not None else 0),
             }
         except Exception as e:
             _log(f"[ERROR] Error obteniendo balance: {e}")

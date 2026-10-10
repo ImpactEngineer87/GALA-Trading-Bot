@@ -31,7 +31,7 @@ METHODS = {'_cerrar_posicion', '_retry_pending_exit', '_exit_recovery_loop',
 Bot = load_methods('engine/bot_engine.py', 'ChocoletraBot', METHODS, {
     'schwab_control_requests': control_requests,
     'schwab_request_pause': lambda: {'retry_after_seconds': 0},
-    'pd': pd, 'math': math,
+    'pd': pd, 'math': math, 'nullcontext': nullcontext,
     'DatosMultiTemporal': lambda **kw: SimpleNamespace(**kw, tf=lambda tf: kw['velas'].get(tf)),
 })
 BOT_SCOPE = Bot._cerrar_posicion.__globals__
@@ -57,6 +57,7 @@ def bot_fixture(side='SELL'):
     bot._activo = True
     bot._cerrando = set()
     bot._exit_recovery = {}
+    bot._last_prices, bot._last_price_times = {}, {}
     bot.account_number = 'offline-account'
     bot._ahora_et = lambda: datetime(2026, 10, 9, 12, 0)
     bot._is_paper_ticker = lambda ticker, pos=None: False
@@ -184,7 +185,7 @@ class ExitIntentTests(unittest.TestCase):
 
     def test_recovery_is_bounded_to_one_hour_and_alert_keeps_exposure_visible(self):
         bot = bot_fixture()
-        bot._cerrar_posicion('NVDA', 235, 'kill switch')
+        bot._cerrar_posicion('NVDA', 235, 'señal opuesta BUY')
         self.clock.advance(3600)
         self.assertFalse(bot._retry_pending_exit('NVDA'))
         self.assertFalse(bot._retry_pending_exit('NVDA'))
@@ -355,16 +356,15 @@ class MacroExitTests(unittest.TestCase):
                 bot._procesar_ticker('NVDA')
                 bot.schwab.obtener_1m_reciente.assert_not_called()
 
-    def test_no_position_pending_entry_paper_or_stopped_never_fetches_exit_data(self):
-        for scenario in ('flat', 'pending', 'paper', 'stopped'):
+    def test_no_position_pending_entry_or_stopped_never_fetches_exit_data(self):
+        # v3.3.23: an open PAPER position now keeps SL/TP management here.
+        for scenario in ('flat', 'pending', 'stopped'):
             with self.subTest(scenario=scenario):
                 bot = self.fixture()
                 if scenario == 'flat':
                     bot._posiciones.clear()
                 elif scenario == 'pending':
                     bot._posiciones['NVDA']['pendiente'] = True
-                elif scenario == 'paper':
-                    bot._is_paper_ticker = lambda *args, **kwargs: True
                 else:
                     bot._activo = False
                 self.assertFalse(bot._check_opposite_exit_without_macro('NVDA', 'WARMUP_PENDING'))

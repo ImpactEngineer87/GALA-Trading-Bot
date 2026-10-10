@@ -248,6 +248,42 @@ class DailyLossGuard:
             self._persist_locked()
             return True
 
+    def book_status(
+        self,
+        paper_trading: bool,
+        *,
+        unrealized_pnl: float = 0.0,
+        priced_positions: int = 0,
+        unpriced_positions: int = 0,
+    ) -> Dict[str, object]:
+        """Live net PnL of one execution book against its own limit.
+
+        Unlike ``snapshot`` this never freezes on the trigger values, so a
+        MIXED session can evaluate the PAPER and REAL books independently.
+        """
+        with self._lock:
+            self.ensure_session()
+            mode = _mode_name(paper_trading)
+            realized = float(
+                (self._state.get("realized_pnl") or {}).get(mode, 0.0) or 0.0
+            )
+            unrealized = (
+                float(unrealized_pnl or 0.0) if self.include_unrealized else 0.0
+            )
+            net = round(realized + unrealized, 2)
+            limit = round(self.limit_for(paper_trading), 2)
+            return {
+                "mode": mode,
+                "limit_usd": limit,
+                "realized_pnl": round(realized, 2),
+                "unrealized_pnl": round(unrealized, 2),
+                "net_pnl": net,
+                "remaining_to_limit_usd": round(max(0.0, net - limit), 2),
+                "breached": bool(self.enabled and net <= limit),
+                "priced_positions": int(priced_positions),
+                "unpriced_positions": int(unpriced_positions),
+            }
+
     def snapshot(
         self,
         paper_trading: bool,

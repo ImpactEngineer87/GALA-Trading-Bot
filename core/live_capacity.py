@@ -4,6 +4,14 @@ import threading
 import time
 
 
+def _opened_before(pos, epoch):
+    """True only when the position's open time is known and not after ``epoch``."""
+    try:
+        return float(pos['abierta_ts'].timestamp()) <= float(epoch)
+    except (KeyError, AttributeError, TypeError, ValueError, OverflowError, OSError):
+        return False
+
+
 def max_real_tickers(live):
     value = live.get('max_real_tickers', live.get('max_tickers', 2))
     if isinstance(value, bool) or int(value) != float(value) or int(value) < 0:
@@ -14,7 +22,8 @@ def max_real_tickers(live):
 class RealCapacityManager:
     def __init__(self, config):
         self.config = config
-        for name, minimum, default in [('notional_multiplier', 1, 1.05), ('cash_reserve_usd', 0, 0), ('max_balance_age_sec', .001, 10)]:
+        for name, minimum, default in [('notional_multiplier', 1, 1.05), ('cash_reserve_usd', 0, 0), ('max_balance_age_sec', .001, 10),
+                                       ('balance_settle_sec', 0, 60)]:
             value = float(config.get(name, default))
             if not math.isfinite(value) or value < minimum:
                 raise ValueError(f'Invalid capacity setting: {name}')
@@ -50,10 +59,15 @@ class RealCapacityManager:
             raise ValueError('Invalid capacity input')
         if float(quantity) != int(quantity) or float(price) == float(stop):
             raise ValueError('Invalid quantity or stop distance')
-        # Broker balances already reflect some committed exposure. Reserving all
-        # managed exposure again is deliberate: it prevents overspend when balances
-        # lag simultaneous submissions, at the expense of lower utilization.
+        # In-flight entries and fills younger than the settle window may not be in
+        # the broker balance yet, so their notional is reserved again to prevent
+        # overspend when balances lag simultaneous submissions. v3.3.23: a fill
+        # older than the window is already deducted by Schwab. Reserving it a
+        # second time held a small account to one REAL position at a time.
+        # Stop risk and the position count still apply to every position.
+        settled_before = float(balance['as_of_epoch']) - float(cfg.get('balance_settle_sec', 60))
         occupied = {}
+        settled = set()
         for symbol, pos in positions.items():
             if symbol == ticker or pos.get('execution_mode') != 'REAL':
                 continue
@@ -62,11 +76,15 @@ class RealCapacityManager:
             entry = pos.get('entrada', getattr(order, 'precio_limite', 0))
             sl = pos.get('sl_actual', pos.get('sl', getattr(order, 'stop_loss', 0)))
             if qty and entry and sl:
-                occupied[symbol] = {'notional': abs(float(qty) * float(entry)),
+                in_balance = (not pos.get('reservado') and not pos.get('pendiente')
+                              and _opened_before(pos, settled_before))
+                if in_balance:
+                    settled.add(symbol)
+                occupied[symbol] = {'notional': 0. if in_balance else abs(float(qty) * float(entry)),
                                     'risk': abs(float(entry) - float(sl)) * float(qty)}
             elif not pos.get('reservado'):
                 return {'allowed': False, 'reason': f'Cannot price existing REAL exposure: {symbol}'}
-        self.reservations = {k: v for k, v in self.reservations.items() if k in positions}
+        self.reservations = {k: v for k, v in self.reservations.items() if k in positions and k not in settled}
         occupied.update({k: v for k, v in self.reservations.items() if k != ticker})
         notional = int(quantity) * float(price) * float(cfg.get('notional_multiplier', 1.05))
         risk = int(quantity) * abs(float(price) - float(stop))
@@ -84,6 +102,7 @@ class RealCapacityManager:
                   'remaining_daily_risk': round(max(0, risk_left), 2),
                   'requested_notional': round(notional, 2), 'requested_stop_risk': round(risk, 2),
                   'open_or_reserved_positions': len(occupied),
+                  'positions_already_in_broker_balance': len(settled),
                   'additional_positions_for_this_order_size': min(capital_slots, risk_slots, free_slots),
                   'max_simultaneous_for_this_order_size': len(occupied) + min(capital_slots, risk_slots, free_slots),
                   'as_of_epoch': balance['as_of_epoch']}

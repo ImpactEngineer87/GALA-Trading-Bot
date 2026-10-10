@@ -266,6 +266,12 @@ class ChocoletraBot:
             self.gestor_riesgo.max_acciones_por_orden = 0
             self.ejecutor_hibrido.max_acciones = self.live_max_shares_per_order
             self.ejecutor_paper.max_acciones = self.max_paper_shares_per_order
+            # v3.3.23: the dashboard's per-ticker share count is exact. With
+            # risk.sizing_mode=atr the hybrid IA/señal-maestra multiplier
+            # (x2/x2.5) silently enlarged PAPER orders, and REAL orders beyond
+            # the capital/stop risk reserved for them.
+            self.ejecutor_hibrido.sizing_mode = "fixed"
+            self.ejecutor_paper.sizing_mode = "fixed"
 
         # --- Configuración de reversión / kill switch ---
         rev = self.config.get("reversion", {})
@@ -831,12 +837,15 @@ class ChocoletraBot:
                 "remaining_to_limit_usd": 0.0,
             }
 
-        # In a mixed session the REAL loss limit governs the live capital.
-        # PAPER PnL keeps accumulating separately but cannot trip the REAL guard.
+        # The primary fields keep describing the REAL book whenever a ticker is
+        # REAL, because REAL capacity consumes ``remaining_to_limit_usd``.
+        # v3.3.23: ``books`` values PAPER and REAL independently so a MIXED
+        # session enforces BOTH limits instead of silently ignoring PAPER.
         guard_paper = not self._has_real_tickers()
-        unrealized = 0.0
-        priced = 0
-        unpriced = 0
+        books = {
+            mode: {"unrealized": 0.0, "priced": 0, "unpriced": 0, "stale": 0}
+            for mode in ("PAPER", "REAL")
+        }
         with getattr(self, "_lock", threading.RLock()):
             items = list(getattr(self, "_posiciones", {}).items())
             prices = dict(getattr(self, "_last_prices", {}))
@@ -845,8 +854,7 @@ class ChocoletraBot:
         for ticker, pos in items:
             if not isinstance(pos, dict) or pos.get("reservado") or pos.get("pendiente"):
                 continue
-            if self._is_paper_ticker(ticker, pos=pos) != guard_paper:
-                continue
+            book = books["PAPER" if self._is_paper_ticker(ticker, pos=pos) else "REAL"]
             try:
                 entry = float(pos.get("entrada", 0.0) or 0.0)
                 order = pos.get("orden")
@@ -856,46 +864,150 @@ class ChocoletraBot:
                     continue
                 price = prices.get(ticker)
                 if price is None:
-                    unpriced += 1
+                    book["unpriced"] += 1
                     continue
+                price = float(price)
+                if str(pos.get("tipo", "")).upper() == "BUY":
+                    pnl = (price - entry) * qty
+                else:
+                    pnl = (entry - price) * qty
                 # Objects constructed by legacy tests have no provenance map;
-                # production bots always do. A stale quote is not a valuation.
+                # production bots always do. A stale quote is not a valuation
+                # for capacity, but its loss still counts toward the kill
+                # switch: valuing a losing position at $0 kept an unresolved
+                # NVDA short from ever tripping the REAL limit.
                 if price_times:
                     age = time.time() - float(price_times.get(ticker, 0.0) or 0.0)
                     if age > float(getattr(self, "_max_risk_price_age_sec", 120.0)):
-                        unpriced += 1
+                        book["unpriced"] += 1
+                        book["stale"] += 1
+                        book["unrealized"] += min(0.0, pnl)
                         continue
-                price = float(price)
-                if str(pos.get("tipo", "")).upper() == "BUY":
-                    unrealized += (price - entry) * qty
-                else:
-                    unrealized += (entry - price) * qty
-                priced += 1
+                book["unrealized"] += pnl
+                book["priced"] += 1
             except (TypeError, ValueError):
-                unpriced += 1
+                book["unpriced"] += 1
 
+        primary = books["PAPER" if guard_paper else "REAL"]
         snapshot = guard.snapshot(
             guard_paper,
-            unrealized_pnl=unrealized,
-            priced_positions=priced,
-            unpriced_positions=unpriced,
+            unrealized_pnl=primary["unrealized"],
+            priced_positions=primary["priced"],
+            unpriced_positions=primary["unpriced"],
         )
-        snapshot["pricing_complete"] = unpriced == 0
+        snapshot["pricing_complete"] = primary["unpriced"] == 0
+        snapshot["stale_priced_positions"] = primary["stale"]
         snapshot["valuation_source"] = "trusted_market_data"
+        snapshot["books"] = {
+            mode: dict(guard.book_status(
+                mode == "PAPER",
+                unrealized_pnl=book["unrealized"],
+                priced_positions=book["priced"],
+                unpriced_positions=book["unpriced"],
+            ), stale_priced_positions=book["stale"],
+                pricing_complete=book["unpriced"] == 0)
+            for mode, book in books.items()
+        }
+        snapshot["mixed_mode"] = bool(
+            not guard_paper and any(
+                self._is_paper_ticker(t) for t in (getattr(self, "tickers", None) or [])
+            )
+        )
         return snapshot
 
     def _evaluar_limite_perdida_diaria(self) -> bool:
-        """Activa el kill switch cuando PnL realizado + no realizado toca el límite."""
+        """Activa el kill switch cuando PnL realizado + no realizado toca el límite.
+
+        v3.3.23: every book is checked against its own limit. A breach of
+        either the PAPER or the REAL limit stops the WHOLE engine: entries are
+        blocked, orders cancelled and PAPER and REAL positions liquidated.
+        """
         guard = self._daily_guard()
         if guard is None or not guard.enabled:
             return False
         if guard.is_blocked():
             return True
         status = self.daily_risk_snapshot()
-        if float(status.get("net_pnl", 0.0)) > float(status.get("limit_usd", 0.0)):
-            return False
-        self._activar_kill_switch_diario(status)
+        books = status.get("books") or {}
+        breached = [
+            books[mode] for mode in ("REAL", "PAPER")
+            if isinstance(books.get(mode), dict) and books[mode].get("breached")
+        ]
+        if not breached:
+            if float(status.get("net_pnl", 0.0)) > float(status.get("limit_usd", 0.0)):
+                return False
+            breached = [status]
+        self._activar_kill_switch_diario(breached[0])
         return True
+
+    def _refresh_position_prices(self) -> None:
+        """Re-quote open positions whose cycle price went stale (one request).
+
+        A ticker that skips market data (pending exit, warmup, quarantine) stops
+        refreshing ``_last_prices``. Its exposure then dropped out of the daily
+        loss valuation and blocked REAL capacity for every other ticker.
+        """
+        max_age = float(getattr(self, "_max_risk_price_age_sec", 120.0))
+        now = time.time()
+        with self._lock:
+            stale = sorted(
+                ticker for ticker, pos in self._posiciones.items()
+                if isinstance(pos, dict) and not pos.get("reservado")
+                and not pos.get("pendiente")
+                and now - float(self._last_price_times.get(ticker, 0.0) or 0.0)
+                > max_age * 0.75
+            )
+        if not stale:
+            return
+        try:
+            quotes = self.schwab.obtener_multiples_precios(stale) or {}
+        except Exception:
+            return
+        stamp = time.time()
+        with self._lock:
+            for ticker in stale:
+                try:
+                    price = float(quotes.get(ticker) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0 and math.isfinite(price):
+                    self._last_prices[ticker] = price
+                    self._last_price_times[ticker] = stamp
+
+    def _kill_switch_residual_sweep(self) -> None:
+        """Paced re-liquidation while the daily block still leaves exposure.
+
+        The trigger runs one bounded liquidation. Exposure it could not close
+        (untracked broker shares, a failed final sweep) was never retried for
+        the rest of the session. Tracked REAL closes keep their own retry
+        deadline inside ``_cerrar_posicion``; this only re-runs the sweep.
+        """
+        if getattr(self, "_daily_kill_in_progress", False):
+            return
+        now = time.monotonic()
+        if now - float(getattr(self, "_daily_kill_last_sweep", 0.0) or 0.0) < 120:
+            return
+        with self._lock:
+            local = [
+                ticker for ticker, pos in self._posiciones.items()
+                if isinstance(pos, dict) and not pos.get("reservado")
+            ]
+        broker = dict(getattr(self, "_broker_reconciliation", {}) or {})
+        broker_exposed = bool(
+            self._has_real_tickers() and not (broker.get("ok") and broker.get("flat"))
+        )
+        if not local and not broker_exposed:
+            return
+        self._daily_kill_last_sweep = now
+        self._emit_log(
+            "WARN",
+            "Kill switch diario activo con exposición pendiente "
+            f"({', '.join(local) or 'broker no confirmado plano'}); reintentando liquidación",
+        )
+        try:
+            self._liquidar_todo("kill switch — pérdida diaria (reintento)")
+        except Exception as exc:
+            self._emit_log("ERROR", f"Kill switch diario: reintento falló: {exc}")
 
     def _activar_kill_switch_diario(self, status: dict) -> None:
         """Bloquea primero, luego cancela y liquida. Idempotente entre hilos."""
@@ -910,18 +1022,20 @@ class ChocoletraBot:
             limit = float(status.get("limit_usd", guard.limit_for(guard_paper)))
             net = float(status.get("net_pnl", 0.0))
             unreal = float(status.get("unrealized_pnl", 0.0))
-            reason = f"límite diario alcanzado ({net:.2f} <= {limit:.2f} USD)"
+            book = "PAPER" if guard_paper else "REAL"
+            reason = f"límite diario {book} alcanzado ({net:.2f} <= {limit:.2f} USD)"
             if not guard.mark_triggered(
                 guard_paper, net_pnl=net, unrealized_pnl=unreal, reason=reason
             ):
                 return
             self._daily_kill_in_progress = True
+            self._daily_kill_last_sweep = time.monotonic()
 
         self._emit_log(
             "ERROR",
-            f"KILL SWITCH DIARIO: PnL neto ${net:.2f} alcanzó el límite "
-            f"${limit:.2f}. Cancelando órdenes, liquidando posiciones y "
-            "bloqueando nuevas entradas hasta la próxima sesión.",
+            f"KILL SWITCH DIARIO ({book}): PnL neto ${net:.2f} alcanzó el límite "
+            f"${limit:.2f}. Cancelando órdenes, liquidando TODAS las posiciones "
+            "PAPER y REAL y bloqueando nuevas entradas hasta la próxima sesión.",
         )
         self._audit_event(
             "DAILY_LOSS_KILL_TRIGGERED",
@@ -1216,10 +1330,13 @@ class ChocoletraBot:
                     # La pérdida diaria se evalúa ANTES de lanzar workers. Si ya
                     # quedó bloqueado (incluido tras reinicio), el motor permanece
                     # vivo para supervisión pero no procesa nuevas señales.
+                    self._refresh_position_prices()
                     if self._evaluar_limite_perdida_diaria():
                         # The trigger path already performs one bounded emergency
                         # liquidation.  Re-sending it every minute after an OAuth
-                        # failure can cancel broker protection and floods Schwab.
+                        # failure can cancel broker protection and floods Schwab,
+                        # so leftover exposure is retried on a 2-minute cadence.
+                        self._kill_switch_residual_sweep()
                         self._emit_log(
                             "WARN",
                             "Entradas bloqueadas por límite diario hasta la próxima sesión NY. "
@@ -1966,15 +2083,22 @@ class ChocoletraBot:
             self._abrir_o_revertir(decision, precio_actual, df_micro)
 
     def _check_opposite_exit_without_macro(self, ticker, reason):
-        """Macro warmup blocks entries, not an exit from fresh native 1m bars."""
+        """Macro warmup blocks entries, not an exit from fresh native 1m bars.
+
+        v3.3.23: PAPER positions also keep their SL/TP simulation here. They
+        previously went unmanaged for the whole wait, so a stop could be
+        blown through and the position later liquidated far beyond it.
+        """
         with self.ejecutor_hibrido.secuencia_simbolo(ticker):
             with self._lock:
                 pos = self._posiciones.get(ticker)
                 if (not self._activo or not pos or pos.get('reservado') or pos.get('pendiente')
-                        or pos.get('exit_pending') or self._is_paper_ticker(ticker, pos=pos)):
+                        or pos.get('exit_pending')):
                     return False
+                paper = self._is_paper_ticker(ticker, pos=pos)
             try:
-                with schwab_control_requests():
+                # Control capacity is reserved for REAL risk; PAPER reads queue normally.
+                with (nullcontext() if paper else schwab_control_requests()):
                     frame = self.schwab.obtener_1m_reciente(ticker)
                 frame = self._solo_velas_cerradas(frame)
                 if frame is None or len(frame) < 35:
@@ -1985,6 +2109,14 @@ class ChocoletraBot:
                 price = float(frame['close'].iloc[-1])
                 if not 0 <= age <= 120 or not math.isfinite(price) or price <= 0:
                     return False
+                with self._lock:
+                    self._last_prices[ticker] = price
+                    self._last_price_times[ticker] = time.time()
+                if paper:
+                    self._gestionar_paper(ticker, pos, frame)
+                    with self._lock:
+                        if self._posiciones.get(ticker) is not pos:
+                            return True
                 data = DatosMultiTemporal(ticker=ticker, velas={'1m': frame}, sintetico=False)
                 side = self._senal_estrategia(data, ticker, price)
                 return self._close_opposite_without_entry(ticker, side, price, reason)
@@ -2628,15 +2760,23 @@ class ChocoletraBot:
         live = getattr(self, 'config', {}).get('live_trading', {}) or {}
         if not (live.get('capacity', {}) or {}).get('enabled', False):
             return True
-        # Lock covers broker balance read + reservations, including concurrent workers.
-        with self._lock:
+        # v3.3.23: the HTTP balance read no longer holds the engine-wide lock
+        # (it stalled every worker and the order monitor). Concurrent workers
+        # stay safe: ``reserve`` is serialized and counts in-flight reservations.
+        # The read uses control capacity so warmup traffic cannot defer it.
+        with schwab_control_requests():
             balance = self.schwab.obtener_balance(self.account_number)
+        with self._lock:
             daily = self.daily_risk_snapshot()
-            if daily.get('blocked') or not daily.get('enabled') or daily.get('unpriced_positions', 0):
+            real = (daily.get('books') or {}).get('REAL') or daily
+            if daily.get('blocked') or not daily.get('enabled') or real.get('unpriced_positions', 0):
                 result = {'allowed': False, 'reason': 'Daily risk unavailable, blocked, or exposure unpriced'}
+                manager = getattr(self, 'real_capacity', None)
+                if manager is not None:
+                    manager.last = dict(result)
             else:
                 result = self.real_capacity.reserve(ticker, order.cantidad, order.precio_limite,
-                    order.stop_loss, balance, daily.get('remaining_to_limit_usd', 0), self._posiciones)
+                    order.stop_loss, balance, real.get('remaining_to_limit_usd', 0), self._posiciones)
             self._audit_event('REAL_CAPACITY_ALLOWED' if result['allowed'] else 'ENTRY_BLOCKED',
                 ticker=ticker, estado='CAPACITY', motivo=result['reason'], detalle=result)
             return result['allowed']
@@ -4344,14 +4484,31 @@ class ChocoletraBot:
             self._gestionar_real(ticker, pos, precio_actual)
 
     def _gestionar_paper(self, ticker: str, pos: dict, df_micro):
-        """Process each eligible closed PAPER candle once, after entry."""
-        bar_ts = self._paper_exit_bar_timestamp(pos, df_micro)
-        if bar_ts is None:
+        """Process each eligible closed PAPER candle once, after entry, in order.
+
+        v3.3.23: every unmanaged closed bar is replayed oldest-first. Only the
+        newest bar was checked before, so a stop touched on a bar skipped by a
+        market-data wait or a slow cycle was never simulated and the loss ran.
+        """
+        try:
+            total = len(df_micro)
+        except TypeError:
             return
-        self._gestionar_paper_bar(ticker, pos, df_micro)
-        # Commit only after the bar's handling succeeds. Exceptions may retry;
-        # a normal TP1 return must not reuse the same pre-breakeven OHLC later.
-        pos["paper_last_managed_bar_ts"] = bar_ts.isoformat()
+        tracked = getattr(self, "_posiciones", None)
+        was_tracked = isinstance(tracked, dict) and tracked.get(ticker) is pos
+        # At most the last 30 bars are replayed; bounds the work after long waits.
+        for end in range(max(1, total - 29), total + 1):
+            window = df_micro if end == total else df_micro.iloc[:end]
+            bar_ts = self._paper_exit_bar_timestamp(pos, window)
+            if bar_ts is None:
+                continue
+            closed = self._gestionar_paper_bar(ticker, pos, window)
+            # Commit only after the bar's handling succeeds. Exceptions may retry;
+            # a normal TP1 return must not reuse the same pre-breakeven OHLC later.
+            pos["paper_last_managed_bar_ts"] = bar_ts.isoformat()
+            # A TP1 partial can trip the daily kill switch, which liquidates.
+            if closed or (was_tracked and tracked.get(ticker) is not pos):
+                return
 
     def _paper_exit_bar_timestamp(self, pos: dict, df_micro):
         """A signal candle's earlier range cannot close its own new PAPER entry.
@@ -4401,6 +4558,7 @@ class ChocoletraBot:
         Simula el ciclo de vida contra la última vela real: salida parcial
         del 70% en TP1, movimiento a breakeven, y cierre por SL o TP final.
         Genera datos de entrenamiento reales para los agentes.
+        Devuelve True cuando solicita el cierre de la posición.
         """
         vela = df_micro.iloc[-1]
         hi = float(vela["high"])
@@ -4413,30 +4571,30 @@ class ChocoletraBot:
             if lo <= pos["sl_actual"]:
                 self._cerrar_posicion(ticker, pos["sl_actual"],
                                       motivo="SL" if not pos["tp1_hit"] else "SL(breakeven)")
-                return
+                return True
             if not pos["tp1_hit"] and pos["salida_parcial"] and hi >= pos["tp1"]:
                 self._ejecutar_parcial(ticker, pos)
                 return
             if pos["tp1_hit"] and hi >= pos["tp_final"]:
                 self._cerrar_posicion(ticker, pos["tp_final"], motivo="TP final")
-                return
+                return True
             if not pos["salida_parcial"] and hi >= pos["tp_final"]:
                 self._cerrar_posicion(ticker, pos["tp_final"], motivo="TP")
-                return
+                return True
         else:  # SELL
             if hi >= pos["sl_actual"]:
                 self._cerrar_posicion(ticker, pos["sl_actual"],
                                       motivo="SL" if not pos["tp1_hit"] else "SL(breakeven)")
-                return
+                return True
             if not pos["tp1_hit"] and pos["salida_parcial"] and lo <= pos["tp1"]:
                 self._ejecutar_parcial(ticker, pos)
                 return
             if pos["tp1_hit"] and lo <= pos["tp_final"]:
                 self._cerrar_posicion(ticker, pos["tp_final"], motivo="TP final")
-                return
+                return True
             if not pos["salida_parcial"] and lo <= pos["tp_final"]:
                 self._cerrar_posicion(ticker, pos["tp_final"], motivo="TP")
-                return
+                return True
 
     def _ejecutar_parcial(self, ticker: str, pos: dict, tp1_por_posicion: bool = False):
         state = PositionState.LONG if pos.get("tipo") == "BUY" else PositionState.SHORT
@@ -4691,19 +4849,33 @@ class ChocoletraBot:
                 if intent and intent['position'] is not pos:
                     intents.pop(ticker, None)
                     intent = None
-                if intent and 'kill switch' in str(motivo).lower():
+                kill = 'kill switch' in str(motivo).lower()
+                deadline = time.monotonic() + 3600
+                if kill:
+                    # v3.3.23: a kill-switch close keeps retrying (paced) until
+                    # the regular session ends (16:05 ET), never less than the
+                    # old one hour; it used to give up after one hour.
+                    now_et = self._ahora_et()
+                    session_end = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
+                    deadline += max(0.0, (session_end - now_et).total_seconds() - 3600)
+                if intent and kill:
+                    if 'kill switch' not in str(intent['reason']).lower():
+                        # First escalation only; retries must not push it out.
+                        intent['deadline'] = max(intent['deadline'], deadline)
+                        intent.pop('expired', None)
+                        pos.pop('exit_recovery_expired', None)
                     intent['reason'] = motivo  # Escalate a prior signal exit to emergency close.
                     pos['exit_reason'] = motivo
                 if intent and time.monotonic() < intent['next_retry']:
                     return False
                 recoverable = bool(pos and not pos.get('reservado')
-                                   and (not pos.get('pendiente') or 'kill switch' in str(motivo).lower())
+                                   and (not pos.get('pendiente') or kill)
                                    and not self._is_paper_ticker(ticker, pos=pos))
                 if recoverable and intent is None:
                     intent = intents[ticker] = {
                         'position': pos, 'side': pos.get('tipo'),
                         'position_id': pos.get('position_id'), 'account': self.account_number,
-                        'session': self._ahora_et().date(), 'deadline': time.monotonic() + 3600,
+                        'session': self._ahora_et().date(), 'deadline': deadline,
                         'next_retry': 0.0, 'attempts': 0, 'reason': motivo, 'price': precio_salida,
                     }
                 if intent:

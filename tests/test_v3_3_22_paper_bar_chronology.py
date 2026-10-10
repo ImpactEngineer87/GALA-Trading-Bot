@@ -163,9 +163,9 @@ class PaperChronologyTests(unittest.TestCase):
 
 
 class MixedGuardDiagnosticTests(unittest.TestCase):
-    def test_paper_losses_are_separate_from_the_existing_real_guard_in_mixed_mode(self):
-        # This records a pre-existing policy limitation; this chronology patch
-        # deliberately does not make PAPER losses liquidate REAL positions.
+    def test_mixed_mode_paper_loss_now_trips_the_kill_switch(self):
+        # v3.3.23 replaced the documented limitation: a MIXED session checks the
+        # PAPER book against its own limit, and any breach stops everything.
         with tempfile.TemporaryDirectory() as directory:
             b = bot()
             config = {'kill_switch': {'daily_loss': {
@@ -179,8 +179,10 @@ class MixedGuardDiagnosticTests(unittest.TestCase):
             b._lock, b._posiciones, b._last_prices = threading.RLock(), {}, {}
             b._activar_kill_switch_diario = Mock()
             self.assertEqual(b.daily_risk_snapshot()['mode'], 'REAL')
-            self.assertFalse(b._evaluar_limite_perdida_diaria())
-            b._activar_kill_switch_diario.assert_not_called()
+            self.assertTrue(b._evaluar_limite_perdida_diaria())
+            status = b._activar_kill_switch_diario.call_args.args[0]
+            self.assertEqual((status['mode'], status['limit_usd'], status['net_pnl']),
+                             ('PAPER', -700., -800.))
 
 
 class PaperEntryIntegrationTests(unittest.TestCase):
