@@ -17,6 +17,8 @@ def test_position_pnl_summary_separates_paper_and_real():
         "real_open_count": 1,
         "paper_unrealized_pnl": 10.34,
         "real_unrealized_pnl": 5.5,
+        "paper_open_realized_pnl": 0.0,
+        "real_open_realized_pnl": 0.0,
     }
 
 

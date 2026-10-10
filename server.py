@@ -575,6 +575,10 @@ def _position_pnl_summary(positions):
     summary = {
         "paper_open_count": 0, "real_open_count": 0,
         "paper_unrealized_pnl": 0.0, "real_unrealized_pnl": 0.0,
+        # v3.3.23: TP1 (70%) profit already banked by a still-open position.
+        # It reaches the history CSV only with the final close, so the session
+        # PnL used to omit it and showed PAPER worse than it was.
+        "paper_open_realized_pnl": 0.0, "real_open_realized_pnl": 0.0,
     }
     for row in positions or []:
         if not isinstance(row, dict):
@@ -593,7 +597,14 @@ def _position_pnl_summary(positions):
             )
         except (TypeError, ValueError):
             pass
-    for key in ("paper_unrealized_pnl", "real_unrealized_pnl"):
+        try:
+            summary[f"{key}_open_realized_pnl"] += float(
+                row.get("realized_pnl", 0.0) or 0.0
+            )
+        except (TypeError, ValueError):
+            pass
+    for key in ("paper_unrealized_pnl", "real_unrealized_pnl",
+                "paper_open_realized_pnl", "real_open_realized_pnl"):
         summary[key] = round(summary[key], 2)
     return summary
 
@@ -768,10 +779,12 @@ def _dashboard_stats():
     stats["paper_closed_today"] = history["paper_closed_today"]
     stats["real_closed_today"] = history["real_closed_today"]
     stats["paper_session_pnl"] = round(
-        history["paper_realized_today"] + live["paper_unrealized_pnl"], 2
+        history["paper_realized_today"] + live["paper_open_realized_pnl"]
+        + live["paper_unrealized_pnl"], 2
     )
     stats["real_session_pnl"] = round(
-        history["real_realized_today"] + live["real_unrealized_pnl"], 2
+        history["real_realized_today"] + live["real_open_realized_pnl"]
+        + live["real_unrealized_pnl"], 2
     )
     return stats
 
@@ -3980,10 +3993,12 @@ def get_trades():
         "real_realized_today": history["real_realized_today"],
         **live,
         "paper_session_pnl": round(
-            history["paper_realized_today"] + live["paper_unrealized_pnl"], 2
+            history["paper_realized_today"] + live["paper_open_realized_pnl"]
+        + live["paper_unrealized_pnl"], 2
         ),
         "real_session_pnl": round(
-            history["real_realized_today"] + live["real_unrealized_pnl"], 2
+            history["real_realized_today"] + live["real_open_realized_pnl"]
+        + live["real_unrealized_pnl"], 2
         ),
         "daily_risk": _engine_daily_risk_snapshot(),
     })
