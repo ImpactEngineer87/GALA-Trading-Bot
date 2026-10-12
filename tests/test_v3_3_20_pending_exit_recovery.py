@@ -27,7 +27,7 @@ METHODS = {'_cerrar_posicion', '_retry_pending_exit', '_exit_recovery_loop',
            '_start_exit_recovery', '_procesar_ticker', '_monitor_orden_ticker',
            '_liquidar_todo', '_detener_impl', '_cantidad_real_broker',
            '_check_opposite_exit_without_macro', '_solo_velas_cerradas',
-           '_close_opposite_without_entry'}
+           '_close_opposite_without_entry', '_resolver_hash_cuenta'}
 Bot = load_methods('engine/bot_engine.py', 'ChocoletraBot', METHODS, {
     'schwab_control_requests': control_requests,
     'schwab_request_pause': lambda: {'retry_after_seconds': 0},

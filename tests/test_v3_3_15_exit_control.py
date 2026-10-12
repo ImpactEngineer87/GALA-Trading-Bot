@@ -42,7 +42,7 @@ def load_methods(path, class_name, names, namespace=None):
 Bot = load_methods("engine/bot_engine.py", "ChocoletraBot", {
     "_procesar_ticker", "_close_opposite_without_entry", "_broker_read_with_retry",
     "_asegurar_ticker_limpio", "_cerrar_posicion_impl", "_detener_impl",
-    "_refresh_broker_reconciliation",
+    "_refresh_broker_reconciliation", "_resolver_hash_cuenta",
 })
 
 

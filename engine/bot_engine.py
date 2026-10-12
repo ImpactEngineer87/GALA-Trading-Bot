@@ -5630,11 +5630,41 @@ class ChocoletraBot:
                     "OAuth Schwab recuperado: datos reales y ejecución REAL vuelven "
                     "a estar disponibles según los demás controles de seguridad.",
                 )
+            self._resolver_hash_cuenta()
             return True
         except Exception as e:
             return _auth_failure(
                 f"Token de trading: {e} — puede requerir reconectar Schwab"
             )
+
+    def _resolver_hash_cuenta(self) -> bool:
+        """Replace a still-plain account number with Schwab's encrypted hash.
+
+        v3.3.24: when OAuth was down at engine start, ``account_number`` kept the
+        plain number and was retried only before a new entry. Every account read
+        (reconciliation, kill switch, stop, dashboard check) then failed with
+        HTTP 400, so a stopped engine could neither confirm Schwab flat nor be
+        restarted after Schwab was reconnected. Returns True once the hash is set.
+        """
+        plain = str(getattr(self, "_account_plain", "") or "")
+        if not plain:
+            return False
+        if self.account_number != plain:
+            return True
+        now = time.monotonic()
+        if now < float(getattr(self, "_hash_retry_after", 0.0) or 0.0):
+            return False
+        self._hash_retry_after = now + 15
+        try:
+            h = self.schwab.obtener_account_hash(plain)
+        except Exception as e:
+            h = None
+            self._emit_log("ERROR", f"No se pudo resolver el hash de cuenta: {e}")
+        if not h:
+            return False
+        self.account_number = h   # a partir de aquí se usa el hash en la API
+        self._hash_retry_after = 0.0
+        return True
 
     def _preparar_trading_real(self):
         """
@@ -5648,17 +5678,12 @@ class ChocoletraBot:
         # resolución del hash aunque self.account_number ya haya cambiado).
         if not getattr(self, "_account_plain", None):
             self._account_plain = self.account_number
-        # 1) Token de usuario fresco
+        # 1) Token de usuario fresco (also resolves the hash when possible)
         if not self._asegurar_token_trading(forzar=True):
             return
         # 2) Hash cifrado de la cuenta para la API de trading
-        try:
-            h = self.schwab.obtener_account_hash(self._account_plain)
-        except Exception as e:
-            h = None
-            self._emit_log("ERROR", f"No se pudo resolver el hash de cuenta: {e}")
+        h = self.account_number if self._resolver_hash_cuenta() else None
         if h:
-            self.account_number = h   # a partir de aquí se usa el hash en la API
             # Listo para trading SOLO si hay hash Y un token de USUARIO válido (un
             # token de datos de mercado no sirve para órdenes). El hash resuelto NO
             # debe habilitar el trading si el token de usuario caducó.
@@ -5968,6 +5993,7 @@ class ChocoletraBot:
                 message="Cuenta Schwab no configurada; exposición REAL desconocida",
                 positions=[], open_order_symbols=[],
             )
+        self._resolver_hash_cuenta()
         ok_pos, positions_raw, err_pos = self._broker_read_with_retry(
             "posiciones",
             lambda: self.schwab.obtener_posiciones(self.account_number),
@@ -6291,6 +6317,7 @@ class ChocoletraBot:
         if self._has_real_tickers() and self.account_number:
             try:
                 with schwab_control_requests():
+                    self._resolver_hash_cuenta()
                     reales = self.schwab.obtener_posiciones(self.account_number)
             except Exception:
                 reales = []

@@ -180,7 +180,8 @@ class OrderSafetyTests(GateFixture):
 class PendingExitReconciliationTests(unittest.TestCase):
     def bot(self, pending_orders):
         Bot = load_methods('engine/bot_engine.py', 'ChocoletraBot',
-                           {'_refresh_broker_reconciliation'}, {})
+                           {'_refresh_broker_reconciliation',
+                            '_resolver_hash_cuenta'}, {})
         bot = Bot()
         bot.account_number, bot.tickers = ACCOUNT, ['NVDA']
         bot._real_tickers = lambda tickers: tickers
