@@ -302,6 +302,8 @@ class VetoObservationStore:
                             "ganadora": "",
                         })
                         state["ticker"] = ticker
+                        if row.get("veto_reason"):
+                            state["veto_reason"] = str(row["veto_reason"]).upper()
                         event = str(row.get("event", "") or "").upper()
                         if event == "RESOLVED":
                             state["event"] = "RESOLVED"
@@ -324,6 +326,7 @@ class VetoObservationStore:
             by_id.setdefault(oid, {
                 "ticker": ticker, "event": "VETO",
                 "resolution": "OPEN", "ganadora": "",
+                "veto_reason": str(row.get("veto_reason", "") or "").upper(),
             })
 
         stats: Dict[str, dict] = {}
@@ -332,9 +335,13 @@ class VetoObservationStore:
             item = stats.setdefault(ticker, {
                 "ticker": ticker, "veto_total": 0, "veto_open": 0,
                 "veto_resolved": 0, "veto_good": 0, "veto_bad": 0,
-                "veto_ambiguous": 0, "veto_timeout": 0,
+                "veto_ambiguous": 0, "veto_timeout": 0, "veto_threshold": 0,
             })
             item["veto_total"] += 1
+            # v3.3.25: only these vetoes change with the ticker's AI threshold;
+            # HARD_VETO (range/macro), regime and long-only blocks do not.
+            if row.get("veto_reason") == "AI_THRESHOLD":
+                item["veto_threshold"] += 1
             if oid in active_ids or str(row.get("resolution", "")).upper() == "OPEN":
                 item["veto_open"] += 1
                 continue
@@ -358,7 +365,7 @@ class VetoObservationStore:
                 stats.setdefault(ticker, {
                     "ticker": ticker, "veto_total": 0, "veto_open": 0,
                     "veto_resolved": 0, "veto_good": 0, "veto_bad": 0,
-                    "veto_ambiguous": 0, "veto_timeout": 0,
+                    "veto_ambiguous": 0, "veto_timeout": 0, "veto_threshold": 0,
                 })
 
         # v3.2: make the client-facing meaning explicit. Only resolved TP/SL

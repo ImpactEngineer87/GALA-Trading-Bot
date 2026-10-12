@@ -761,6 +761,11 @@
       .exec-model-badge{font-size:.72rem;font-weight:700;display:inline-flex;gap:6px;align-items:center;color:#c5d4ea;margin-bottom:6px}
       .exec-model-badge.production{color:#6ee7b7}.exec-model-badge.shadow{color:#c4b5fd}
       .exec-ai-detail{color:#a5b4cc;font-size:.72rem;line-height:1.55;margin-bottom:9px}
+      .exec-thr{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:9px}
+      .exec-thr label{font-size:.72rem;font-weight:700;color:#c5d4ea}
+      .exec-thr .exec-thr-input{width:72px;min-height:34px;padding:6px 8px}
+      .exec-thr-note{flex-basis:100%;font-size:.7rem;line-height:1.45;color:#9fb2ce;overflow-wrap:anywhere}
+      .exec-thr-note[data-state="error"]{color:#fbbf24}.exec-thr-note[data-state="saved"]{color:#6ee7b7}
       .exec-row-actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:7px}
       .exec-row-actions .btn{padding:8px 11px;min-height:36px}
       .exec-row-feedback{font-size:.73rem;line-height:1.5;color:#9fb2ce;overflow-wrap:anywhere}
@@ -3612,8 +3617,8 @@ function aiThresholdSection(ticker,t){
     ${t.load_error?'<p class="section-note">'+escHtml(t.load_error)+'</p>':''}
     <form onsubmit="event.preventDefault();saveAIThreshold('${escHtml(ticker)}')" style="display:grid;gap:10px;max-width:680px">
       <label>Nuevo umbral (%) <input id="aiThrValue" type="number" min="${lo}" max="${hi}" step="1" class="exec-mode-select" style="width:120px" value="${o?Math.round(o.threshold*100):''}" required></label>
-      <label>Motivo <input id="aiThrReason" class="exec-mode-select" style="width:100%" required></label>
-      <p class="section-note">Entre ${lo}% y ${hi}%, con el motor detenido. Un umbral más bajo aprueba más señales de este ticker en PAPER y REAL. Los vetos de rango/macro, régimen, estrategia, capital, pérdida diaria y broker siguen aplicando.${t.model_loaded?'':' Sin modelo PRODUCTION cargado: el umbral se aplicará cuando haya uno.'}</p>
+      <label>Motivo (opcional) <input id="aiThrReason" class="exec-mode-select" style="width:100%"></label>
+      <p class="section-note">Entre ${lo}% y ${hi}%. Se puede cambiar con el motor activo y aplica a las próximas señales; las posiciones abiertas no cambian. Un umbral más bajo aprueba más señales de este ticker en PAPER y REAL. Los vetos de rango/macro, régimen, estrategia, capital, pérdida diaria y broker siguen aplicando.${t.model_loaded?'':' Sin modelo PRODUCTION cargado: el umbral se aplicará cuando haya uno.'}</p>
       <div><button class="btn btn-blue btn-sm" type="submit">Guardar umbral</button> <button class="btn btn-sm" type="button" onclick="clearAIThreshold('${escHtml(ticker)}')" ${o?'':'disabled'}>Usar umbral del modelo</button></div>
     </form>`;
 }
@@ -3737,7 +3742,7 @@ function renderTickerExecution(){
         <td data-label="Ejecución"><select class="exec-mode-select" id="exec-mode-${escaped}" aria-label="Ejecución de ${escaped}"><option value="PAPER">PAPER</option><option value="REAL">REAL</option></select></td>
         <td data-label="Acciones por orden"><input class="exec-shares-input" id="exec-shares-${escaped}" type="number" min="1" step="1" inputmode="numeric" aria-label="Acciones de ${escaped}" aria-describedby="exec-quantity-note-${escaped}"><div class="exec-saved-value" id="exec-quantity-note-${escaped}"></div><button class="exec-cap-action" id="exec-raise-${escaped}" hidden>Ajustar máximo REAL ↑</button></td>
         <td data-label="Salida parcial"><span class="exec-muted" id="exec-plan-${escaped}"></span></td>
-        <td data-label="IA / modelo"><span id="exec-model-${escaped}" class="exec-model-badge"></span><div class="exec-ai-detail" id="exec-ai-${escaped}"></div><button class="btn btn-ghost btn-sm" id="exec-details-${escaped}">Ver modelo ↗</button></td>
+        <td data-label="IA / modelo"><span id="exec-model-${escaped}" class="exec-model-badge"></span><div class="exec-ai-detail" id="exec-ai-${escaped}"></div><div class="exec-thr"><label for="exec-thr-input-${escaped}">Umbral IA</label><input class="exec-shares-input exec-thr-input" id="exec-thr-input-${escaped}" type="number" min="30" max="95" step="1" inputmode="numeric" aria-describedby="exec-thr-note-${escaped}"><span class="exec-muted">%</span><button class="btn btn-blue btn-sm" id="exec-thr-save-${escaped}">Aplicar</button><button class="btn btn-ghost btn-sm" id="exec-thr-reset-${escaped}">Usar modelo</button><div class="exec-thr-note" id="exec-thr-note-${escaped}" role="status" aria-live="polite"></div></div><button class="btn btn-ghost btn-sm" id="exec-details-${escaped}">Ver modelo ↗</button></td>
         <td data-label="Cambios"><div class="exec-row-actions"><button class="btn btn-blue btn-sm" id="exec-save-${escaped}">Guardar</button><button class="btn btn-ghost btn-sm" id="exec-discard-${escaped}" hidden>Descartar</button></div><div class="exec-row-feedback" id="exec-feedback-${escaped}" role="status" aria-live="polite"></div><button class="exec-cap-action" id="exec-raise-tickers-${escaped}" hidden>Ajustar cupos REAL ↑</button></td>`;
       body.appendChild(tr);
       el('exec-mode-'+ticker).onchange=()=>updateExecShareLimit(ticker);
@@ -3748,6 +3753,10 @@ function renderTickerExecution(){
       el('exec-raise-'+ticker).onclick=()=>raiseRealShareLimitFor(ticker);
       el('exec-raise-tickers-'+ticker).onclick=raiseRealTickerLimit;
       el('exec-details-'+ticker).onclick=()=>showModelDetails(ticker);
+      el('exec-thr-input-'+ticker).oninput=event=>{(S.thrDrafts??={})[ticker]=event.target.value;delete (S.thrNotices??={})[ticker];renderTickerThreshold(ticker);};
+      el('exec-thr-input-'+ticker).onkeydown=event=>{if(event.key==='Enter')applyTickerThreshold(ticker);};
+      el('exec-thr-save-'+ticker).onclick=()=>applyTickerThreshold(ticker);
+      el('exec-thr-reset-'+ticker).onclick=()=>resetTickerThreshold(ticker);
     }
     const draft=S.execDrafts[ticker];
     if(draft&&!draft.saving&&draft.base.updated_utc!==(row.updated_utc||'') && (draft.base.mode!==row.mode||Number(draft.base.shares)!==Number(row.shares)))draft.conflict=true;
@@ -3774,11 +3783,65 @@ function renderTickerExecution(){
     const model=el('exec-model-'+ticker);model.className='exec-model-badge '+(production?'production':shadow?'shadow':'');
     model.textContent=production?(ai.production_manual_override?'● Producción · override':'● Producción'):shadow?'● En validación':'○ Sin modelo';
     el('exec-ai-'+ticker).textContent=(ai?.production_threshold!=null?`Umbral ${(Number(ai.production_threshold)*100).toFixed(0)}%${ai?.operator_threshold!=null?' (manual)':''} · `:'')+`Aprendizaje ${ai?.new_observations??0}/${ai?.retrain_samples??50}`;
+    renderTickerThreshold(ticker);
     const save=el('exec-save-'+ticker);save.disabled=running||saving||!draft||!!issue;save.textContent=saving?'Guardando…':'Guardar';
     const discard=el('exec-discard-'+ticker);discard.hidden=!draft;discard.disabled=saving;
     const notice=S.execNotices[ticker];
     executionMessage(el('exec-feedback-'+ticker),saving?'Validando y guardando…':draft?(draft.error||issue||'Cambios sin guardar'):(notice||'Sin cambios'),draft?.error||issue?'error':notice?'saved':'');
   }
+}
+// v3.3.25: per-ticker AI threshold, editable while the engine runs. The AI
+// reads it on every decision; open positions and other vetoes are unchanged.
+const AI_THRESHOLD_MIN=30, AI_THRESHOLD_MAX=95;
+function tickerThresholdIssue(value){
+  const n=Number(value);
+  return value===''||!Number.isInteger(n)||n<AI_THRESHOLD_MIN||n>AI_THRESHOLD_MAX?`Entre ${AI_THRESHOLD_MIN}% y ${AI_THRESHOLD_MAX}% (entero)`:'';
+}
+function renderTickerThreshold(ticker){
+  const input=el('exec-thr-input-'+ticker);
+  if(!input)return;
+  const ai=aiRowForTicker(ticker),draft=S.thrDrafts?.[ticker],busy=!!S.thrSaving?.[ticker];
+  const pct=v=>Math.round(Number(v)*100)+'%';
+  const applied=ai?.production_threshold??ai?.operator_threshold;
+  if(draft==null&&document.activeElement!==input){
+    const value=applied==null?'':String(Math.round(Number(applied)*100));
+    if(input.value!==value)input.value=value;
+  }
+  const issue=draft==null?'':tickerThresholdIssue(String(draft).trim());
+  input.setAttribute('aria-invalid',String(!!issue));
+  input.disabled=busy;
+  el('exec-thr-save-'+ticker).disabled=busy||draft==null||!!issue;
+  el('exec-thr-reset-'+ticker).disabled=busy||ai?.operator_threshold==null;
+  const model=ai?.model_threshold,manual=ai?.operator_threshold,vetoes=Number(ai?.veto_threshold||0);
+  const info=(model==null?'Sin modelo PRODUCTION: se aplicará cuando haya uno':`Modelo ${pct(model)}${manual!=null?' · manual '+pct(manual):''}`)
+    +` · ${vetoes} veto(s) por umbral`;
+  const notice=S.thrNotices?.[ticker];
+  executionMessage(el('exec-thr-note-'+ticker),busy?'Guardando…':issue||(draft!=null?'Sin aplicar · '+info:notice||info),issue?'error':notice&&draft==null?'saved':'');
+}
+async function sendTickerThreshold(ticker,options,describe){
+  S.thrSaving??={};S.thrNotices??={};S.thrDrafts??={};
+  if(S.thrSaving[ticker])return;
+  S.thrSaving[ticker]=true;renderTickerThreshold(ticker);
+  try {
+    const d=await (await api('/api/ai/threshold/'+encodeURIComponent(ticker),options)).json();
+    if(d.status!=='ok')throw new Error(d.message||'No se pudo guardar');
+    delete S.thrDrafts[ticker];
+    S.thrNotices[ticker]=describe(d);
+    toast('ok','Umbral IA',`${ticker}: ${S.thrNotices[ticker]}`);
+    if(typeof fetchAIStatus==='function')await fetchAIStatus();
+  } catch(e){toast('err','Umbral IA',String(e.message||e));}
+  finally{delete S.thrSaving[ticker];renderTickerThreshold(ticker);}
+}
+function applyTickerThreshold(ticker){
+  const draft=S.thrDrafts?.[ticker];
+  if(draft==null||tickerThresholdIssue(String(draft).trim())){renderTickerThreshold(ticker);return;}
+  const value=Number(draft);
+  return sendTickerThreshold(ticker,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({threshold:value/100})},
+    d=>`umbral ${Math.round(Number(d.applied_threshold??value/100)*100)}% aplicado a las próximas señales`);
+}
+function resetTickerThreshold(ticker){
+  return sendTickerThreshold(ticker,{method:'DELETE'},
+    d=>`vuelve al umbral del modelo${d.applied_threshold==null?'':' ('+Math.round(Number(d.applied_threshold)*100)+'%)'}`);
 }
 function updateExecShareLimit(ticker){
   const row=execSavedRow(ticker),mode=el('exec-mode-'+ticker),shares=el('exec-shares-'+ticker);

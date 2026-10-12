@@ -104,7 +104,13 @@ def register(app, host):
 
     @app.route('/api/ai/threshold/<ticker>', methods=['GET', 'POST', 'DELETE'])
     def ai_threshold_v3319(ticker):
-        """Operator AI threshold for one ticker (v3.3.19)."""
+        """Operator AI threshold for one ticker (v3.3.19).
+
+        v3.3.25: changes are allowed while the engine runs. The AI reads the
+        store on every decision, so a change applies to the next signal and
+        never touches an open position. Stopping the engine to change it ran
+        the kill switch, so in practice thresholds were never adjusted.
+        """
         from core.ai_threshold_overrides import MAX_THRESHOLD, MIN_THRESHOLD, validate_threshold
         ticker = ticker.strip().upper()
         if ticker not in host['BOT_STATE'].get('tickers', []):
@@ -121,9 +127,8 @@ def register(app, host):
                     max_threshold=MAX_THRESHOLD, load_error=store.load_error or None, **extra)
             if request.method == 'GET':
                 return payload()
-            if host['BOT_STATE'].get('running'):
-                return jsonify(status='error', message='Detenga el motor antes de cambiar el umbral de IA.'), 409
             cfg = host['_read_config_runtime']()
+            log = host.get('_log') or (lambda *args, **kwargs: None)
             audit = EventHistory(cfg.get('live_trading', {}).get(
                 'authorization_audit_path', 'data/real_mode_audit.jsonl'))
             # Audit first (as live-settings does): no change without a record.
@@ -134,18 +139,20 @@ def register(app, host):
                         audit.append({'event': 'AI_THRESHOLD_OVERRIDE_CLEARED', 'ticker': ticker,
                                       'actor': session.get('username'), 'previous': previous})
                         store.clear(ticker)
+                        log("INFO", f"[IA] {ticker}: umbral manual eliminado; vuelve al umbral "
+                                    "del modelo para las próximas señales")
                     return payload()
                 data = request.get_json(silent=True) or {}
                 threshold = validate_threshold(data.get('threshold'))
-                reason = str(data.get('reason', '') or '').strip()
-                if not reason:
-                    raise ValueError('Indique el motivo del cambio de umbral')
+                reason = str(data.get('reason', '') or '').strip() or 'Ajuste desde el dashboard'
                 audit.append({'event': 'AI_THRESHOLD_OVERRIDE_SET', 'ticker': ticker,
                               'actor': session.get('username'), 'threshold': threshold,
                               'model_threshold': model_threshold, 'previous': store.row(ticker),
                               'reason': reason[:300]})
                 store.set(ticker, threshold, actor=session.get('username'), reason=reason,
                           model_threshold=model_threshold)
+                log("WARN", f"[IA] {ticker}: umbral manual {threshold:.0%} aplicado a las "
+                            "próximas señales (posiciones abiertas sin cambios)")
             except (ValueError, OSError) as exc:
                 return jsonify(status='error', message=str(exc)), 400
             return payload()

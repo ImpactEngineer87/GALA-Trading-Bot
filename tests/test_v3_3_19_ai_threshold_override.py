@@ -151,11 +151,11 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(events, ["AI_THRESHOLD_OVERRIDE_SET", "AI_THRESHOLD_OVERRIDE_CLEARED"])
 
     def test_rejections_change_nothing(self):
-        cases = [({"threshold": 0.1, "reason": "x"}, 400), ({"threshold": 0.6}, 400),
-                 ({"threshold": 0.6, "reason": "x"}, 409)]
+        # v3.3.25: a running engine and a missing reason are no longer refusals.
+        cases = [({"threshold": 0.1, "reason": "x"}, 400), ({"threshold": 0.96}, 400),
+                 ({"threshold": "x"}, 400), ({}, 400)]
         for body, status in cases:
             with self.subTest(body=body):
-                self.state["running"] = status == 409
                 response = self.client.post("/api/ai/threshold/META", json=body)
                 self.assertEqual(response.status_code, status)
         self.assertIsNone(self.trainer.umbrales_operador.get("META"))
