@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 import requests
+from api.schwab_rate_guard import guarded_market_get
 from flask import Flask, send_from_directory, jsonify, request, session
 from dotenv import load_dotenv
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -1265,8 +1266,9 @@ def schwab_headers() -> dict:
 def _verify_schwab_connection(*, force: bool = False) -> dict:
     """Verify OAuth against Schwab, refreshing once after a rejected token.
 
-    Only an authorization rejection is reported as ``expired``. Timeouts,
-    rate limits, and Schwab/server failures are ``unavailable`` and therefore
+    Only a confirmed 401 is reported as ``expired``. A 403 can also mean
+    app/endpoint permission rejection: don't rotate OAuth for a 403.
+    Timeouts, rate limits, and Schwab/server failures are ``unavailable`` and therefore
     never trigger the five-minute expiration notification.
     """
     with _SCHWAB_AUTH_LOCK:
@@ -1300,7 +1302,7 @@ def _verify_schwab_connection(*, force: bool = False) -> dict:
         params = {"symbols": "BA"}
 
         def verify_request(token: str):
-            return requests.get(
+            return guarded_market_get(
                 url,
                 params=params,
                 headers={
@@ -1312,7 +1314,7 @@ def _verify_schwab_connection(*, force: bool = False) -> dict:
 
         try:
             response = verify_request(access_token)
-            if response.status_code in {401, 403}:
+            if response.status_code == 401:
                 if refresh_token and schwab_refresh(refresh_token):
                     access_token = BOT_STATE.get("schwab_token") or ""
                     response = verify_request(access_token)
@@ -1340,7 +1342,7 @@ def _verify_schwab_connection(*, force: bool = False) -> dict:
                     "Conexión Schwab verificada.",
                     verified=True,
                 )
-            elif response.status_code in {401, 403}:
+            elif response.status_code == 401:
                 _mark_schwab_expired(
                     "Schwab rechazó la autorización después del intento de renovación. "
                     "Vuelva a autorizar OAuth desde el dashboard."
@@ -1367,7 +1369,7 @@ def schwab_get_candles(ticker: str, cantidad: int = 200):
     if not hdrs:
         return _synthetic_candles(ticker, cantidad)
     try:
-        r = requests.get(
+        r = guarded_market_get(
             f"{SCHWAB_MKT_URL}/pricehistory",
             params={"symbol": ticker, "periodType": "day", "period": 5,
                     "frequencyType": "minute", "frequency": 1,
@@ -1383,7 +1385,7 @@ def schwab_get_candles(ticker: str, cantidad: int = 200):
             hdrs = schwab_headers()
             if not hdrs:
                 return _synthetic_candles(ticker, cantidad)
-            r = requests.get(
+            r = guarded_market_get(
                 f"{SCHWAB_MKT_URL}/pricehistory",
                 params={"symbol": ticker, "periodType": "day", "period": 5,
                         "frequencyType": "minute", "frequency": 1,
@@ -1477,7 +1479,7 @@ def _fetch_chart_candles(
         "needPreviousClose": True,
     }
 
-    response = requests.get(
+    response = guarded_market_get(
         f"{SCHWAB_MKT_URL}/pricehistory",
         params=params,
         headers=headers,
@@ -1492,7 +1494,7 @@ def _fetch_chart_candles(
         headers = schwab_headers()
         if not headers:
             raise RuntimeError("La sesión Schwab expiró; vuelva a autorizar OAuth")
-        response = requests.get(
+        response = guarded_market_get(
             f"{SCHWAB_MKT_URL}/pricehistory",
             params=params,
             headers=headers,
@@ -2126,7 +2128,7 @@ def schwab_test():
     if not hdrs:
         return jsonify({"status":"error","message":"Sin token Schwab"}), 400
     try:
-        r = requests.get(f"{SCHWAB_MKT_URL}/quotes", params={"symbols":"BA"}, headers=hdrs, timeout=10)
+        r = guarded_market_get(f"{SCHWAB_MKT_URL}/quotes", params={"symbols":"BA"}, headers=hdrs, timeout=10)
         if r.ok:
             price = r.json().get("BA",{}).get("quote",{}).get("lastPrice","N/A")
             _log("INFO", f"[Schwab] Test OK - BA: ${price}")
@@ -4148,7 +4150,7 @@ def market_quote():
     if not hdrs:
         return jsonify({"status":"error","message":"Sin token Schwab"}), 400
     try:
-        r = requests.get(f"{SCHWAB_MKT_URL}/quotes", params={"symbols":symbol},
+        r = guarded_market_get(f"{SCHWAB_MKT_URL}/quotes", params={"symbols":symbol},
                          headers=hdrs, timeout=10)
         return jsonify({"status":"ok","data":r.json()}) if r.ok else \
                jsonify({"status":"error","message":f"HTTP {r.status_code}"}), r.status_code
