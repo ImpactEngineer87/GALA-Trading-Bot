@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from typing import Optional
 from urllib.parse import urlparse
 
 import requests
@@ -27,7 +28,7 @@ def _setting(name: str, default: float, low: float, high: float) -> float:
 
 
 class MarketDataGuard:
-    def __init__(self, *, min_interval: float | None = None):
+    def __init__(self, *, min_interval: Optional[float] = None):
         self.min_interval = (
             _setting("SCHWAB_MARKET_MIN_INTERVAL_SEC", 0.20, 0.0, 2.0)
             if min_interval is None else max(0.0, float(min_interval))
