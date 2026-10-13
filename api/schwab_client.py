@@ -19,6 +19,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
+from api.schwab_rate_guard import MARKET_DATA_GUARD
 from api.schwab_oauth import (
     DEFAULT_REDIRECT_URI,
     OAUTH_ROTATION_LOCK,
@@ -413,19 +414,33 @@ class SchwabClient:
 
     def _get_autorizado(self, url: str, *, params: Optional[dict] = None,
                         timeout: int = 15):
-        """GET con un solo refresh ante 401; nunca envia un token vacio."""
+        """GET con un solo refresh ante 401, sin repetir automáticamente un 403.
+
+        Market-data requests share one bounded per-process request budget with
+        dashboard reads. Trading/broker reconciliation GETs are not gated here.
+        """
         if not self._asegurar_token():
             return None
-        r = self._session.get(
-            url, params=params, headers=self._headers(), timeout=timeout
-        )
+
+        def get_once():
+            market_data = url.startswith(BASE_URL + "/")
+            if market_data:
+                MARKET_DATA_GUARD.acquire()
+            response = self._session.get(
+                url, params=params, headers=self._headers(), timeout=timeout
+            )
+            if market_data:
+                MARKET_DATA_GUARD.observe(response, url)
+            return response
+
+        r = get_once()
         if r.status_code != 401:
+            # 403 can mean insufficient API permissions/app status, not OAuth
+            # expiry. Let the caller report the error without rotating tokens.
             return r
         if not self._recuperar_401():
             return None
-        return self._session.get(
-            url, params=params, headers=self._headers(), timeout=timeout
-        )
+        return get_once()
 
     # ----------------------------------------------------------
     # DATOS DE MERCADO -- VELAS OHLCV
