@@ -58,6 +58,14 @@ def report(ticker, feedback_path, state_path, limit=12):
     last_attempt = record.get("last_attempt_count")
     eligible = len(valid) + len(legacy)
     progress = max(0, eligible - int(last_attempt)) if last_attempt is not None else None
+    recent = sorted(
+        (valid + legacy + rejected),
+        key=lambda row: str(row.get("timestamp") or ""),
+    )
+    if limit == 0:
+        recent = []
+    else:
+        recent = recent[-limit:]
     result = {
         "ticker": ticker,
         "feedback_file": str(feedback_path),
@@ -82,7 +90,7 @@ def report(ticker, feedback_path, state_path, limit=12):
                 "has_exit_order_id": bool(r.get("exit_order_id")),
                 "has_position_id": bool(r.get("position_id")),
             }
-            for r in (valid + legacy + rejected)[-limit:]
+            for r in recent
         ],
     }
     return result
