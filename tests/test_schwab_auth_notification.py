@@ -103,6 +103,20 @@ class SchwabAuthVerificationTests(unittest.TestCase):
         self.assertFalse(result["verified"])
         self.assertEqual(result["auth_state"], "unavailable")
 
+    def test_403_is_not_interpreted_as_expired_or_token_refresh(self):
+        from api.schwab_rate_guard import MarketDataGuard
+        with patch.object(server, "get_env", side_effect=self.env_value), \
+             patch.object(server.requests, "get", return_value=response(403)) as live_get, \
+             patch.object(server.requests, "post") as refresh, \
+             patch("api.schwab_rate_guard.MARKET_DATA_GUARD", MarketDataGuard(min_interval=0)):
+            result = server._verify_schwab_connection(force=True)
+
+        self.assertFalse(result["connected"])
+        self.assertFalse(result["auth_expired"])
+        self.assertEqual(result["auth_state"], "unavailable")
+        self.assertEqual(live_get.call_count, 1)
+        refresh.assert_not_called()
+
     def test_successful_refresh_is_retried_and_verified(self):
         with patch.object(server, "get_env", side_effect=self.env_value), \
              patch.object(
