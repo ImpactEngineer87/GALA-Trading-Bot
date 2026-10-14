@@ -60,6 +60,7 @@ from api.schwab_oauth import (
     DEFAULT_REDIRECT_URI as SCHWAB_REDIRECT_URI,
     OAUTH_ROTATION_LOCK,
     SchwabOAuthFailure,
+    SchwabOAuthCooldown,
     code_fingerprint,
     exchange_authorization_code,
     refresh_oauth_token,
@@ -1217,6 +1218,18 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
         )
         _log("INFO", "[Schwab] Token renovado correctamente")
         return True
+    except SchwabOAuthCooldown as exc:
+        # A previous refresh got 403/429. Do not POST again or claim that the
+        # access token was successfully refreshed. Operator can reconnect via
+        # authorization_code, which clears the gate on success.
+        _set_schwab_auth_state(
+            "unavailable",
+            "Renovación OAuth pausada tras rechazo HTTP %s. Revise permisos y "
+            "estado de la aplicación Schwab." % (exc.last_status or "?"),
+            verified=False,
+            cache_seconds=max(30, int(exc.remaining_seconds)),
+        )
+        return False
     except SchwabOAuthFailure as exc:
         diag = dict(exc.diagnostic or {})
         BOT_STATE["schwab_oauth_diagnostic"] = diag
