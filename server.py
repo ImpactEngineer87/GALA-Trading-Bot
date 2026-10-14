@@ -2475,6 +2475,21 @@ def get_status():
 def reconcile_broker_read_only():
     try:
         state = _refresh_broker_reconciliation_read_only()
+        # A completed GET workflow is not proof that Schwab confirmed the
+        # actual positions and orders. Do not show a false success toast if
+        # the broker returned None (or another fail-closed result).
+        if not isinstance(state, dict) or not bool(state.get("ok")):
+            message = (
+                str(state.get("message") or "Schwab no confirmó posiciones y órdenes")
+                if isinstance(state, dict)
+                else "Schwab no confirmó posiciones y órdenes"
+            )
+            _log("WARN", "[Schwab] Reconciliación manual pendiente: broker no confirmado")
+            return jsonify({
+                "status": "error",
+                "message": message,
+                "broker_reconciliation": state,
+            }), 409
         _log("INFO", "[Schwab] Reconciliación manual de solo lectura completada")
         return jsonify({"status": "ok", "broker_reconciliation": state})
     except Exception as exc:
