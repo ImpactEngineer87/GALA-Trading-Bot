@@ -14,6 +14,7 @@ import hashlib
 import json
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import parse_qs, urlparse
@@ -26,6 +27,45 @@ DEFAULT_REDIRECT_URI = "https://127.0.0.1"
 
 # Shared by dashboard + engine/client instances in the same Python process.
 OAUTH_ROTATION_LOCK = threading.RLock()
+# This process-wide gate applies only to token refreshes, never to the operator's
+# authorization-code reconnect. No credentials or tokens are stored in it.
+_OAUTH_RETRY_NOT_BEFORE = 0.0
+_OAUTH_RETRY_STATUS = None
+
+
+class SchwabOAuthCooldown(RuntimeError):
+    """Previous refresh was rejected; wait without retrying the token endpoint."""
+
+    def __init__(self, remaining_seconds: float, last_status=None):
+        self.remaining_seconds = max(0.0, float(remaining_seconds))
+        self.last_status = last_status
+        super().__init__("Schwab OAuth refresh paused after HTTP rejection")
+
+
+def reset_oauth_refresh_cooldown():
+    """A successful authorization-code exchange clears rejected refresh state."""
+    global _OAUTH_RETRY_NOT_BEFORE, _OAUTH_RETRY_STATUS
+    with OAUTH_ROTATION_LOCK:
+        _OAUTH_RETRY_NOT_BEFORE = 0.0
+        _OAUTH_RETRY_STATUS = None
+
+
+def _check_oauth_refresh_cooldown():
+    remaining = _OAUTH_RETRY_NOT_BEFORE - time.monotonic()
+    if remaining > 0:
+        raise SchwabOAuthCooldown(remaining, _OAUTH_RETRY_STATUS)
+
+
+def _record_oauth_refresh_rejection(status):
+    global _OAUTH_RETRY_NOT_BEFORE, _OAUTH_RETRY_STATUS
+    # Unspecified 403 is not automatically a rate limit; a long cooldown
+    # prevents credential-retry storms while the operator reviews app access.
+    delay = 900.0 if status == 403 else (120.0 if status == 429 else 0.0)
+    if delay:
+        _OAUTH_RETRY_NOT_BEFORE = max(
+            _OAUTH_RETRY_NOT_BEFORE, time.monotonic() + delay
+        )
+        _OAUTH_RETRY_STATUS = status
 
 
 @dataclass
@@ -244,6 +284,7 @@ def exchange_authorization_code(
                     "request_id": None,
                 },
             )
+        reset_oauth_refresh_cooldown()
         return payload
 
 
@@ -264,6 +305,7 @@ def refresh_oauth_token(
 
     post = http_post or requests.post
     with OAUTH_ROTATION_LOCK:
+        _check_oauth_refresh_cooldown()
         response = post(
             TOKEN_URL,
             auth=HTTPBasicAuth(cid, secret),
@@ -271,13 +313,19 @@ def refresh_oauth_token(
             data={"grant_type": "refresh_token", "refresh_token": refresh},
             timeout=timeout,
         )
-        _raise_for_oauth_failure(
-            response,
-            phase="refresh_token_exchange",
-            client_id=cid,
-            redirect_uri=redirect_uri,
-            secrets_to_redact=(secret, refresh),
-        )
+        try:
+            _raise_for_oauth_failure(
+                response,
+                phase="refresh_token_exchange",
+                client_id=cid,
+                redirect_uri=redirect_uri,
+                secrets_to_redact=(secret, refresh),
+            )
+        except SchwabOAuthFailure as exc:
+            _record_oauth_refresh_rejection(
+                int((exc.diagnostic or {}).get("http_status") or 0)
+            )
+            raise
         payload = response.json()
         if not isinstance(payload, dict) or not payload.get("access_token"):
             raise SchwabOAuthFailure(
@@ -293,4 +341,5 @@ def refresh_oauth_token(
                     "request_id": None,
                 },
             )
+        reset_oauth_refresh_cooldown()
         return payload
