@@ -24,6 +24,7 @@ from api.schwab_oauth import (
     DEFAULT_REDIRECT_URI,
     OAUTH_ROTATION_LOCK,
     SchwabOAuthFailure,
+    SchwabOAuthCooldown,
     refresh_oauth_token,
 )
 
@@ -302,6 +303,15 @@ class SchwabClient:
                 self._save_env_token(env_path)
                 _log("[OK] Schwab token renovado")
                 return True
+            except SchwabOAuthCooldown as exc:
+                # Per-process OAuth rejection cooldown. Never bypass it from a
+                # ticker worker; without a valid token REAL entries fail closed.
+                self._marcar_reautorizacion(
+                    "Schwab OAuth pausado tras HTTP %s; compruebe permisos o "
+                    "reconecte desde el dashboard." % (exc.last_status or "?"),
+                    cooldown_seconds=max(60, int(exc.remaining_seconds)),
+                )
+                return False
             except SchwabOAuthFailure as exc:
                 diag = exc.diagnostic or {}
                 oauth_error = str(diag.get("oauth_error") or "").lower()
