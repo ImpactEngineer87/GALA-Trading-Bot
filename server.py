@@ -1138,7 +1138,10 @@ def schwab_ensure_token():
         # Intentar refresh primero
         refresh = BOT_STATE.get("schwab_refresh_token") or get_env("SCHWAB_REFRESH_TOKEN")
         if refresh:
-            schwab_refresh(refresh)
+            if not schwab_refresh(refresh):
+                # Do not hand an expired bearer token to any market-data,
+                # order or chart request after a failed refresh.
+                return False
         else:
             schwab_get_token_cc()
     return bool(_current_schwab_access_token())
@@ -1269,7 +1272,8 @@ def _schwab_refresh_locked(refresh_token: str) -> bool:
         return False
 
 def schwab_headers() -> dict:
-    schwab_ensure_token()
+    if not schwab_ensure_token():
+        return {}
     token = _current_schwab_access_token()
     if not token:
         return {}
