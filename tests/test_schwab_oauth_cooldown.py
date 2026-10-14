@@ -90,7 +90,7 @@ class OAuthCooldownTests(unittest.TestCase):
                 "SCHWAB_CLIENT_SECRET": "secret",
                 "SCHWAB_REFRESH_TOKEN": "saved-refresh",
             }
-            with patch.object(server, "get_env", side_effect=lambda k, default="": settings.get(k, default)), \\
+            with patch.object(server, "get_env", side_effect=lambda k, default="": settings.get(k, default)), \
                  patch.object(server.requests, "post", return_value=response(403, {})) as post:
                 self.assertFalse(server.schwab_ensure_token())
                 self.assertFalse(server.schwab_ensure_token())
