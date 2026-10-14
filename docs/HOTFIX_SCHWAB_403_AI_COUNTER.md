@@ -15,6 +15,34 @@
 - Broker trading and critical reconciliation requests are deliberately not
   gated by this market-data guard, and retain fail-closed behavior.
 
+## OAuth refresh 403 (additional October 14 patch)
+- Schwab also rejected `/v1/oauth/token` refresh calls with HTTP 403,
+  roughly once a minute. That is a distinct problem from quote/pricehistory
+  throttling and rejected order submission.
+- After the first rejected **OAuth refresh** with HTTP 403, do not make another
+  refresh-token POST for 15 minutes **per Python process**. HTTP 429 similarly
+  defers follow-up refresh calls for 2 minutes.
+- During the rejection/cooldown, an expired bearer token must not be reused
+  for dashboard market/trader data reads. REAL entries stay fail-closed.
+- A successful manual OAuth **authorization_code** exchange clears this cooldown
+  and updates the running bot token. Do not clear it by simply restarting
+  repeatedly; determine whether the Schwab developer app has the correct
+  approval, entitlements and current Client ID/Secret.
+- A 403 at `/v1/oauth/token` is **not** evidence of market-data rate limiting.
+  To resolve it, first review the sanitized dashboard OAuth diagnostic
+  (HTTP status, recommended action, request ID, client-id tail) and the status
+  of the Schwab Developer Portal app. Never share refresh/access tokens,
+  authorization codes, client secrets or account hashes.
+- These source changes are **not proof of successful OAuth**; complete a new
+  interactive authorization if needed and test with PAPER only until
+  Schwab authorization and broker-state reconciliation are verified.
+
+### Additional offline tests
+```powershell
+python -m unittest discover -s tests -p "test_schwab_oauth_cooldown.py" -v
+python -m unittest discover -s tests -p "test_schwab_auth_notification.py" -v
+```
+
 ## Why NVDA can show 25/50 despite BUY and SELL markers
 Those chart markers are strategy signals, not necessarily matched,
 execution-confirmed open/close pairs. The model's new-observations counter
