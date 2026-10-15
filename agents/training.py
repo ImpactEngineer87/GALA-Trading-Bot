@@ -193,7 +193,9 @@ class EntrenadorAgentes:
             warning_samples=self.retrain_warning_samples,
             retrain_samples=self.retrain_trigger_samples,
         )
-        self.retraining.refresh(self.shadow_tickers)
+        # Loading a trainer for status/model verification must not rewrite
+        # lifecycle state owned by the active training process.
+        self.retraining.refresh(self.shadow_tickers, persist=False)
 
     # =========================================================
     # INFERENCIA (filtro de veto por ticker)

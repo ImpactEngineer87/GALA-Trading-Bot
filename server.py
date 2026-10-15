@@ -2599,6 +2599,8 @@ _ENGINE_CONTROL_LOCK = threading.RLock()
 _STARTUP_QUARANTINE = {}
 _SCHEDULER = None
 _AI_STATUS_TRAINER = None
+_AI_STATUS_SIGNATURE = None
+_AI_STATUS_LOCK = threading.RLock()
 _VETO_STATUS_STORE = None
 _LEARNING_STATUS_STORE = None
 
@@ -4202,7 +4204,9 @@ def update_ticker_execution(ticker):
                 }), 500
             # Invalidate the read-only AI status trainer so the dashboard sees
             # the newly promoted PRODUCTION pair immediately without restart.
-            globals()["_AI_STATUS_TRAINER"] = None
+            with _AI_STATUS_LOCK:
+                globals()["_AI_STATUS_TRAINER"] = None
+                globals()["_AI_STATUS_SIGNATURE"] = None
         except Exception as exc:
             return jsonify({
                 "status": "error",
@@ -4353,6 +4357,13 @@ def trigger_training():
 
 def _ai_trainer_for_status():
     """Use the running model, or refresh the stopped dashboard on artifact changes."""
+    # Concurrent dashboard polling must share one initialized trainer. Its
+    # constructor reads model/lifecycle files and can be relatively expensive.
+    with _AI_STATUS_LOCK:
+        return _ai_trainer_for_status_locked()
+
+
+def _ai_trainer_for_status_locked():
     global _AI_STATUS_TRAINER
     if _ENGINE is not None and BOT_STATE.get('running'):
         return _ENGINE.orquestador.entrenador

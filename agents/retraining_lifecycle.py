@@ -13,6 +13,8 @@ import json
 from pathlib import Path
 import os
 import re
+import stat
+import tempfile
 import threading
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional
@@ -437,12 +439,36 @@ class RetrainingLifecycle:
             "retrain_samples": self.retrain_samples,
             "tickers": self._state,
         }
-        tmp = self.state_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, self.state_path)
+        try:
+            existing_mode = stat.S_IMODE(os.stat(self.state_path).st_mode)
+        except FileNotFoundError:
+            existing_mode = None
+        # Each trainer has its own lifecycle lock. A shared .tmp filename lets
+        # another instance replace (and consume) our file before we can use it.
+        # A unique sibling keeps replacement atomic on the same filesystem.
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=folder or ".",
+                prefix=f".{os.path.basename(self.state_path)}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                tmp = handle.name
+                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if existing_mode is not None:
+                os.chmod(tmp, existing_mode)
+            os.replace(tmp, self.state_path)
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
 
     def _ensure_record(self, ticker: str, total_count: int) -> dict:
         ticker = str(ticker).upper()
