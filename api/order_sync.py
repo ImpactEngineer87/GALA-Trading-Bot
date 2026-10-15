@@ -24,6 +24,33 @@ def normalize_status(value: Any) -> str:
     return text or UNKNOWN_STATUS
 
 
+def valid_order_snapshot(value: Any) -> bool:
+    """Require complete broker order records before trusting list membership.
+
+    An empty list is a valid snapshot. A malformed response is unknown, so it
+    must never become evidence that no order is reserving or closing shares.
+    Nested order strategies need the same identity and status checks as roots.
+    """
+    if not isinstance(value, list):
+        return False
+    for order in value:
+        if not isinstance(order, dict):
+            return False
+        order_id = order.get("orderId")
+        if isinstance(order_id, str):
+            if not order_id.strip():
+                return False
+        elif type(order_id) is not int or order_id <= 0:
+            return False
+        status = order.get("status")
+        if not isinstance(status, str) or not status.strip():
+            return False
+        children = order.get("childOrderStrategies")
+        if children is not None and not valid_order_snapshot(children):
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class OrderWaitResult:
     """Final observation produced by a broker polling operation."""

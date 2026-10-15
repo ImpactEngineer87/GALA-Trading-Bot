@@ -32,15 +32,16 @@ DESCRIPCIÓN:
 
 import os
 import re
+import time
 import requests
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
 from dataclasses import dataclass
 from dotenv import load_dotenv
 from core.risk_manager import OrdenTradingCalculada
-from api.order_sync import AsyncOrderSynchronizer, normalize_status
+from api.order_sync import AsyncOrderSynchronizer, normalize_status, valid_order_snapshot
 
 load_dotenv()
 
@@ -325,6 +326,11 @@ class EjecutorHibridoDeOrdenes:
         self._working_orders_provider = None
         self._audit_hook = None
         self._lifecycle_local = threading.local()
+        self._order_observation_local = threading.local()
+        self._order_observation_lock = threading.Lock()
+        self._order_observation_generation = 0
+        self._order_read_warning_lock = threading.Lock()
+        self._order_read_warnings = {}
         if access_token:
             self._session.headers.update({
                 "Authorization": f"Bearer {access_token}",
@@ -381,6 +387,82 @@ class EjecutorHibridoDeOrdenes:
 
     def set_quote_provider(self, provider):
         self._quote_provider = provider
+
+    @contextmanager
+    def order_observation_scope(self, orders, *, account_number="", generation=None):
+        """Reuse positive WORKING states only during one monitor observation.
+
+        Fill details and cancellation checks continue to read the broker afresh.
+        Absence from this snapshot never establishes a terminal order state.
+        """
+        previous = getattr(self._order_observation_local, "scope", None)
+        # Capture before traversing: a mutation during construction must expire
+        # this observation. The monitor can pass its version from before the GET.
+        if generation is None:
+            with self._order_observation_lock:
+                generation = self._order_observation_generation
+        working_ids = frozenset(
+            str(order["orderId"])
+            for order in self._iter_order_nodes(orders)
+            if order.get("orderId")
+            and normalize_status(order.get("status")) == "WORKING"
+        ) if isinstance(orders, list) else frozenset()
+        self._order_observation_local.scope = (
+            str(account_number), working_ids, generation
+        )
+        try:
+            yield
+        finally:
+            self._order_observation_local.scope = previous
+
+    def _invalidate_order_observations(self):
+        """Expire every worker's observation before any broker mutation."""
+        with self._order_observation_lock:
+            self._order_observation_generation += 1
+
+    def _submit_order_request(self, method, url, **kwargs):
+        """Invalidate observations around successful and failed POST/DELETE calls."""
+        self._invalidate_order_observations()
+        try:
+            return getattr(self._http_session(), method)(url, **kwargs)
+        finally:
+            # A snapshot fetched while the request was in flight may also be old.
+            self._invalidate_order_observations()
+
+    def _report_order_read_failure(self, account_number, direct_error, list_error):
+        """Keep endpoint failures actionable without printing each polling retry."""
+        direct_response = getattr(direct_error, "response", None)
+        direct_status = getattr(direct_response, "status_code", None)
+        list_response = getattr(list_error, "response", None)
+        list_status = getattr(list_response, "status_code", None)
+        signature = (direct_status, list_status, type(list_error).__name__)
+        now = time.monotonic()
+        with self._order_read_warning_lock:
+            previous = self._order_read_warnings.get(account_number)
+            if previous and previous[0] == signature and now - previous[1] < 30:
+                self._order_read_warnings[account_number] = (
+                    signature, previous[1], previous[2] + 1
+                )
+                return
+            repeats = previous[2] if previous else 0
+            self._order_read_warnings[account_number] = (signature, now, 0)
+        detail = (
+            _err_detalle(list_error) if list_response is not None
+            else type(list_error).__name__
+        )
+        _ps(
+            "[WARN] Lectura de órdenes no disponible: "
+            f"GET por id HTTP={direct_status or type(direct_error).__name__}; "
+            f"listado {detail}; repeticiones={repeats}. "
+            "Estado desconocido: se mantiene la reconciliación con el broker."
+        )
+
+    def _report_order_read_recovery(self, account_number):
+        with self._order_read_warning_lock:
+            previous = self._order_read_warnings.pop(account_number, None)
+        if previous:
+            _ps("[OK] Lectura de órdenes recuperada; "
+                f"repeticiones agrupadas={previous[2]}")
 
     def retire_pending_exit_after_authoritative_flat(self, account, ticker, reason="broker confirmed flat"):
         """Clear a durable pending exit after a read-only broker flat proof.
@@ -692,8 +774,8 @@ class EjecutorHibridoDeOrdenes:
 
         url = f"{self.TRADER_URL}/accounts/{account_number}/orders"
         try:
-            resp = self._http_session().post(
-                url, json=cuerpo, timeout=self.request_timeout_s)
+            resp = self._submit_order_request(
+                "post", url, json=cuerpo, timeout=self.request_timeout_s)
             resp.raise_for_status()
             order_id = resp.headers.get("Location", "").split("/")[-1]
             self._audit(
@@ -973,19 +1055,24 @@ class EjecutorHibridoDeOrdenes:
         if not order_id:
             return None
         direct_url = f"{self.TRADER_URL}/accounts/{account_number}/orders/{order_id}"
+        direct_error = None
         try:
             direct = self._http_session().get(
                 direct_url, timeout=self.request_timeout_s)
             direct.raise_for_status()
             data = direct.json()
-            if isinstance(data, dict) and data:
+            if (isinstance(data, dict)
+                    and str(data.get("orderId", "")) == str(order_id)
+                    and isinstance(data.get("status"), str) and data["status"].strip()):
+                self._report_order_read_recovery(account_number)
                 return data
-        except Exception:
+            direct_error = ValueError("Invalid order detail response")
+        except Exception as exc:
             # El fallback de listado es deliberado; no se registra aquí para evitar
             # ruido por cada poll. Si ambos caminos fallan sí se registra abajo.
-            pass
+            direct_error = exc
 
-        ahora = datetime.utcnow()
+        ahora = datetime.now(timezone.utc)
         desde = ahora - timedelta(days=2)
         # El límite SUPERIOR se adelanta 1 día: si el reloj del VPS va ATRASADO,
         # la 'enteredTime' real (reloj de Schwab) de una orden recién puesta sería
@@ -1002,15 +1089,16 @@ class EjecutorHibridoDeOrdenes:
             }, timeout=self.request_timeout_s)
             r.raise_for_status()
             data = r.json()
-            if not isinstance(data, list):
-                return None
+            if not valid_order_snapshot(data):
+                raise ValueError("Invalid order list response")
+            self._report_order_read_recovery(account_number)
             objetivo = str(order_id)
-            for o in data:
+            for o in self._iter_order_nodes(data):
                 if str(o.get("orderId", "")) == objetivo:
                     return o
             return None
         except Exception as e:
-            _ps(f"[ERROR] listado ordenes ({order_id}): {_err_detalle(e)}")
+            self._report_order_read_failure(account_number, direct_error, e)
             return None
 
 
@@ -1032,10 +1120,8 @@ class EjecutorHibridoDeOrdenes:
             except Exception as exc:
                 _ps(f"[ERROR] provider órdenes WORKING: {_err_detalle(exc)}")
                 return None
-            if data is None:
-                return None
-            return data if isinstance(data, list) else []
-        ahora = datetime.utcnow()
+            return data if valid_order_snapshot(data) else None
+        ahora = datetime.now(timezone.utc)
         desde = ahora - timedelta(days=7)
         hasta = ahora + timedelta(days=1)
         fmt = "%Y-%m-%dT%H:%M:%S.000Z"
@@ -1053,7 +1139,7 @@ class EjecutorHibridoDeOrdenes:
             )
             r.raise_for_status()
             data = r.json()
-            return data if isinstance(data, list) else []
+            return data if valid_order_snapshot(data) else None
         except Exception as exc:
             _ps(f"[ERROR] snapshot órdenes WORKING: {_err_detalle(exc)}")
             return None
@@ -1141,15 +1227,19 @@ class EjecutorHibridoDeOrdenes:
             # responses while the current WORKING snapshot is healthy.  Treat a
             # successful live snapshot as sufficient acknowledgement that the
             # submitted order exists, without inventing any terminal/fill data.
-            working = self.orden_trabajando(account_number, order_id)
-            if working is True:
-                return {
-                    "status": "WORKING",
-                    "filled": 0.0,
-                    "avg_price": 0.0,
-                    "status_source": "WORKING_SNAPSHOT",
-                }
+            snapshot = self._working_orders_snapshot(account_number)
+            for order in self._iter_order_nodes(snapshot):
+                if (str(order.get("orderId", "")) == str(order_id)
+                        and normalize_status(order.get("status")) == "WORKING"):
+                    detail = self._detalle_desde_orden(order)
+                    detail["status_source"] = "WORKING_SNAPSHOT"
+                    return detail
             return {"status": "DESCONOCIDO", "filled": 0.0, "avg_price": 0.0}
+        return self._detalle_desde_orden(d)
+
+    @staticmethod
+    def _detalle_desde_orden(d):
+        """Preserve actual quantities and execution prices from either endpoint."""
         status = str(d.get("status", "DESCONOCIDO")).upper()
         # Acciones ejecutadas + precio medio desde las PATAS de ejecución. Schwab
         # a veces NO reporta filledQuantity en una orden CANCELED tras un llenado
@@ -1206,6 +1296,14 @@ class EjecutorHibridoDeOrdenes:
         """Consulta el estado de una orden (WORKING/FILLED/...) vía el LISTADO."""
         if not order_id:
             return "DESCONOCIDO"
+        observation = getattr(self._order_observation_local, "scope", None)
+        if observation:
+            account, working_ids, generation = observation
+            with self._order_observation_lock:
+                if (account and account == str(account_number)
+                        and generation == self._order_observation_generation
+                        and str(order_id) in working_ids):
+                    return "WORKING"
         d = self._buscar_orden_en_listado(account_number, order_id)
         if not d:
             return "DESCONOCIDO"
@@ -1263,8 +1361,8 @@ class EjecutorHibridoDeOrdenes:
 
         url = f"{self.TRADER_URL}/accounts/{account_number}/orders"
         try:
-            resp = self._http_session().post(
-                url, json=cuerpo, timeout=self.request_timeout_s)
+            resp = self._submit_order_request(
+                "post", url, json=cuerpo, timeout=self.request_timeout_s)
             resp.raise_for_status()
             order_id = resp.headers.get("Location", "").split("/")[-1]
             event_prefix = "STOP" if tipo_orden == "STOP" else "TP1"
@@ -1541,8 +1639,8 @@ class EjecutorHibridoDeOrdenes:
         }
         url = f"{self.TRADER_URL}/accounts/{account_number}/orders"
         try:
-            resp = self._http_session().post(
-                url, json=cuerpo, timeout=self.request_timeout_s)
+            resp = self._submit_order_request(
+                "post", url, json=cuerpo, timeout=self.request_timeout_s)
             resp.raise_for_status()
             order_id = resp.headers.get("Location", "").split("/")[-1]
             self._audit(
@@ -1749,8 +1847,8 @@ class EjecutorHibridoDeOrdenes:
         try:
             # A DELETE has no JSON body.  Removing Content-Type avoids sending an
             # unnecessary entity header to strict broker gateways.
-            resp = self._http_session().delete(
-                url,
+            resp = self._submit_order_request(
+                "delete", url,
                 headers={"Content-Type": None, "Accept": "application/json"},
                 timeout=self.request_timeout_s,
             )

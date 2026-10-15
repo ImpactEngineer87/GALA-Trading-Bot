@@ -113,15 +113,15 @@ class OrderMonitorTests(unittest.TestCase):
         self.assertIsNone(bot._order_monitor_thread)
         provider.assert_not_called()
 
-    def test_pending_real_position_is_monitored_without_optional_scope(self):
+    def test_pending_real_position_supports_older_executor_without_scope(self):
         position = {
             "execution_mode": "REAL", "pendiente": True,
             "orden": SimpleNamespace(precio_limite=123.45),
         }
         orders = [{"orderId": 123, "status": "WORKING"}]
         bot, provider = self.bot({"AAPL": position}, orders)
-        self.assertFalse(hasattr(bot.ejecutor_hibrido, "order_observation_scope"))
-        self.run_one_iteration(bot)
+        with patch.object(bot.ejecutor_hibrido, "order_observation_scope", None):
+            self.run_one_iteration(bot)
         provider.assert_called_once_with("offline-account")
         bot._gestionar_entrada_pendiente.assert_called_once_with(
             "AAPL", position, 123.45,
@@ -135,8 +135,10 @@ class OrderMonitorTests(unittest.TestCase):
         events = []
 
         @contextmanager
-        def scope(snapshot):
+        def scope(snapshot, *, account_number, generation):
             self.assertIs(snapshot, orders)
+            self.assertEqual(account_number, "offline-account")
+            self.assertEqual(generation, 0)
             events.append("enter")
             try:
                 yield
@@ -149,9 +151,36 @@ class OrderMonitorTests(unittest.TestCase):
             bot.ejecutor_hibrido, "order_observation_scope", factory, create=True,
         ):
             self.run_one_iteration(bot)
-        factory.assert_called_once_with(orders)
+        factory.assert_called_once_with(
+            orders, account_number="offline-account", generation=0,
+        )
         provider.assert_called_once_with("offline-account")
         self.assertEqual(events, ["enter", "manage", "exit"])
+        bot._gestionar_real.assert_called_once_with("AAPL", position, 123.45)
+
+    def test_mutation_during_snapshot_fetch_prevents_reusing_old_working_state(self):
+        position = {"execution_mode": "REAL", "entrada": 123.45}
+        orders = [{"orderId": 123, "status": "WORKING"}]
+        bot, provider = self.bot({"AAPL": position}, orders)
+
+        def snapshot_with_concurrent_mutation(account_number):
+            bot.ejecutor_hibrido._invalidate_order_observations()
+            return orders
+
+        def manage_position(*args):
+            self.assertEqual(
+                bot.ejecutor_hibrido._estado_orden("offline-account", "123"),
+                "FILLED",
+            )
+
+        provider.side_effect = snapshot_with_concurrent_mutation
+        bot._gestionar_real.side_effect = manage_position
+        with patch.object(
+            bot.ejecutor_hibrido, "_buscar_orden_en_listado", return_value={"status": "FILLED"},
+        ) as lookup:
+            self.run_one_iteration(bot)
+        provider.assert_called_once_with("offline-account")
+        lookup.assert_called_once_with("offline-account", "123")
         bot._gestionar_real.assert_called_once_with("AAPL", position, 123.45)
 
     def test_monitor_skips_paper_and_reserved_positions(self):

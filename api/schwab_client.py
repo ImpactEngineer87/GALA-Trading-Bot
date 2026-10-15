@@ -16,9 +16,10 @@ import sys
 import threading
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dotenv import load_dotenv
+from api.order_sync import valid_order_snapshot
 from api.schwab_rate_guard import MARKET_DATA_GUARD
 from api.schwab_oauth import (
     DEFAULT_REDIRECT_URI,
@@ -963,7 +964,7 @@ class SchwabClient:
             _log(f"[ERROR] obtener_posiciones: {e}")
             return None
 
-    def obtener_ordenes_abiertas(self, account_number: str) -> list:
+    def obtener_ordenes_abiertas(self, account_number: str) -> Optional[list]:
         """Devuelve las órdenes de trabajo (WORKING) abiertas de la cuenta.
 
         El endpoint /accounts/{hash}/orders de Schwab EXIGE una ventana temporal
@@ -975,7 +976,7 @@ class SchwabClient:
             return None
         if not self._asegurar_token():
             return None
-        ahora = datetime.utcnow()
+        ahora = datetime.now(timezone.utc)
         desde = ahora - timedelta(days=7)
         # Colchón de +1 día en el límite superior: si el reloj del VPS va atrasado,
         # evita que una orden recién puesta (con enteredTime del reloj de Schwab,
@@ -997,7 +998,13 @@ class SchwabClient:
                 return None
             r.raise_for_status()
             data = r.json()
-            return data if isinstance(data, list) else []
+            if not valid_order_snapshot(data):
+                _log(
+                    "[ERROR] obtener_ordenes_abiertas: respuesta de ordenes "
+                    "invalida; estado del broker desconocido"
+                )
+                return None
+            return data
         except Exception as e:
             cuerpo = ""
             resp = getattr(e, "response", None)

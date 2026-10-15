@@ -466,8 +466,8 @@ class SmartExit:
             if is_limit:
                 body['price'] = format(state['limit'], '.2f')
             try:
-                response = self.executor._http_session().post(
-                    f'{self.executor.TRADER_URL}/accounts/{account}/orders', json=body,
+                response = self.executor._submit_order_request(
+                    'post', f'{self.executor.TRADER_URL}/accounts/{account}/orders', json=body,
                     timeout=self.executor.request_timeout_s)
                 response.raise_for_status()
                 leg['order_id'] = response.headers.get('Location', '').rstrip('/').split('/')[-1]

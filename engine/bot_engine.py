@@ -3795,6 +3795,9 @@ class ChocoletraBot:
                 # Check current broker order visibility before monitoring.
                 # Executors with observation scopes can reuse this snapshot;
                 # other versions keep their normal fresh per-order reads.
+                observation_generation = getattr(
+                    self.ejecutor_hibrido, "_order_observation_generation", None
+                )
                 orders = self.ejecutor_hibrido._working_orders_snapshot(self.account_number)
                 if orders is None:
                     # A failing account-order list must not prevent detection
@@ -3808,7 +3811,9 @@ class ChocoletraBot:
                         self._order_monitor_stop.wait(poll_s)
                         continue
                 futures = [
-                    pool.submit(self._monitor_orden_ticker, ticker, orders)
+                    pool.submit(
+                        self._monitor_orden_ticker, ticker, orders, observation_generation
+                    )
                     for ticker in tickers
                 ]
                 for future in futures:
@@ -3818,12 +3823,15 @@ class ChocoletraBot:
                         self._emit_log("ERROR", f"Monitor de órdenes: {exc}")
                 self._order_monitor_stop.wait(poll_s)
 
-    def _monitor_orden_ticker(self, ticker: str, orders=None):
+    def _monitor_orden_ticker(self, ticker: str, orders=None, observation_generation=None):
         observation_scope = getattr(
             self.ejecutor_hibrido, "order_observation_scope", None
         )
+        scope_kwargs = {"account_number": self.account_number}
+        if observation_generation is not None:
+            scope_kwargs["generation"] = observation_generation
         scope = (
-            observation_scope(orders)
+            observation_scope(orders, **scope_kwargs)
             if orders is not None and callable(observation_scope) else nullcontext()
         )
         with self.ejecutor_hibrido.secuencia_simbolo(ticker), scope:
