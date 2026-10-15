@@ -65,6 +65,8 @@ from core.trade_history import TradeHistoryLedger
 
 from api.schwab_client import SchwabClient
 from api.hybrid_order_executor import EjecutorHibridoDeOrdenes, ContextoMercado
+from api.schwab_rate_guard import SchwabMarketBackoff
+from api.order_lifecycle_compat import cancelar_orden_compatible
 
 from gsco.sheets_client import SheetsClient
 from gsco.tos_reader import TOSReader
@@ -920,8 +922,9 @@ class ChocoletraBot:
             with lock:
                 self._daily_kill_in_progress = False
 
-    def _cancelar_todas_ordenes_pendientes(self, motivo: str) -> None:
-        """Cancela entradas/protecciones pendientes de todos los tickers gestionados."""
+    def _cancelar_todas_ordenes_pendientes(self, motivo: str) -> bool:
+        """Cancel managed orders without inferring flat state from a failed read."""
+        all_confirmed = True
         with self._lock:
             pendientes = [
                 ticker for ticker, pos in self._posiciones.items()
@@ -929,53 +932,75 @@ class ChocoletraBot:
             ]
         for ticker in pendientes:
             try:
-                self._cancelar_pendiente(ticker)
+                if self._cancelar_pendiente(ticker) is False:
+                    all_confirmed = False
             except Exception as exc:
+                all_confirmed = False
                 self._emit_log("ERROR", f"[{ticker}] No se pudo cancelar entrada pendiente: {exc}")
 
-        if not self._has_real_tickers() or not self.account_number:
+        if not self._has_real_tickers():
+            return all_confirmed
+        if not self.account_number or not self._asegurar_token_trading():
+            self._emit_log("ERROR", "Kill switch diario: cuenta/token no disponible para cancelar ordenes")
+            return False
+        try:
+            orders = self.schwab.obtener_ordenes_abiertas(self.account_number)
+        except Exception as exc:
+            self._emit_log("ERROR", f"Kill switch diario: no se pudieron leer ordenes abiertas: {exc}")
+            orders = None
+        if not isinstance(orders, list):
             self._set_broker_reconciliation(
-                ok=True, flat=True, context="STARTUP",
-                message="Sin tickers REAL o sin cuenta configurada",
+                ok=False, flat=False, context="KILL_SWITCH",
+                message="No se pudieron confirmar las ordenes abiertas del broker",
                 positions=[], open_order_symbols=[],
             )
-            return True
-        if not self._asegurar_token_trading():
-            self._emit_log("ERROR", "Kill switch diario: token de trading no disponible para cancelar órdenes")
-            return
-        try:
-            orders = self.schwab.obtener_ordenes_abiertas(self.account_number) or []
-        except Exception as exc:
-            self._emit_log("ERROR", f"Kill switch diario: no se pudieron leer órdenes abiertas: {exc}")
-            return
+            return False
 
         managed = {str(t).upper() for t in self._real_tickers(self.tickers)}
-        for order in orders:
+        visited = set()
+        for order in self._iter_broker_orders(orders):
+            oid = str(order.get("orderId", "") or "")
+            if not oid or oid in visited:
+                continue
+            subtree = list(self._iter_broker_orders([order]))
+            symbols = {
+                str((leg.get("instrument") or {}).get("symbol", "")).upper()
+                for node in subtree for leg in (node.get("orderLegCollection") or [])
+            }
+            symbols.discard("")
+            if not (symbols & managed):
+                continue
+            # Parent cancellation affects its children; preserve foreign scope.
+            if not symbols <= managed:
+                all_confirmed = False
+                continue
+            visited.add(oid)
+            cancel_ticker = sorted(symbols & managed)[0]
             try:
-                oid = str(order.get("orderId", "") or "")
-                legs = order.get("orderLegCollection") or []
-                symbols = {
-                    str((leg.get("instrument") or {}).get("symbol", "")).upper()
-                    for leg in legs
-                }
-                symbols.discard("")
-            except Exception:
+                result = cancelar_orden_compatible(
+                    self.ejecutor_hibrido, self.account_number, oid, ticker=cancel_ticker)
+            except Exception as exc:
+                all_confirmed = False
+                self._emit_log("ERROR", f"[{cancel_ticker}] No se pudo confirmar cancelacion: {exc}")
                 continue
-            if not oid or not (symbols & managed):
-                continue
-            cancel_ticker = next(iter(symbols & managed), "")
-            result = self.ejecutor_hibrido.cancelar_orden_confirmada(
-                self.account_number, oid, ticker=cancel_ticker
-            )
+            confirmed = bool(result.get("confirmado"))
+            all_confirmed = all_confirmed and confirmed
+            if (confirmed and result.get("broker_status") in ("CANCELED", "CANCELLED")
+                    and not result.get("terminal_by_absence")):
+                visited.update(str(node.get("orderId", "")) for node in subtree)
             self._audit_event(
-                "DAILY_KILL_ORDER_CANCEL",
-                ticker=next(iter(symbols & managed), ""),
-                estado=result.get("broker_status", "DESCONOCIDO"),
-                order_id=oid,
-                latency_ms=result.get("latency_ms"),
-                motivo=motivo,
-                detalle={"confirmado": result.get("confirmado", False)},
+                "DAILY_KILL_ORDER_CANCEL", ticker=cancel_ticker,
+                estado=result.get("broker_status", "DESCONOCIDO"), order_id=oid,
+                latency_ms=result.get("latency_ms"), motivo=motivo,
+                detalle={"confirmado": confirmed},
             )
+        if not all_confirmed:
+            self._set_broker_reconciliation(
+                ok=False, flat=False, context="KILL_SWITCH",
+                message="Cancelacion de ordenes gestionadas pendiente de confirmacion",
+                positions=[], open_order_symbols=[],
+            )
+        return all_confirmed
 
     # ==========================================================
     # INICIO / DETENCIÓN
@@ -2859,7 +2884,7 @@ class ChocoletraBot:
             # header was missing.
             if not sl_id:
                 if tp1_id:
-                    self.ejecutor_hibrido.cancelar_orden_confirmada(
+                    cancelar_orden_compatible(self.ejecutor_hibrido,
                         self.account_number, tp1_id, ticker=ticker
                     )
                 symbol_clean = self._asegurar_ticker_limpio(ticker)
@@ -3130,13 +3155,25 @@ class ChocoletraBot:
         # Timeout: cancelar y decidir según el estado FINAL real.
         edad = (datetime.now() - pos["ts_pendiente"]).total_seconds()
         if edad > self.entrada_timeout_seg:
+            with self._lock:
+                if time.monotonic() < pos.get("next_cancel_retry_monotonic", 0.0):
+                    return
+                # An unresolved cancellation must not be reissued on every
+                # monitor sweep, especially when Schwab rejects an old id.
+                pos["next_cancel_retry_monotonic"] = time.monotonic() + 30.0
+            if not oid:
+                self._emit_log(
+                    "ERROR", f"[{ticker}] Entrada sin order_id sigue incierta; "
+                    "se mantiene reservada hasta reconciliar el broker.",
+                )
+                return
             # Cancelar PRIMERO congela la orden (tras esto ya no puede seguir
             # llenándose); solo DESPUÉS verificamos qué pasó. Una cancelación
             # "exitosa" NO prueba que la entrada no se llenó (el remanente de un
             # parcial se cancela con éxito dejando acciones reales).
             cancelacion = None
             if oid:
-                cancelacion = self.ejecutor_hibrido.cancelar_orden_confirmada(
+                cancelacion = cancelar_orden_compatible(self.ejecutor_hibrido,
                     self.account_number, oid, ticker=ticker)
             # (1) ¿Posición real? (fuente autoritativa) → adoptar con protección.
             if self._reconciliar_una_posicion(ticker, pos):
@@ -3153,24 +3190,12 @@ class ChocoletraBot:
                 # Sin llenado (por posiciones). Decidir según el estado de la orden.
                 if est2 not in ("CANCELED", "REJECTED", "EXPIRED", "REPLACED", "NOT_WORKING"):
                     if est2 == "DESCONOCIDO":
-                        # No se puede confirmar el estado (API caída o la orden
-                        # cayó fuera de la ventana de consulta). Mantener pendiente
-                        # y reintentar, con un TOPE para no bloquear el ticker de
-                        # forma indefinida: pasado el tope, posiciones ya tuvo
-                        # minutos para reflejar cualquier llenado y no mostró nada.
-                        tope = self.entrada_timeout_seg + max(120, self.entrada_timeout_seg)
-                        if edad < tope:
-                            self._emit_log("WARN", f"[{ticker}] Entrada incierta (estado {est2}); "
-                                                   f"se reintenta el próximo ciclo")
-                            return
-                        # Última verificación autoritativa por posiciones antes de
-                        # soltar: si el llenado apareció por fin, adoptarlo con
-                        # protección en vez de dejarlo huérfano.
-                        if self._reconciliar_una_posicion(ticker, pos):
-                            return
-                        self._emit_log("ERROR", f"[{ticker}] Entrada NO confirmable en {int(edad)}s "
-                                                f"y sin posición real — se libera el hueco. "
-                                                f"Revisa órdenes abiertas en el broker.")
+                        # Time passing is not evidence that an order was canceled.
+                        # Releasing this slot previously allowed another entry
+                        # while the original could still execute at the broker.
+                        self._emit_log("WARN", f"[{ticker}] Entrada incierta (estado {est2}); "
+                                               "se mantiene pendiente para reconciliación")
+                        return
                     else:
                         # Confirmada VIVA (WORKING/PENDING_*): reintentar cancelar
                         # el próximo ciclo. NO se libera (sería huérfana); la
@@ -3203,7 +3228,7 @@ class ChocoletraBot:
         if parcial and filled < orden.cantidad and oid:
             # Cancelar el remanente PRIMERO congela la orden; luego re-leer la
             # cantidad REAL final para no dejar acciones sin proteger.
-            cancelacion = self.ejecutor_hibrido.cancelar_orden_confirmada(
+            cancelacion = cancelar_orden_compatible(self.ejecutor_hibrido,
                 self.account_number, oid, ticker=ticker)
             if not cancelacion.get("confirmado"):
                 self._emit_log(
@@ -3432,7 +3457,7 @@ class ChocoletraBot:
                 return True  # CONFIRMADO: sin órdenes vivas del símbolo → abrir
             # Aún hay órdenes del símbolo: cancelarlas explícitamente y re-confirmar.
             for oid in propias:
-                self.ejecutor_hibrido.cancelar_orden_confirmada(
+                cancelar_orden_compatible(self.ejecutor_hibrido,
                     self.account_number, oid, ticker=ticker)
             self._emit_log("INFO", f"[{ticker}] Cancelando {len(propias)} orden(es) previa(s) del "
                                    f"símbolo antes de abrir; esperando confirmación de cancelación…")
@@ -3535,7 +3560,7 @@ class ChocoletraBot:
                 continue
             self._emit_log("WARN", f"[{sym}] Orden HUÉRFANA confirmada (id {oid}) sin posición "
                                    f"asociada — cancelando (limpieza de la red de seguridad)")
-            cancel_ok = self.ejecutor_hibrido.cancelar_orden_confirmada(
+            cancel_ok = cancelar_orden_compatible(self.ejecutor_hibrido,
                 self.account_number, oid, ticker=sym)
             self._audit_event(
                 "ORPHAN_ORDER_CLEANUP", ticker=sym,
@@ -3666,7 +3691,7 @@ class ChocoletraBot:
             # Cancelar PRIMERO congela la orden (si hay id que cancelar).
             cancelacion = None
             if oid:
-                cancelacion = self.ejecutor_hibrido.cancelar_orden_confirmada(
+                cancelacion = cancelar_orden_compatible(self.ejecutor_hibrido,
                     self.account_number, oid, ticker=ticker)
             # Comprobar SIEMPRE (incluso SIN oid: entrada RECONCILIAR ya enviada al
             # broker) si la entrada dejó acciones reales, por POSICIONES (fuente
@@ -3740,7 +3765,7 @@ class ChocoletraBot:
         self._emit_log(
             "INFO",
             f"Monitor de órdenes activo cada "
-            f"{self.ejecutor_hibrido.poll_interval_ms}ms",
+            f"{self.ejecutor_hibrido.monitor_interval_ms}ms",
         )
 
     def _detener_monitor_ordenes(self):
@@ -3753,18 +3778,37 @@ class ChocoletraBot:
     def _order_monitor_loop(self):
         max_workers = max(
             1,
-            int(self.config.get("risk", {}).get("max_simultaneous_positions", 17)),
+            min(4, int(self.config.get("risk", {}).get("max_simultaneous_positions", 17))),
         )
-        poll_s = max(0.025, self.ejecutor_hibrido.poll_interval_ms / 1000.0)
+        poll_s = max(1.0, self.ejecutor_hibrido.monitor_interval_ms / 1000.0)
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             while self._activo and not self._order_monitor_stop.is_set():
                 with self._lock:
                     tickers = [
                         ticker for ticker, pos in self._posiciones.items()
                         if pos and not pos.get("reservado")
+                        and not self._is_paper_ticker(ticker, pos=pos)
                     ]
+                if not tickers:
+                    self._order_monitor_stop.wait(poll_s)
+                    continue
+                # One account-level snapshot replaces GETs for each unchanged
+                # STOP/TP/entry on every ticker. Only positive WORKING evidence
+                # is reused; absent orders still need their own detail read.
+                orders = self.ejecutor_hibrido._working_orders_snapshot(self.account_number)
+                if orders is None:
+                    # A failing account-order list must not prevent detection
+                    # of a newly filled entry that still needs its first STOP.
+                    # Restrict the fallback to pending entries; the shared guard
+                    # blocks access-denied/throttled endpoints without retries.
+                    with self._lock:
+                        tickers = [ticker for ticker in tickers
+                                   if self._posiciones.get(ticker, {}).get("pendiente")]
+                    if not tickers:
+                        self._order_monitor_stop.wait(poll_s)
+                        continue
                 futures = [
-                    pool.submit(self._monitor_orden_ticker, ticker)
+                    pool.submit(self._monitor_orden_ticker, ticker, orders)
                     for ticker in tickers
                 ]
                 for future in futures:
@@ -3774,8 +3818,12 @@ class ChocoletraBot:
                         self._emit_log("ERROR", f"Monitor de órdenes: {exc}")
                 self._order_monitor_stop.wait(poll_s)
 
-    def _monitor_orden_ticker(self, ticker: str):
-        with self.ejecutor_hibrido.secuencia_simbolo(ticker):
+    def _monitor_orden_ticker(self, ticker: str, orders=None):
+        scope = (
+            self.ejecutor_hibrido.order_observation_scope(orders)
+            if orders is not None else nullcontext()
+        )
+        with self.ejecutor_hibrido.secuencia_simbolo(ticker), scope:
             with self._lock:
                 pos = self._posiciones.get(ticker)
             if pos is None or pos.get("reservado") or not self._activo:
@@ -4170,7 +4218,7 @@ class ChocoletraBot:
             for oid_key in ("tp1_order_id", "sl_order_id"):
                 oid = pos.get(oid_key)
                 if oid:
-                    cancel_result = self.ejecutor_hibrido.cancelar_orden_confirmada(
+                    cancel_result = cancelar_orden_compatible(self.ejecutor_hibrido,
                         self.account_number, oid, ticker=ticker)
                     if oid_key == "sl_order_id":
                         sl_cancel_result = dict(cancel_result or {})
@@ -4994,8 +5042,8 @@ class ChocoletraBot:
     def _broker_retry_settings(self):
         cfg = getattr(self, "config", {}) or {}
         live = (cfg.get("live_trading", {}) or {})
-        attempts = max(1, int(live.get("reconciliation_retry_attempts", 3) or 3))
-        delay = max(0.0, float(live.get("reconciliation_retry_delay_sec", 0.75) or 0.75))
+        attempts = max(1, min(3, int(live.get("reconciliation_retry_attempts", 1) or 1)))
+        delay = max(2.0, float(live.get("reconciliation_retry_delay_sec", 2.0) or 2.0))
         return attempts, delay
 
     def _broker_read_with_retry(self, label: str, callback):
@@ -5006,7 +5054,9 @@ class ChocoletraBot:
             try:
                 value = callback()
                 if value is None:
-                    raise RuntimeError("respuesta vacía")
+                    # The shared client already handled HTTP/auth failures.
+                    # None is unknown state, never a reason to amplify traffic.
+                    return False, None, "estado del broker desconocido"
                 if attempt > 1:
                     self._emit_log(
                         "INFO",
@@ -5015,12 +5065,16 @@ class ChocoletraBot:
                 return True, value, ""
             except Exception as exc:
                 last_error = str(exc)
+                response = getattr(exc, "response", None)
+                code = getattr(response, "status_code", None)
+                if isinstance(exc, SchwabMarketBackoff) or code in (401, 403, 429):
+                    break
                 if attempt < attempts:
                     self._emit_log(
                         "WARN",
                         f"[Schwab] {label} falló intento {attempt}/{attempts}: {exc}; reintentando",
                     )
-                    time.sleep(delay)
+                    time.sleep(delay * (2 ** (attempt - 1)))
         return False, None, last_error or "sin respuesta"
 
     def _refresh_broker_reconciliation(

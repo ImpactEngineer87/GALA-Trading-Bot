@@ -25,6 +25,7 @@ data/agentes_feedback.csv
 data/shadow_decisions.csv
 data/reportes/
 data/reportes_shadow/
+data/
 # Local Python environment
 .venv/
 venv/

@@ -87,6 +87,11 @@ class PlanificadorHorario:
         self._cb_estado: Optional[Callable[[], bool]] = None
         self._suspendido_fecha = None
         self._wake = threading.Event()
+        self._start_retry_after = 0.0
+        self._start_failures = 0
+        self._start_retry_date = None
+        self._start_retry_sec = max(
+            60.0, float(sched_cfg.get("start_retry_sec", 300)))
 
     def _parsear_horas(self, cfg: dict):
         """Convierte strings HH:MM a objetos time."""
@@ -138,6 +143,9 @@ class PlanificadorHorario:
             )
             return
 
+        if self._hilo is not None and self._hilo.is_alive():
+            return
+
         self._corriendo = True
         self._cb_encender = callback_encender
         self._cb_apagar = callback_apagar
@@ -182,6 +190,8 @@ class PlanificadorHorario:
 
     def reanudar(self):
         self._suspendido_fecha = None
+        self._start_retry_after = 0.0
+        self._start_failures = 0
         self._wake.set()
 
     def estado(self) -> dict:
@@ -206,6 +216,12 @@ class PlanificadorHorario:
             return "manual"
 
         ahora = self._ahora()
+        if self._start_retry_date != ahora.date():
+            # A failed start belongs to its session. Do not carry a monotonic
+            # cooldown into the next trading day (or a corrected clock date).
+            self._start_retry_date = ahora.date()
+            self._start_retry_after = 0.0
+            self._start_failures = 0
         if (
             self._suspendido_fecha is not None
             and self._suspendido_fecha != ahora.date()
@@ -219,11 +235,29 @@ class PlanificadorHorario:
             return "suspendido"
 
         if es_activo and not encendido:
+            if time.monotonic() < self._start_retry_after:
+                return "esperando_reintento"
             log_info(
                 f"[Scheduler] {ahora.strftime('%H:%M:%S')} ET — ENCENDIENDO BOT"
             )
-            resultado = self._cb_encender()
+            # Starting can perform OAuth, account resolution and broker
+            # reconciliation. A blocked/failed start must not repeat every 5s.
+            self._start_retry_after = time.monotonic() + self._start_retry_sec
+            try:
+                resultado = self._cb_encender()
+            except Exception:
+                self._start_failures += 1
+                self._start_retry_after = time.monotonic() + min(
+                    3600.0, self._start_retry_sec * (2 ** min(self._start_failures - 1, 6)))
+                raise
             self._bot_encendido = resultado is not False
+            if self._bot_encendido:
+                self._start_failures = 0
+                self._start_retry_after = 0.0
+            else:
+                self._start_failures += 1
+                self._start_retry_after = time.monotonic() + min(
+                    3600.0, self._start_retry_sec * (2 ** min(self._start_failures - 1, 6)))
             return "encendido" if self._bot_encendido else "bloqueado"
 
         if not es_activo and encendido:
