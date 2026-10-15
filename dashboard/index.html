@@ -1163,7 +1163,7 @@
           <div class="step-num">1</div>
           <div>
             <div class="step-txt">Haz clic en el botón para abrir la página de autorización de Schwab en tu navegador.</div>
-            <button class="btn btn-blue btn-sm" style="margin-top:8px" onclick="openSchwabAuth()">Abrir Schwab OAuth →</button>
+            <button id="schwabAuthOpenBtn" class="btn btn-blue btn-sm" style="margin-top:8px" onclick="openSchwabAuth()">Abrir Schwab OAuth →</button>
           </div>
         </div>
         <div class="schwab-step">
@@ -2825,16 +2825,33 @@ async function checkSchwabStatus(){
       : (d.account_number ? 'Cuenta: '+d.account_number : (d.message || 'Autoriza en el paso 1-3 de abajo'));
     updateSchwabAuthBanner(d);
     maybeNotifySchwabAuthExpired(d);
-    if(d.oauth_diagnostic) renderSchwabOAuthDiagnostic(d.oauth_diagnostic);
+    renderSchwabOAuthDiagnostic(d.oauth_diagnostic || d.api_diagnostic || null);
   } catch(e){}
 }
 
 async function openSchwabAuth(){
+  const btn = el('schwabAuthOpenBtn');
+  if(btn && btn.disabled) return;
+  if(btn) btn.disabled = true;
+  // Open during the click so the browser does not block the login popup while
+  // the dashboard is fetching a new OAuth session.
+  const authWindow = window.open('about:blank','_blank');
   try {
     const r = await api('/api/schwab/auth-url');
     const d = await r.json();
-    window.open(d.auth_url,'_blank');
-  } catch(e){ toast('err','Error','No se pudo obtener URL de Schwab'); }
+    if(!r.ok || d.status !== 'ok' || !d.auth_url) throw new Error(d.message || 'No se pudo obtener URL de Schwab');
+    if(!authWindow || authWindow.closed) throw new Error('Permite ventanas emergentes y abre Schwab OAuth nuevamente.');
+    el('schwabCodeInput').value = '';
+    renderSchwabOAuthDiagnostic(null);
+    authWindow.opener = null;
+    authWindow.location.replace(d.auth_url);
+    toast('info','Nueva autorización Schwab','Completa el acceso y pega la URL de retorno inmediatamente en este dashboard.');
+  } catch(e){
+    if(authWindow && !authWindow.closed) authWindow.close();
+    toast('err','Error Schwab',e.message || 'No se pudo obtener URL de Schwab');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
 }
 
 function renderSchwabOAuthDiagnostic(diag){
@@ -2842,11 +2859,22 @@ function renderSchwabOAuthDiagnostic(diag){
   if(!box) return;
   if(!diag){ box.style.display='none'; box.textContent=''; return; }
   const rows = [];
+  const actions = {
+    OPEN_NEW_AUTHORIZATION: 'Abre Schwab OAuth nuevamente y pega la nueva URL de retorno aquí',
+    CHECK_CLIENT_CREDENTIALS: 'Revisa Client ID y Client Secret de la aplicación',
+    NEW_AUTHORIZATION_CODE: 'Completa un nuevo acceso OAuth y usa la nueva URL',
+    CHECK_APP_AUTHORIZATION: 'Revisa los permisos y el estado de la aplicación en Schwab',
+    VERIFY_APP_CREDENTIALS_AND_STATUS: 'Revisa credenciales y estado de la aplicación en Schwab',
+    CHECK_VPS_CONNECTIVITY_AND_APP_STATUS: 'Revisa el acceso a Schwab desde el VPS y el estado de la aplicación',
+    RETRY_LATER: 'Espera antes de volver a intentar',
+  };
+  if(diag.phase) rows.push('Paso: '+diag.phase);
   if(diag.http_status) rows.push('HTTP: '+diag.http_status);
   if(diag.oauth_error) rows.push('OAuth: '+diag.oauth_error);
   if(diag.client_id_tail) rows.push('Client ID: ****'+diag.client_id_tail);
   if(diag.redirect_uri) rows.push('Callback: '+diag.redirect_uri);
-  if(diag.recommended_action) rows.push('Acción: '+diag.recommended_action);
+  if(diag.content_type) rows.push('Respuesta: '+diag.content_type);
+  if(diag.recommended_action) rows.push('Acción: '+(actions[diag.recommended_action] || diag.recommended_action));
   if(diag.description) rows.push('Detalle: '+diag.description);
   if(diag.request_id) rows.push('Request ID: '+diag.request_id);
   box.textContent = rows.join(' · ');
@@ -2868,6 +2896,7 @@ async function connectSchwab(){
     const d = await r.json();
     if(d.status==='ok'){
       toast('ok','Schwab Conectado ✅','Cuenta: '+(d.account || 'verificada'));
+      if(d.warning) toast('warn','Guardar autorización',d.warning);
       el('schwabCodeInput').value = '';
       renderSchwabOAuthDiagnostic(null);
       checkSchwabStatus();
@@ -2886,6 +2915,7 @@ async function testSchwab(){
   try {
     const r = await api('/api/schwab/test');
     const d = await r.json();
+    renderSchwabOAuthDiagnostic(d.diagnostic || null);
     if(d.status==='ok') toast('ok','Test OK ✅','BA: $'+d.price);
     else toast('err','Test Schwab',d.message);
   } catch(e){ toast('err','Error',String(e)); }

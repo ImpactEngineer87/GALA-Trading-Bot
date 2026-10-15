@@ -16,7 +16,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -136,17 +136,25 @@ def parse_authorization_input(raw_value: str, *, expected_redirect_uri: str = DE
     return {"code": code, "state": state}
 
 
-def _response_payload(response) -> Dict[str, Any]:
+def _looks_like_html(value: str) -> bool:
+    return bool(re.search(r"<\s*(?:!doctype\b|/?[a-z][\w:-]*(?:\s|/?>))", value, re.I))
+
+
+def _response_payload(response, content_type: str) -> Tuple[Dict[str, Any], str]:
     try:
         payload = response.json()
         if isinstance(payload, dict):
-            return payload
+            return payload, "json"
     except Exception:
         pass
     text = str(getattr(response, "text", "") or "").strip()
+    if content_type in {"text/html", "application/xhtml+xml"} or _looks_like_html(text):
+        # An intermediary's HTML error page may contain scripts, credentials,
+        # or reflected request parameters. Never forward that page to logs/UI.
+        return {}, "html"
     if text:
-        return {"raw_message": text[:800]}
-    return {}
+        return {"raw_message": text[:800]}, "text"
+    return {}, "empty"
 
 
 def _clean_text(value: Any, secrets_to_redact) -> str:
@@ -157,8 +165,16 @@ def _clean_text(value: Any, secrets_to_redact) -> str:
         secret = str(secret or "")
         if secret:
             text = text.replace(secret, "[REDACTED]")
+    if _looks_like_html(text):
+        return "[HTML response omitted]"
     # OAuth/JWT-looking blobs and query-code fragments should never reach logs/UI.
-    text = re.sub(r"(?i)(code|access_token|refresh_token|client_secret)\s*[=:]\s*[^\s,&]+", r"\1=[REDACTED]", text)
+    text = re.sub(r"(?i)\b(Basic|Bearer)\s+[A-Za-z0-9_~+./=-]+", r"\1 [REDACTED]", text)
+    text = re.sub(
+        r'''(?ix)(["']?\b(?:authorization|authorization_code|auth_code|code|code_verifier|token|access_token|refresh_token|id_token|client_secret)["']?\s*[=:]\s*)'''
+        r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;&}\]]+)''',
+        r"\1[REDACTED]",
+        text,
+    )
     text = re.sub(r"\b[A-Za-z0-9_-]{80,}\b", "[REDACTED_LONG_VALUE]", text)
     return text[:500]
 
@@ -171,13 +187,24 @@ def build_safe_diagnostic(
     redirect_uri: str,
     secrets_to_redact=(),
 ) -> Dict[str, Any]:
-    payload = _response_payload(response)
+    # Copy only the diagnostic headers below; never serialize response/request
+    # headers wholesale (Authorization and cookies may contain credentials).
+    headers = {str(key).lower(): value for key, value in (getattr(response, "headers", {}) or {}).items()}
+    content_type = _clean_text(headers.get("content-type"), secrets_to_redact).split(";", 1)[0].strip().lower()
+    if not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", content_type):
+        content_type = ""
+    payload, response_kind = _response_payload(response, content_type)
     oauth_error = _clean_text(payload.get("error", ""), secrets_to_redact).lower()
     description = _clean_text(
         payload.get("error_description") or payload.get("message") or payload.get("raw_message") or "",
         secrets_to_redact,
     )
     status = int(getattr(response, "status_code", 0) or 0)
+    if response_kind == "html":
+        description = (
+            "Schwab endpoint returned HTML instead of API JSON. Inspect VPS "
+            "connectivity/intermediary filtering and Schwab app access/status."
+        )
 
     if oauth_error == "invalid_client":
         action = "CHECK_CLIENT_CREDENTIALS"
@@ -189,13 +216,14 @@ def build_safe_diagnostic(
         action = "RETRY_LATER"
     elif status >= 500:
         action = "RETRY_LATER"
+    elif status == 403 and response_kind in {"html", "text"}:
+        action = "CHECK_VPS_CONNECTIVITY_AND_APP_STATUS"
     elif status in {401, 403}:
         action = "VERIFY_APP_CREDENTIALS_AND_STATUS"
     else:
         action = "REVIEW_OAUTH_RESPONSE"
 
     request_id = ""
-    headers = getattr(response, "headers", {}) or {}
     for key in ("x-request-id", "request-id", "x-correlation-id", "trace-id"):
         if headers.get(key):
             request_id = _clean_text(headers.get(key), secrets_to_redact)
@@ -204,11 +232,13 @@ def build_safe_diagnostic(
     return {
         "phase": phase,
         "http_status": status,
+        "content_type": content_type or None,
+        "response_kind": response_kind,
         "oauth_error": oauth_error or None,
         "description": description or None,
         "recommended_action": action,
         "client_id_tail": client_id_tail(client_id),
-        "redirect_uri": redirect_uri,
+        "redirect_uri": _clean_text(redirect_uri, secrets_to_redact),
         "request_id": request_id or None,
     }
 

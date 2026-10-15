@@ -28,7 +28,8 @@ from api.schwab_oauth import (
     refresh_oauth_token,
 )
 
-load_dotenv(override=True)
+ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
+load_dotenv(ENV_PATH, override=False)
 
 # Forzar UTF-8 en salida de consola (Windows fix)
 if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
@@ -40,6 +41,22 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
 BASE_URL   = "https://api.schwabapi.com/marketdata/v1"
 TRADER_URL = "https://api.schwabapi.com/trader/v1"
 TOKEN_URL  = "https://api.schwabapi.com/v1/oauth/token"
+
+
+def _parse_token_expiry(raw_value) -> Optional[datetime]:
+    """Normalize persisted timestamps to the local naive clock used by clients."""
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        expiry = datetime.fromisoformat(raw)
+        if expiry.tzinfo is not None:
+            expiry = expiry.astimezone().replace(tzinfo=None)
+        return expiry
+    except (TypeError, ValueError):
+        return None
 
 
 def _log(msg: str):
@@ -81,8 +98,8 @@ class SchwabClient:
         self.include_extended_hours_data = bool(
             self.config.get("market", {}).get(
                 "include_extended_hours_data", False))
-        self.client_id     = os.getenv("SCHWAB_CLIENT_ID", "")
-        self.client_secret = os.getenv("SCHWAB_CLIENT_SECRET", "")
+        self.client_id     = os.getenv("SCHWAB_CLIENT_ID", "").strip()
+        self.client_secret = os.getenv("SCHWAB_CLIENT_SECRET", "").strip()
         self.access_token:  Optional[str]      = None
         self.refresh_token: Optional[str]      = None
         self.token_expiry:  Optional[datetime] = None
@@ -91,6 +108,7 @@ class SchwabClient:
         self._auth_retry_after: Optional[datetime] = None
         self._auth_lock = threading.RLock()
         self._auth_warning_emitted = False
+        self._rejected_access_token: Optional[str] = None
         # Todos los tokens aceptados por este cliente proceden del OAuth de usuario.
         # Arranca en False (fail-safe) hasta cargar o recibir uno.
         self.token_es_usuario = False
@@ -106,24 +124,15 @@ class SchwabClient:
             )
         else:
             # Intentar cargar token guardado del .env
-            saved = os.getenv("SCHWAB_ACCESS_TOKEN", "")
+            saved = os.getenv("SCHWAB_ACCESS_TOKEN", "").strip()
+            self.refresh_token = os.getenv("SCHWAB_REFRESH_TOKEN", "").strip() or None
             if saved:
                 self.access_token  = saved
-                self.refresh_token = os.getenv("SCHWAB_REFRESH_TOKEN", "")
-                raw_expiry = os.getenv("SCHWAB_TOKEN_EXPIRES_AT", "")
-                try:
-                    self.token_expiry = datetime.fromisoformat(raw_expiry) if raw_expiry else None
-                except (TypeError, ValueError):
-                    self.token_expiry = None
-                # Sin vencimiento persistido, refrescar inmediatamente si es posible.
-                # Si solo existe access_token, se permite una primera llamada y un
-                # eventual 401 lo marcará como desconectado sin crear un bucle.
-                if self.token_expiry is None:
-                    self.token_expiry = (
-                        datetime.now()
-                        if self.refresh_token
-                        else datetime.now() + timedelta(minutes=20)
-                    )
+                self.token_expiry = _parse_token_expiry(
+                    os.getenv("SCHWAB_TOKEN_EXPIRES_AT", "")
+                )
+                # Unknown expiry never grants extra validity to a saved bearer.
+                # The first request must refresh, or require authorization.
                 self.token_es_usuario = True
                 self._paper = False
                 self._session.headers.update({
@@ -131,6 +140,10 @@ class SchwabClient:
                     "Accept": "application/json",
                 })
                 _log("[OK] Token Schwab cargado desde .env")
+            elif self.refresh_token:
+                # An access token may be absent while refresh credentials remain
+                # usable. Let the first authenticated operation recover it.
+                self._paper = False
             else:
                 self._marcar_reautorizacion(
                     "No hay token OAuth de usuario. Conecte Schwab mediante authorization_code.",
@@ -158,7 +171,8 @@ class SchwabClient:
         return False
 
     def autenticar_con_token(self, access_token: str, refresh_token: str = "",
-                             expires_in: int = 1800):
+                             expires_in: int = 1800, *,
+                             expires_at: Optional[datetime] = None):
         """
         Configura el cliente con tokens OAuth2 del usuario
         (flujo authorization_code -- para trading real).
@@ -171,14 +185,17 @@ class SchwabClient:
             return False
         self.access_token  = access_token
         self.refresh_token = refresh_token
-        self.token_expiry  = datetime.now() + timedelta(
-            seconds=max(30, int(expires_in) - 60)
+        self.token_expiry = (
+            _parse_token_expiry(expires_at)
+            if expires_at is not None
+            else datetime.now() + timedelta(seconds=max(30, int(expires_in) - 60))
         )
         self.token_es_usuario = True   # token de USUARIO → válido para trading
         self.reauthorization_required = False
         self.auth_error = ""
         self._auth_retry_after = None
         self._auth_warning_emitted = False
+        self._rejected_access_token = None
         self._paper = False
         self._session.headers.update({
             "Authorization": f"Bearer {self.access_token}",
@@ -236,25 +253,25 @@ class SchwabClient:
         self.client_secret = os.getenv("SCHWAB_CLIENT_SECRET", self.client_secret or "").strip()
         latest_access = os.getenv("SCHWAB_ACCESS_TOKEN", "").strip()
         latest_refresh = os.getenv("SCHWAB_REFRESH_TOKEN", "").strip()
-        raw_expiry = os.getenv("SCHWAB_TOKEN_EXPIRES_AT", "").strip()
-        latest_expiry = None
-        if raw_expiry:
-            try:
-                latest_expiry = datetime.fromisoformat(raw_expiry)
-                if latest_expiry.tzinfo is not None:
-                    latest_expiry = latest_expiry.astimezone().replace(tzinfo=None)
-            except (TypeError, ValueError):
-                latest_expiry = None
+        latest_expiry = _parse_token_expiry(
+            os.getenv("SCHWAB_TOKEN_EXPIRES_AT", "")
+        )
 
         if latest_refresh:
             self.refresh_token = latest_refresh
-        if latest_access and latest_expiry and datetime.now() < latest_expiry:
+        if (
+            latest_access
+            and latest_access != self._rejected_access_token
+            and latest_expiry
+            and datetime.now() < latest_expiry
+        ):
             self.access_token = latest_access
             self.token_expiry = latest_expiry
             self.token_es_usuario = True
             self.reauthorization_required = False
             self.auth_error = ""
             self._auth_retry_after = None
+            self._paper = False
             self._session.headers.update({
                 "Authorization": f"Bearer {self.access_token}",
                 "Accept": "application/json",
@@ -298,9 +315,10 @@ class SchwabClient:
                 self.auth_error = ""
                 self._auth_retry_after = None
                 self._auth_warning_emitted = False
+                self._rejected_access_token = None
+                self._paper = False
 
-                env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
-                self._save_env_token(env_path)
+                self._save_env_token(ENV_PATH)
                 _log("[OK] Schwab token renovado")
                 return True
             except SchwabOAuthCooldown as exc:
@@ -336,19 +354,25 @@ class SchwabClient:
                 )
                 return False
 
-    def _recuperar_401(self) -> bool:
+    def _recuperar_401(self, rejected_access_token: Optional[str] = None) -> bool:
         """Invalida el access token y realiza como maximo un refresh controlado."""
         with self._auth_lock:
+            rejected = rejected_access_token or self.access_token
+            self._rejected_access_token = rejected
+            # Another thread may already have replaced the rejected bearer.
+            if (
+                self.access_token
+                and self.access_token != rejected
+                and self.token_expiry
+                and datetime.now() < self.token_expiry
+            ):
+                return True
             self.access_token = None
             self.token_expiry = None
             self._session.headers.pop("Authorization", None)
-            if self.refresh_token:
-                return self._refrescar_token()
-            self._marcar_reautorizacion(
-                "Schwab devolvio 401 y no existe refresh_token; reconecte OAuth.",
-                cooldown_seconds=0,
-            )
-            return False
+            # Adoption may find a newer process token even if this instance
+            # has no refresh token. The rejected bearer is never adopted again.
+            return self._refrescar_token()
 
     def estado_autenticacion(self) -> dict:
         """Estado no sensible para diagnostico y dashboard."""
@@ -436,21 +460,22 @@ class SchwabClient:
             market_data = url.startswith(BASE_URL + "/")
             if market_data:
                 MARKET_DATA_GUARD.acquire()
+            headers = self._headers()
             response = self._session.get(
-                url, params=params, headers=self._headers(), timeout=timeout
+                url, params=params, headers=headers, timeout=timeout
             )
             if market_data:
                 MARKET_DATA_GUARD.observe(response, url)
-            return response
+            return response, headers["Authorization"][len("Bearer "):]
 
-        r = get_once()
+        r, used_access_token = get_once()
         if r.status_code != 401:
             # 403 can mean insufficient API permissions/app status, not OAuth
             # expiry. Let the caller report the error without rotating tokens.
             return r
-        if not self._recuperar_401():
+        if not self._recuperar_401(used_access_token):
             return None
-        return get_once()
+        return get_once()[0]
 
     # ----------------------------------------------------------
     # DATOS DE MERCADO -- VELAS OHLCV
