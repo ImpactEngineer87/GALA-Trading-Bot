@@ -3792,9 +3792,9 @@ class ChocoletraBot:
                 if not tickers:
                     self._order_monitor_stop.wait(poll_s)
                     continue
-                # One account-level snapshot replaces GETs for each unchanged
-                # STOP/TP/entry on every ticker. Only positive WORKING evidence
-                # is reused; absent orders still need their own detail read.
+                # Check current broker order visibility before monitoring.
+                # Executors with observation scopes can reuse this snapshot;
+                # other versions keep their normal fresh per-order reads.
                 orders = self.ejecutor_hibrido._working_orders_snapshot(self.account_number)
                 if orders is None:
                     # A failing account-order list must not prevent detection
@@ -3819,9 +3819,12 @@ class ChocoletraBot:
                 self._order_monitor_stop.wait(poll_s)
 
     def _monitor_orden_ticker(self, ticker: str, orders=None):
+        observation_scope = getattr(
+            self.ejecutor_hibrido, "order_observation_scope", None
+        )
         scope = (
-            self.ejecutor_hibrido.order_observation_scope(orders)
-            if orders is not None else nullcontext()
+            observation_scope(orders)
+            if orders is not None and callable(observation_scope) else nullcontext()
         )
         with self.ejecutor_hibrido.secuencia_simbolo(ticker), scope:
             with self._lock:

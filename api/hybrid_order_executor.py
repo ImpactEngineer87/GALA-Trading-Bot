@@ -355,6 +355,11 @@ class EjecutorHibridoDeOrdenes:
         # --- Sincronización estricta con el estado real del broker ---
         sync_cfg = cfg.get("order_sync", {})
         self.poll_interval_ms = int(sync_cfg.get("poll_interval_ms", 100))
+        # Background position monitoring has its own cadence. Keep it separate
+        # from the faster acknowledgement/fill polling, with the engine's 1s floor.
+        self.monitor_interval_ms = max(
+            1000, int(sync_cfg.get("monitor_interval_ms", 1000))
+        )
         self.ack_timeout_s = float(sync_cfg.get("ack_timeout_ms", 750)) / 1000.0
         self.cancel_timeout_s = float(sync_cfg.get("cancel_timeout_ms", 2500)) / 1000.0
         self.fill_timeout_s = float(sync_cfg.get("fill_timeout_ms", 5000)) / 1000.0
