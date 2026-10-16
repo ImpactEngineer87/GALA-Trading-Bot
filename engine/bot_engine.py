@@ -1465,10 +1465,13 @@ class ChocoletraBot:
         # siguen disponibles para los agentes como contexto/veto.
         df_1m = datos_confirmados.tf("1m")
         df_micro = df_1m
+        micro_duration_minutes = 1
         if df_micro is None:
             df_micro = datos_confirmados.tf("5m")
+            micro_duration_minutes = 5
         if df_micro is None:
             df_micro = datos_confirmados.tf("15m")
+            micro_duration_minutes = 15
         if df_micro is None or len(df_micro) < 30:
             self._emit_log("WARN", f"[{ticker}] Datos micro insuficientes")
             self._quarantine_real_ticker(ticker, 'Insufficient market data')
@@ -1521,18 +1524,12 @@ class ChocoletraBot:
                 f"[AI-VETO-AUDIT] {ticker}: no se pudo actualizar: {exc}",
             )
 
-        # v3.3.7: advance the broader signal-learning ledger with the same
-        # confirmed bar. Only unambiguous TP/SL counterfactuals may later be
-        # used as low-weight FIT examples; they never count toward x/50.
+        # Replay every newly confirmed candle, including those missed during a
+        # slow cycle or a service restart. The first SL/TP must decide the label,
+        # even when a later candle touches the opposite boundary.
         try:
-            last_bar = df_micro.iloc[-1]
-            bar_ts = df_micro.index[-1] if len(df_micro.index) else None
-            resolved_learning = self.signal_learning.update_bar(
-                ticker,
-                high=float(last_bar["high"]),
-                low=float(last_bar["low"]),
-                close=float(last_bar["close"]),
-                bar_timestamp=bar_ts,
+            resolved_learning = self._avanzar_aprendizaje_senales(
+                ticker, df_micro, bar_duration_minutes=micro_duration_minutes,
             )
             for learning_row in resolved_learning:
                 self._emit_log(
@@ -1617,24 +1614,20 @@ class ChocoletraBot:
         )
         if requerir_modelo and self.orquestador.entrenador.modelo_disponible(ticker):
             self._recover_ticker_quarantine(ticker, 'model')
-        if (
+        model_unavailable = bool(
             requerir_modelo
             and not self.orquestador.entrenador.modelo_disponible(ticker)
-        ):
+        )
+        if model_unavailable:
             self._quarantine_real_ticker(ticker, 'Production model unavailable')
             self._emit_log(
                 "ERROR",
                 f"[{ticker}] Señal {senal_gala10} bloqueada: modo real exige "
                 "modelo IA aprobado y cargado.",
             )
-            self._emit_signal(
-                "OM-R", ticker, precio_actual, self._atr_micro(df_micro), None,
-                motivo="REAL_MODEL_REQUIRED",
-                ai_threshold=self._ai_threshold_for_ticker(ticker),
-                execution_mode="REAL",
-                ai_decision="BLOCKED_MODEL",
-            )
-            return
+            # Continue through the feature audit so this blocked REAL signal
+            # can be observed without sending an order. The production veto
+            # remains mandatory and is also enforced after the audit below.
 
         # 4) ATR micro + features GSCO (opcional) para la auditoría del ticker.
         atr_micro = self._atr_micro(df_micro)
@@ -1662,6 +1655,19 @@ class ChocoletraBot:
             self._emit_log("ERROR", f"[{ticker}] Error en auditoría de agentes: {e}")
             self._quarantine_real_ticker(ticker, 'AI inference failed')
             return
+
+        if model_unavailable:
+            decision.operar = False
+            decision.execution_veto_reason = "AI_MODEL_UNAVAILABLE"
+
+        # Persist the exact UTC candle baseline for counterfactual labels. NY
+        # decision wall-clock time is distinct from Schwab's UTC candle index.
+        with self._lock:
+            signal_bar = self._gala10_signal_bar.get(ticker)
+        decision.signal_bar_timestamp = (
+            signal_bar if signal_bar is not None else df_micro.index[-1]
+        )
+        decision.signal_bar_duration_minutes = micro_duration_minutes
 
         if getattr(decision, 'ai_inference_error', False) and not paper_ticker:
             self._quarantine_real_ticker(ticker, 'Production inference unavailable')
@@ -1845,6 +1851,30 @@ class ChocoletraBot:
         return effective_ai_threshold(
             snapshot, self._ai_threshold_for_ticker(ticker)
         )
+
+    def _avanzar_aprendizaje_senales(
+        self, ticker: str, confirmed_frame, *, bar_duration_minutes: int = 1,
+    ) -> list:
+        """Resolve open signal observations from confirmed candles in order."""
+        store = self.signal_learning
+        cursor = store.pending_after(ticker)
+        if cursor is None or confirmed_frame is None or len(confirmed_frame) == 0:
+            return []
+        timestamps = pd.to_datetime(confirmed_frame.index, utc=True, errors="coerce")
+        mask = timestamps.notna() & (timestamps > pd.Timestamp(cursor))
+        fresh = confirmed_frame.iloc[mask].copy()
+        fresh.index = timestamps[mask]
+        fresh = fresh.sort_index(kind="stable")
+        fresh = fresh.loc[~fresh.index.duplicated(keep="last")]
+        resolved = []
+        for bar_timestamp, bar in fresh.iterrows():
+            resolved.extend(store.update_bar(
+                ticker, high=bar["high"], low=bar["low"], close=bar["close"],
+                bar_timestamp=bar_timestamp, bar_duration_minutes=bar_duration_minutes,
+            ))
+            if store.pending_after(ticker) is None:
+                break
+        return resolved
 
     def _registrar_veto_ia(self, decision, execution_mode: str):
         """Persist a non-executed audited signal in both audit layers.

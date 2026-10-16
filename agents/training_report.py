@@ -5,13 +5,24 @@ from __future__ import annotations
 import csv
 import json
 import os
+import stat
+import tempfile
+import threading
 from datetime import datetime, timezone
 from typing import Dict
+
+
+_PUBLISH_LOCK = threading.Lock()
 
 
 REPORT_COLUMNS = [
     "ticker", "muestras", "muestras_fit", "muestras_validation",
     "muestras_train", "muestras_test",
+    "muestras_fit_reales", "muestras_fit_suplementarias",
+    "validation_test_actual_only", "temporal_integrity_passed",
+    "economic_gate_passed", "economic_net_r", "economic_expectancy_r",
+    "economic_profit_factor", "economic_max_drawdown_r",
+    "economic_accepted_trades", "economic_round_trip_cost_bps",
     "accuracy", "baseline_accuracy", "accuracy_lift_pp",
     "balanced_accuracy", "precision", "base_win_rate_pct",
     "precision_lift_pp", "recall", "f1", "approval_rate_pct",
@@ -27,24 +38,50 @@ REPORT_COLUMNS = [
 ]
 
 
+def _atomic_write(path: str, write):
+    """Publish one complete report without sharing a temporary file name."""
+    path = os.fspath(path)
+    try:
+        existing_mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        existing_mode = None
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="",
+            dir=os.path.dirname(path) or ".",
+            prefix=f".{os.path.basename(path)}.", suffix=".tmp", delete=False,
+        ) as handle:
+            tmp = handle.name
+            write(handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if existing_mode is not None:
+            os.chmod(tmp, existing_mode)
+        # Windows can reject overlapping replacements of the same destination;
+        # serialize the short publication step within this service process.
+        with _PUBLISH_LOCK:
+            os.replace(tmp, path)
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
+
 def _atomic_json(path: str, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    _atomic_write(path, lambda handle: json.dump(
+        data, handle, ensure_ascii=False, indent=2
+    ))
 
 
 def _atomic_csv(path: str, rows):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=REPORT_COLUMNS)
+    def write(handle):
+        writer = csv.DictWriter(handle, fieldnames=REPORT_COLUMNS)
         writer.writeheader()
         writer.writerows(rows)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    _atomic_write(path, write)
 
 
 def guardar_reporte_modelos(metricas: Dict[str, dict],
@@ -60,6 +97,9 @@ def guardar_reporte_modelos(metricas: Dict[str, dict],
         model_path = item.get("modelo_path", "")
         model_exists = bool(model_path and os.path.exists(model_path))
         confusion = item.get("matriz_confusion") or {}
+        economics = item.get("economic_test") or {}
+        if not isinstance(economics, dict):
+            economics = {}
         item["modelo_existe"] = model_exists
         item["modelo_bytes"] = os.path.getsize(model_path) if model_exists else 0
         detalle[ticker] = item
@@ -70,6 +110,18 @@ def guardar_reporte_modelos(metricas: Dict[str, dict],
             "muestras_validation": item.get("muestras_validation", 0),
             "muestras_train": item.get("muestras_train", 0),
             "muestras_test": item.get("muestras_test", 0),
+            "muestras_fit_reales": item.get(
+                "muestras_fit_reales", item.get("muestras_fit", "")),
+            "muestras_fit_suplementarias": item.get("muestras_fit_suplementarias", ""),
+            "validation_test_actual_only": item.get("validation_test_actual_only", ""),
+            "temporal_integrity_passed": item.get("temporal_integrity_passed", ""),
+            "economic_gate_passed": item.get("economic_gate_passed", ""),
+            "economic_net_r": economics.get("net_r", ""),
+            "economic_expectancy_r": economics.get("expectancy_r", ""),
+            "economic_profit_factor": economics.get("profit_factor", ""),
+            "economic_max_drawdown_r": economics.get("max_drawdown_r", ""),
+            "economic_accepted_trades": economics.get("accepted_trades", ""),
+            "economic_round_trip_cost_bps": economics.get("round_trip_cost_bps", ""),
             "accuracy": item.get("accuracy", ""),
             "baseline_accuracy": item.get("baseline_accuracy", ""),
             "accuracy_lift_pp": item.get("accuracy_lift_pp", ""),

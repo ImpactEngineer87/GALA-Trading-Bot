@@ -875,12 +875,23 @@
       .ai-delta.zero{color:var(--txt2)}
       .ai-accepted-score{display:inline-flex;align-items:center;gap:4px;color:var(--green);font-family:var(--mono);font-weight:800}
       .ai-accepted-score.missing{color:var(--txt3);font-weight:600}
+      .ai-learning-cards .stat-value{font-size:1.35rem}
+      .ai-learning-cards .daily-risk-sub{line-height:1.5}
+      .ai-cell-note{display:block;max-width:260px;white-space:normal;color:var(--txt3);font-size:.68rem;line-height:1.45;margin-top:4px}
+      .ai-economic-pass{color:var(--green)}
+      .ai-economic-fail{color:var(--orange)}
     </style>
+    <div class="stats-row ai-learning-cards" aria-live="polite">
+      <div class="stat-card green"><div class="stat-value" id="aiVerifiedClosed">—</div><div class="stat-label">Cierres verificados para IA</div><div class="daily-risk-sub" id="aiClosedSources">REAL — · PAPER —</div></div>
+      <div class="stat-card purple"><div class="stat-value" id="aiResolvedSignals">—</div><div class="stat-label">Señales resueltas utilizables</div><div class="daily-risk-sub" id="aiSignalSources">Esperando resultados confirmados</div></div>
+      <div class="stat-card orange"><div class="stat-value" id="aiTrainingReady">—</div><div class="stat-label">Tickers listos para entrenar</div><div class="daily-risk-sub" id="aiTrainingSchedule">Cargando programación</div></div>
+      <div class="stat-card"><div class="stat-value" id="aiEconomicEvidence">—</div><div class="stat-label">TEST con puerta económica aprobada</div><div class="daily-risk-sub" id="aiEconomicDetail">Resultados de candidatos, con costes estimados</div></div>
+    </div>
     <div class="card" style="margin-bottom:16px">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px">
         <div>
           <div class="card-title" style="margin:0">🧠 Ciclo IA por ticker</div>
-          <div class="section-note">30 ejecuciones v2.9 verificadas = revisión; 50 = reentrenamiento post-sesión. Las filas legacy sin enlace se conservan, pero no entrenan. Las señales vetadas se auditan aparte y no incrementan x/50.</div>
+          <div class="section-note" id="aiLearningPolicy">Aprende de cierres REAL y PAPER verificados y de señales resueltas con peso reducido. Cargando umbrales y programación…</div>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <button class="btn btn-ghost btn-sm" onclick="triggerTraining()">🧠 Reentrenar pendientes</button>
@@ -889,11 +900,11 @@
       </div>
       <div class="ai-life-wrap">
         <table class="ai-life-table">
-          <thead><tr><th>Ticker</th><th>Modelo</th><th>Progreso x/50</th><th>Vetadas IA</th><th>Aprendizaje señales</th><th>Dataset válido / afectado</th><th>Estado</th><th>Último candidato</th><th>BA aceptada SHADOW</th><th>Candidate BA</th><th>Shadow Inc. BA</th><th>Δ Shadow</th><th>Gate PROD</th><th>Prod Inc. BA</th><th>Umbral decisión</th><th>Evaluación</th><th>Razón / gate</th></tr></thead>
-          <tbody id="aiLifecycleRows"><tr><td colspan="17">Cargando estado IA…</td></tr></tbody>
+          <thead><tr><th>Ticker</th><th>Modelo</th><th>Cierres nuevos / objetivo</th><th>Cierres REAL / PAPER</th><th>Vetadas IA</th><th>Aprendizaje señales</th><th>Dataset válido / afectado</th><th>Último FIT: cierres + señales</th><th>Estado</th><th>Último candidato</th><th>BA aceptada SHADOW</th><th>Candidate BA</th><th>Shadow Inc. BA</th><th>Δ Shadow</th><th>Gate PROD</th><th>TEST económico</th><th>Prod Inc. BA</th><th>Umbral decisión</th><th>Evaluación</th><th>Razón / gate</th></tr></thead>
+          <tbody id="aiLifecycleRows"><tr><td colspan="20">Cargando estado IA…</td></tr></tbody>
         </table>
       </div>
-      <div class="section-note" style="margin-top:8px"><strong>v3.3.8:</strong> x/50 sigue contando únicamente operaciones ejecutadas y cerradas con integridad válida. <strong>Aprendizaje señales</strong> muestra vetos/señales no ejecutadas cuyo resultado hipotético se sigue con velas confirmadas; solo TP/SL no ambiguos pueden complementar el bloque FIT con peso reducido. VALIDACIÓN y TEST continúan usando exclusivamente operaciones reales/PAPER ejecutadas válidas. <span style="color:var(--green)">BA aceptada SHADOW</span> sigue siendo la puntuación histórica del modelo instalado; un reentrenamiento posterior REJECTED no la reemplaza ni degrada el modelo aceptado.</div>
+      <div class="section-note" style="margin-top:8px">El progreso cuenta cierres ejecutados con integridad válida; se conserva al reiniciar. <strong>Las señales resueltas</strong> pueden complementar FIT con peso reducido y solo con TP/SL no ambiguos; no suman al contador de cierres. VALIDACIÓN y TEST usan exclusivamente cierres REAL/PAPER válidos. El TEST económico compara retornos después de costes estimados; R expresa el resultado respecto al riesgo inicial y no equivale a dinero ganado. Entrenar o aprobar un candidato no garantiza rentabilidad futura. <span style="color:var(--green)">BA aceptada SHADOW</span> describe el modelo instalado; rechazar otro candidato conserva ese modelo. La promoción a producción y el modo REAL siguen requiriendo revisión manual.</div>
     </div>
     <div class="card signal-chart-card" id="signalChartCard">
       <div class="signal-chart-head">
@@ -1232,8 +1243,8 @@
         <div style="height:1px;background:var(--border);margin-bottom:12px"></div>
         <div class="config-card-title">🤖 Entrenamiento IA</div>
         <div class="cfg-row">
-          <div class="cfg-hint" style="margin-bottom:8px">Evalúa los modelos XGBoost por ticker con el histórico limpio GALA10 + volumen/liquidez y genera el reporte de métricas.</div>
-          <button class="btn btn-ghost btn-full" onclick="triggerTraining()">🧠 Re-entrenar IA Ahora</button>
+          <div class="cfg-hint" style="margin-bottom:8px">Reentrena los tickers pendientes con cierres REAL/PAPER verificados y señales resueltas de menor peso. Detén el motor antes de iniciar. Validación y TEST usan cierres ejecutados; revisa las métricas y la puerta económica antes de promover un modelo a producción.</div>
+          <button class="btn btn-ghost btn-full" onclick="triggerTraining()">🧠 Reentrenar tickers pendientes</button>
         </div>
       </div>
 
@@ -1317,7 +1328,7 @@
             Modo de Ejecución
             <span class="pill paper" id="cfgModePill">POR TICKER</span>
           </div>
-          <div class="cfg-hint">v2.9.6: PAPER/REAL y acciones siguen siendo manuales por ticker. PAPER + REAL comparten el mismo progreso IA x/50; los cierres/reversiones REAL usan el broker como fuente de verdad.</div>
+          <div class="cfg-hint">PAPER/REAL y acciones siguen siendo manuales por ticker. Los cierres PAPER + REAL verificados comparten el progreso IA; las señales resueltas complementan el entrenamiento. Los cierres/reversiones REAL usan el broker como fuente de verdad.</div>
         </div>
       </div>
 
@@ -2924,12 +2935,63 @@ async function testSchwab(){
 // ─────────────────────────────────────────────────────────
 // AI RETRAINING LIFECYCLE
 // ─────────────────────────────────────────────────────────
+function aiMetricNumber(value){
+  if(value == null || value === '' || typeof value === 'boolean') return null;
+  const number=Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+function aiMetricText(value, suffix=''){
+  const number=aiMetricNumber(value);
+  return number == null ? '—' : `${number.toFixed(2)}${suffix}`;
+}
+function aiCountText(value){
+  const number=aiMetricNumber(value);
+  return number == null ? '—' : String(Math.max(0,Math.trunc(number)));
+}
+function aiEvaluation(row){
+  return row.last_evaluation && typeof row.last_evaluation === 'object' ? row.last_evaluation : {};
+}
+function aiEconomicSnapshot(row){
+  const evaluation=aiEvaluation(row);
+  const metrics=row.economic_test || evaluation.economic_test || {};
+  const gate=row.economic_gate_passed ?? evaluation.economic_gate_passed;
+  return {metrics,gate,evaluated:metrics.evaluated === true};
+}
+function renderAILearningSummary(data){
+  const rows=data.tickers || [], summary=data.summary || {};
+  const sumField=key=>rows.reduce((total,row)=>total+(aiMetricNumber(row[key]) || 0),0);
+  const completeSum=key=>rows.length && rows.every(row=>aiMetricNumber(row[key]) != null) ? sumField(key) : null;
+  const setText=(id,value)=>{const target=el(id);if(target) target.textContent=value;};
+  const real=completeSum('eligible_closed_real'), paper=completeSum('eligible_closed_paper');
+  const verified=real == null || paper == null ? null : real+paper;
+  const legacy=summary.eligible_closed_legacy ?? sumField('eligible_closed_legacy');
+  setText('aiVerifiedClosed',aiCountText(verified));
+  setText('aiClosedSources',`REAL ${aiCountText(real)} · PAPER ${aiCountText(paper)} · excluidas ${aiCountText(summary.quarantined_observations ?? sumField('quarantined_observations'))}${legacy>0 ? ` · ${aiCountText(legacy)} históricos sin verificación` : ''}`);
+  const trainable=summary.learning_trainable ?? sumField('learning_trainable');
+  const resolved=summary.learning_resolved ?? sumField('learning_resolved');
+  const open=summary.learning_open ?? sumField('learning_open');
+  const excluded=Math.max(0,Number(resolved)-Number(trainable));
+  setText('aiResolvedSignals',aiCountText(trainable));
+  setText('aiSignalSources',`${aiCountText(resolved)} resueltas · ${aiCountText(open)} pendientes · ${aiCountText(excluded)} excluidas`);
+  const ready=rows.filter(row=>(row.training_readiness || {}).ready === true).length;
+  const readinessKnown=rows.some(row=>typeof (row.training_readiness || {}).ready === 'boolean');
+  setText('aiTrainingReady',readinessKnown ? `${ready}/${rows.length}` : '—');
+  const schedule=data.only_after_session ? 'Después de la sesión NY' : 'Al alcanzar el objetivo';
+  setText('aiTrainingSchedule',`${data.automatic_retraining ? schedule : 'Inicio manual'} · ${aiCountText(summary.pending ?? rows.filter(row=>row.status==='PENDING_RETRAIN').length)} pendientes · ${aiCountText(summary.training ?? rows.filter(row=>row.status==='TRAINING').length)} entrenando`);
+  const economic=rows.map(aiEconomicSnapshot).filter(snapshot=>snapshot.evaluated);
+  const passed=economic.filter(snapshot=>snapshot.gate===true).length;
+  setText('aiEconomicEvidence',economic.length ? `${passed}/${economic.length}` : 'Sin evaluar');
+  setText('aiEconomicDetail',economic.length ? `${economic.length} últimos candidatos evaluados · costes estimados · promoción manual` : 'Sin evidencia económica TEST disponible');
+  setText('aiLearningPolicy',`Fuentes: cierres REAL + PAPER verificados y señales resueltas de menor peso. Revisión: ${aiCountText(data.warning_samples)} cierres nuevos; reentrenamiento: ${aiCountText(data.retrain_samples)}. ${data.automatic_retraining ? schedule : 'Inicio manual'}.`);
+}
+
 async function fetchAIStatus(){
   try {
     const r = await api('/api/ai/status');
     const d = await r.json();
     if(d.status !== 'ok') return;
     S.aiStatus = d.tickers || [];
+    renderAILearningSummary(d);
     const sum = d.summary || {};
     const summary = el('aiLifecycleSummary');
     if(summary){
@@ -2939,7 +3001,24 @@ async function fetchAIStatus(){
     const body = el('aiLifecycleRows');
     if(!body) return;
     body.innerHTML = S.aiStatus.map(row => {
-      const progress = `${Number(row.new_observations||0)}/${Number(row.retrain_samples||50)}`;
+      const progress = `${aiCountText(row.new_observations)}/${aiCountText(row.retrain_samples ?? d.retrain_samples)}`;
+      const readiness = row.training_readiness || {};
+      const readinessText = readiness.reason || (readiness.ready === true ? 'Datos listos para entrenar' : 'Comprobando datos de entrenamiento');
+      const readinessDetail = [readinessText,readiness.min_samples != null ? `${aiCountText(readiness.eligible_samples)} / ${aiCountText(readiness.min_samples)} cierres necesarios para FIT + VALIDACIÓN + TEST` : ''].filter(Boolean).join(' · ');
+      const closedSources = `REAL ${aiCountText(row.eligible_closed_real)} / PAPER ${aiCountText(row.eligible_closed_paper)}`;
+      const evaluation = aiEvaluation(row);
+      const fitActual = row.muestras_fit_reales ?? evaluation.muestras_fit_reales ?? row.last_fit_samples ?? evaluation.muestras_fit;
+      const fitSignals = row.muestras_fit_suplementarias ?? evaluation.muestras_fit_suplementarias;
+      const fitText = fitActual == null && fitSignals == null ? 'Sin entrenamiento registrado' : `${aiCountText(fitActual)} cierres + ${aiCountText(fitSignals)} señales`;
+      const actualOnly = row.validation_test_actual_only ?? evaluation.validation_test_actual_only;
+      const fitDetail = actualOnly === true ? 'VALIDACIÓN / TEST: solo cierres ejecutados' : 'Fuentes de VALIDACIÓN / TEST no registradas';
+      const economicSnapshot = aiEconomicSnapshot(row), economic = economicSnapshot.metrics;
+      const economicGateText = economicSnapshot.gate === true ? 'PASS' : (economicSnapshot.gate === false ? 'FAIL' : 'Sin puerta registrada');
+      const economicText = economicSnapshot.evaluated ? `${economicGateText} · ${aiMetricText(economic.net_r,' R')} neto · ${aiCountText(economic.accepted_trades)} aprobadas` : 'Sin evaluar';
+      const profitFactorText = economic.no_loss_trades === true ? 'sin pérdidas' : aiMetricText(economic.profit_factor);
+      const economicDetail = economicSnapshot.evaluated ? `Esperanza ${aiMetricText(economic.expectancy_r,' R')} · PF ${profitFactorText} · Caída máx. ${aiMetricText(economic.max_drawdown_r,' R')} · Coste ida/vuelta ${aiMetricText(economic.round_trip_cost_bps,' pb')}` : 'Requiere TEST ejecutado y retornos verificables';
+      const economicReasons = row.economic_reasons ?? evaluation.economic_reasons ?? [];
+      const economicTitle = [economicDetail,...(Array.isArray(economicReasons) ? economicReasons : [])].join(' · ');
       const model = row.dashboard_model_status || ((row.shadow_model_loaded || row.production_model_loaded) ? 'READY' : 'N/A');
       const dataset = `${Number(row.eligible_observations||0)} / ${Number(row.quarantined_observations||0)}`;
       const vetoTotal = Number(row.veto_total||0);
@@ -2952,7 +3031,9 @@ async function fetchAIStatus(){
       const learningTrainable = Number(row.learning_trainable||0);
       const learningOpen = Number(row.learning_open||0);
       const learningMissed = Number(row.learning_execution_missed||0);
-      const learningText = `${learningTrainable} utilizables / ${learningTotal} total${learningMissed ? ` · ${learningMissed} no ejecutadas` : ''}${learningOpen ? ` · ${learningOpen} abiertas` : ''}`;
+      const learningResolved = Number(row.learning_resolved||0);
+      const learningExcluded = Math.max(0,learningResolved-learningTrainable);
+      const learningText = `${learningTrainable} utilizables / ${learningTotal} total${learningExcluded ? ` · ${learningExcluded} excluidas` : ''}${learningMissed ? ` · ${learningMissed} no ejecutadas` : ''}${learningOpen ? ` · ${learningOpen} pendientes` : ''}`;
       const shadowAccepted = row.last_shadow_candidate_accepted;
       const shadowResult = shadowAccepted === true
         ? 'ACCEPTED'
@@ -3011,11 +3092,13 @@ async function fetchAIStatus(){
       const evalTitle = `Snapshot: ${row.last_evaluation_id || 'legacy'} · TEST n=${Number(row.last_test_samples||0)}${testWindow ? ` · ${testWindow}` : ''}`;
       return `<tr>
         <td class="notranslate" translate="no"><strong translate="no">${escHtml(row.ticker||'—')}</strong></td>
-        <td>${model}</td>
-        <td>${progress}</td>
-        <td title="Auditoría separada: útiles = el veto habría evitado una pérdida; perdidas = una señal vetada habría sido ganadora. No suma a x/50.">${vetoText}</td>
-        <td title="Señales no ejecutadas resueltas por TP/SL. Solo las no ambiguas pueden complementar FIT con peso reducido; nunca suman a x/50 ni entran a VALIDACIÓN/TEST.">${learningText}</td>
+        <td>${escHtml(model)}</td>
+        <td title="${escHtml(readinessDetail)}">${progress}<span class="ai-cell-note">${escHtml(readinessText)}</span></td>
+        <td title="Cierres verificados disponibles para entrenar. El contador total de operaciones cerradas también conserva filas no elegibles para IA.">${closedSources}</td>
+        <td title="Auditoría separada: útiles = el veto habría evitado una pérdida; perdidas = una señal vetada habría sido ganadora. No suma al contador de cierres.">${vetoText}</td>
+        <td title="Señales no ejecutadas resueltas por TP/SL. Solo las no ambiguas pueden complementar FIT con peso reducido; nunca suman al contador de cierres ni entran a VALIDACIÓN/TEST.">${learningText}</td>
         <td title="Ejecutadas válidas para IA / ejecuciones afectadas o legacy en cuarentena">${dataset}</td>
+        <td>${fitText}<span class="ai-cell-note">${escHtml(fitDetail)}</span></td>
         <td><span class="ai-state ${escHtml(row.status||'COLLECTING')}">${escHtml(row.status||'COLLECTING')}</span></td>
         <td title="Resultado del candidato más reciente dentro de SHADOW; REJECTED no degrada el modelo aceptado anterior.">${escHtml(shadowResult)}</td>
         <td title="${escHtml(acceptedShadowTitle)}">${acceptedShadow}</td>
@@ -3023,12 +3106,13 @@ async function fetchAIStatus(){
         <td title="Incumbente SHADOW evaluado sobre exactamente el mismo TEST">${shadowInc}</td>
         <td><span class="ai-delta ${deltaClass}">${delta}</span></td>
         <td title="Puerta independiente para permitir promoción normal a PRODUCTION">${prodGateText}</td>
+        <td class="${economicSnapshot.gate===true?'ai-economic-pass':economicSnapshot.gate===false?'ai-economic-fail':''}" title="${escHtml(economicTitle)}">${economicText}<span class="ai-cell-note">${escHtml(economicDetail)}</span></td>
         <td title="Incumbente PRODUCTION evaluado sobre exactamente el mismo TEST">${prodInc}</td>
         <td title="Umbral elegido en VALIDACIÓN y luego congelado para este TEST">${threshold}</td>
         <td title="${escHtml(evalTitle)}">${escHtml(evalText)}</td>
         <td title="${escHtml(reason)}" style="max-width:360px;overflow:hidden;text-overflow:ellipsis">${escHtml(reason)}</td>
       </tr>`;
-    }).join('') || '<tr><td colspan="17">Sin estado disponible</td></tr>';
+    }).join('') || '<tr><td colspan="20">Sin estado disponible</td></tr>';
     if(S.tickerExecution.length) renderTickerExecution();
   } catch(e){}
 }
@@ -3345,7 +3429,7 @@ function renderTickerExecution(){
     const ai=aiRowForTicker(ticker),production=!!ai?.production_model_loaded,shadow=!!ai?.shadow_model_loaded;
     const model=el('exec-model-'+ticker);model.className='exec-model-badge '+(production?'production':shadow?'shadow':'');
     model.textContent=production?(ai.production_manual_override?'● Producción · override':'● Producción'):shadow?'● En validación':'○ Sin modelo';
-    el('exec-ai-'+ticker).textContent=(ai?.production_threshold!=null?`Umbral ${(Number(ai.production_threshold)*100).toFixed(0)}% · `:'')+`Aprendizaje ${ai?.new_observations??0}/${ai?.retrain_samples??50}`;
+    el('exec-ai-'+ticker).textContent=(ai?.production_threshold!=null?`Umbral ${(Number(ai.production_threshold)*100).toFixed(0)}% · `:'')+`Cierres IA ${aiCountText(ai?.new_observations)}/${aiCountText(ai?.retrain_samples)}`;
     const save=el('exec-save-'+ticker);save.disabled=running||saving||!draft||!!issue;save.textContent=saving?'Guardando…':'Guardar';
     const discard=el('exec-discard-'+ticker);discard.hidden=!draft;discard.disabled=saving;
     const notice=S.execNotices[ticker];
@@ -3391,7 +3475,7 @@ async function applyTickerExecution(ticker){
   if(issue){draft.error=issue;renderTickerExecution();return;}
   const mode=draft.mode,shares=Number(draft.shares);
   const ai = aiRowForTicker(ticker);
-  const progress = ai ? `${Number(ai.new_observations||0)}/${Number(ai.retrain_samples||50)}` : 'actual';
+  const progress = ai ? `${aiCountText(ai.new_observations)}/${aiCountText(ai.retrain_samples)}` : 'actual';
   if(mode === 'REAL' && saved.mode !== 'REAL'){
     const plan=partialPlanForShares(shares);
     const planText=plan.enabled?`\nPlan parcial: ${plan.text}.`:`\nPlan parcial: no activo con menos de 3 acciones.`;

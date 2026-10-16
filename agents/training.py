@@ -40,6 +40,10 @@ import pandas as pd
 from agents.contracts import DecisionFinal
 from agents.feedback_store import construir_features
 from agents.gala10_features import GALA10_FEATURE_NAMES
+from agents.learning_dataset import LEARNING_POLICY_VERSION, eligible_closed_trades
+from agents.learning_economics import (
+    net_trade_returns, economic_metrics, economic_rejection_reasons,
+)
 from agents.retraining_lifecycle import RetrainingLifecycle
 from agents.volume_features import VOLUME_FEATURE_NAMES
 
@@ -56,7 +60,6 @@ FEATURES = [
 
 TRAINING_POLICY_VERSION = 4
 FEATURE_VERSION = 4
-LEARNING_POLICY_VERSION = 1
 
 
 def _only_execution_valid(df: pd.DataFrame) -> pd.DataFrame:
@@ -67,10 +70,7 @@ def _only_execution_valid(df: pd.DataFrame) -> pd.DataFrame:
     unlinked historical row with value 0.
     """
 
-    if "execution_valid" not in df.columns:
-        return df
-    valid = pd.to_numeric(df["execution_valid"], errors="coerce").fillna(0)
-    return df[valid == 1].copy()
+    return eligible_closed_trades(df, allow_legacy=True)
 
 
 class EntrenadorAgentes:
@@ -122,13 +122,13 @@ class EntrenadorAgentes:
             learning_cfg.get("path", "data/signal_learning_observations.csv")
         )
         self.signal_learning_weight: float = min(1.0, max(0.0, float(
-            learning_cfg.get("counterfactual_weight", 0.35) or 0.35
+            learning_cfg.get("counterfactual_weight", 0.35)
         )))
         self.signal_learning_max_ratio: float = max(0.0, float(
-            learning_cfg.get("max_counterfactual_to_actual_fit_ratio", 1.0) or 1.0
+            learning_cfg.get("max_counterfactual_to_actual_fit_ratio", 1.0)
         ))
         auto_cfg = cfg.get("automatic_retraining", {}) or {}
-        self.reentrenar_cada_n: int = int(cfg.get("reentrenar_cada_n", 25))
+        self.reentrenar_cada_n: int = int(cfg.get("reentrenar_cada_n", 50))
         self.auto_retrain_enabled: bool = bool(
             auto_cfg.get("enabled", self.activo))
         self.auto_retrain_only_after_session: bool = bool(
@@ -175,8 +175,17 @@ class EntrenadorAgentes:
             cfg.get("min_perdedoras_filtradas_pct", 55.0)) / 100.0
         self.max_balanced_accuracy_drop: float = float(
             cfg.get("max_balanced_accuracy_drop", 0.02))
+        economics = cfg.get("economic_validation", {}) or {}
+        self.round_trip_cost_bps = max(0.0, float(economics.get("round_trip_cost_bps", 2.0)))
+        self.economic_min_trades = max(1, int(economics.get("min_accepted_test_trades", 10)))
+        self.economic_min_expectancy_r = max(0.0, float(economics.get("min_expectancy_r", 0.0)))
+        self.economic_min_profit_factor = max(1.0, float(economics.get("min_profit_factor", 1.10)))
+        self.economic_max_drawdown_r = max(0.0, float(economics.get("max_drawdown_r", 6.0)))
+        self.economic_min_net_r_lift = max(0.0, float(economics.get("min_net_r_lift", 0.0)))
 
         self._lock = threading.Lock()
+        self._status_feedback_signature = None
+        self._status_feedback_rows = pd.DataFrame()
         self._modelos: Dict[str, object] = {}     # approved production models
         self._umbrales: Dict[str, float] = {}
         self._modelos_shadow: Dict[str, object] = {}
@@ -477,7 +486,10 @@ class EntrenadorAgentes:
             sup = pd.read_csv(self.signal_learning_path)
         except Exception:
             return empty
-        required = {"ticker", "event", "training_eligible", "ganadora", "resolution"}
+        cutoff_utc = self._timestamp_to_utc(fit_cutoff)
+        if pd.isna(cutoff_utc):
+            return empty
+        required = {"ticker", "event", "training_eligible", "ganadora", "resolution", "resolved_utc"}
         if not required.issubset(sup.columns):
             return empty
         sup = sup[
@@ -495,29 +507,90 @@ class EntrenadorAgentes:
                 sup[col] = np.nan
         for col in FEATURES + ["ganadora"]:
             sup[col] = pd.to_numeric(sup[col], errors="coerce")
+        sup[FEATURES] = sup[FEATURES].replace([np.inf, -np.inf], np.nan)
+        sup = sup[sup["ganadora"].isin([0, 1])]
         sup = sup.dropna(subset=[
             "ganadora", "volumen_relativo_20", "liquidez_dolar_log",
             *GALA10_FEATURE_NAMES,
         ])
         if sup.empty:
             return empty
-        cutoff_utc = self._timestamp_to_utc(fit_cutoff)
-        if pd.notna(cutoff_utc) and "resolved_utc" in sup.columns:
-            sup["_resolved_utc"] = pd.to_datetime(
-                sup["resolved_utc"], errors="coerce", utc=True
-            )
-            sup = sup[sup["_resolved_utc"].notna() & (sup["_resolved_utc"] <= cutoff_utc)]
+        sup["_resolved_utc"] = pd.to_datetime(
+            sup["resolved_utc"], errors="coerce", utc=True
+        )
+        sup = sup[sup["_resolved_utc"].notna() & (sup["_resolved_utc"] <= cutoff_utc)]
         if sup.empty:
             return empty
-        sort_col = "_resolved_utc" if "_resolved_utc" in sup.columns else "timestamp"
-        if sort_col in sup.columns:
-            sup = sup.sort_values(sort_col, kind="stable")
+        # Re-label small gross winners as losses when the configured fee
+        # reserve consumes their entire return. No synthetic row reaches TEST.
+        sup_returns = net_trade_returns(sup, self.round_trip_cost_bps)
+        known = np.isfinite(sup_returns)
+        sup.loc[known, "ganadora"] = (sup_returns[known] > 0).astype(int)
+        sup = sup.sort_values("_resolved_utc", kind="stable")
         cap = max(0, int(round(max(0, actual_fit_count) * self.signal_learning_max_ratio)))
         if cap <= 0:
             return empty
         if len(sup) > cap:
             sup = sup.tail(cap)
         return sup
+
+    def _prepare_training_rows(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """Apply the same identity/verification policy as the closed counter."""
+        df = _only_execution_valid(frame).copy()
+        if not {"ticker", "tipo", "ganadora", "timestamp"}.issubset(df.columns):
+            return df.iloc[:0]
+        df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+        df["tipo"] = df["tipo"].astype(str).str.upper()
+        df = df[df["tipo"].isin(["BUY", "SELL"])].copy()
+        df["_timestamp"] = pd.to_datetime(
+            df["timestamp"].map(self._timestamp_to_utc), errors="coerce", utc=True
+        )
+        df["_closed_utc"] = pd.to_datetime(
+            df.get("closed_utc", pd.Series(pd.NaT, index=df.index)),
+            errors="coerce", utc=True,
+        )
+        df = df[df["_timestamp"].notna() & (
+            df["_closed_utc"].isna() | (df["_closed_utc"] >= df["_timestamp"])
+        )].copy()
+        df["tipo_num"] = (df["tipo"] == "BUY").astype(float)
+        for col in FEATURES + ["ganadora"]:
+            df[col] = pd.to_numeric(df.get(col, np.nan), errors="coerce")
+        df[FEATURES] = df[FEATURES].replace([np.inf, -np.inf], np.nan)
+        df = df[df["ganadora"].isin([0, 1])].dropna(subset=[
+            "volumen_relativo_20", "liquidez_dolar_log", *GALA10_FEATURE_NAMES,
+        ]).copy()
+        df["_net_r"] = net_trade_returns(df, self.round_trip_cost_bps)
+        known = np.isfinite(df["_net_r"])
+        df.loc[known, "ganadora"] = (df.loc[known, "_net_r"] > 0).astype(int)
+        return df.sort_values("_timestamp", kind="stable").reset_index(drop=True)
+
+    def _causal_blocks(self, df: pd.DataFrame, *, automatic: bool):
+        sizes = self._chronological_split_sizes(len(df), automatic=automatic)
+        if sizes is None:
+            return None
+        n_fit, n_val, _ = sizes
+        fit, val, test = (df.iloc[:n_fit].copy(), df.iloc[n_fit:n_fit+n_val].copy(),
+                          df.iloc[n_fit+n_val:].copy())
+        validation_start, test_start = val["_timestamp"].min(), test["_timestamp"].min()
+        original_fit, original_val = len(fit), len(val)
+        # Never train on a known outcome that arrived after a holdout decision.
+        # Legacy missing close times may build SHADOW evidence, but cannot pass
+        # the temporal production gate until genuine timestamps are available.
+        fit = fit[(fit["_timestamp"] < validation_start) & (
+            fit["_closed_utc"].isna() | (fit["_closed_utc"] < validation_start))]
+        val = val[(val["_timestamp"] < test_start) & (
+            val["_closed_utc"].isna() | (val["_closed_utc"] < test_start))]
+        min_fit = max(1, self.auto_min_fit_samples) if automatic else max(40, self.min_muestras)
+        min_val = max(1, self.auto_min_validation_samples if automatic else self.min_validation_muestras)
+        if len(fit) < min_fit or len(val) < min_val:
+            return None
+        temporal = {
+            "temporal_integrity_passed": bool(df["_closed_utc"].notna().all()),
+            "unknown_close_timestamps": int(df["_closed_utc"].isna().sum()),
+            "purged_fit_rows": original_fit - len(fit),
+            "purged_validation_rows": original_val - len(val),
+        }
+        return fit, val, test, validation_start - pd.Timedelta(nanoseconds=1), temporal
 
     def entrenar_ticker(
         self,
@@ -536,9 +609,10 @@ class EntrenadorAgentes:
             df = pd.read_csv(self.feedback_path)
         except Exception:
             return None
-        df = _only_execution_valid(df)
+        df = self._prepare_training_rows(df)
         if "ticker" not in df.columns:
             return None
+        ticker = str(ticker).strip().upper()
         df = df[df["ticker"] == ticker].copy()
         if len(df) < self.min_muestras:
             return None
@@ -549,34 +623,6 @@ class EntrenadorAgentes:
             print("[Agentes] Instala xgboost y scikit-learn para el meta-modelo por ticker")
             return None
 
-        # Orden temporal estricto: el bloque de prueba siempre es posterior al de
-        # entrenamiento. Un split aleatorio mezcla regímenes y filtra información.
-        if "timestamp" in df.columns:
-            df["_timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-            df = df.sort_values("_timestamp", kind="stable")
-        dedupe_cols = [
-            c for c in (
-                "timestamp", "ticker", "tipo", "precio_entrada", "precio_salida",
-            ) if c in df.columns
-        ]
-        if dedupe_cols:
-            df = df.drop_duplicates(subset=dedupe_cols, keep="last")
-
-        # Features: las opcionales pueden quedar NaN, pero volumen/liquidez son
-        # obligatorias en el nuevo esquema para no reutilizar el entrenamiento viejo.
-        df["tipo_num"] = (df["tipo"] == "BUY").astype(float)
-        for col in FEATURES:
-            if col not in df.columns:
-                df[col] = np.nan
-        for col in FEATURES + ["ganadora"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=[
-            "ganadora", "volumen_relativo_20", "liquidez_dolar_log",
-            *GALA10_FEATURE_NAMES,
-        ])
-        if len(df) < self.min_muestras:
-            return None
-
         y = df["ganadora"].astype(int).values
         if len(np.unique(y)) < 2:
             return None   # aún no hay ganadoras Y perdedoras para este ticker
@@ -585,30 +631,21 @@ class EntrenadorAgentes:
         # Política v3: FIT (60%) -> VALIDACIÓN (20%, selecciona umbral) ->
         # TEST (20%, auditoría intocable). Elegir el umbral sobre el mismo test
         # que reportamos inflaría las métricas y sería data leakage.
-        x = df[FEATURES].values
-        split_sizes = self._chronological_split_sizes(
-            len(df), automatic=automatic
-        )
-        if split_sizes is None:
+        blocks = self._causal_blocks(df, automatic=automatic)
+        if blocks is None:
             return None
-        n_fit, n_val, n_test = split_sizes
-        split_val = n_fit
-        split_test = n_fit + n_val
+        fit_rows, val_rows, test_rows, fit_cutoff, temporal = blocks
         x_fit_actual, x_val, x_te = (
-            x[:split_val], x[split_val:split_test], x[split_test:]
+            block[FEATURES].values for block in (fit_rows, val_rows, test_rows)
         )
         y_fit_actual, y_val, y_te = (
-            y[:split_val], y[split_val:split_test], y[split_test:]
+            block["ganadora"].astype(int).values for block in (fit_rows, val_rows, test_rows)
         )
         if any(len(np.unique(block)) < 2 for block in (y_fit_actual, y_val, y_te)):
             return None
 
         # v3.3.7: supplement FIT with lower-trust resolved non-executed signals.
         # Validation/test remain 100% actual execution-valid trades.
-        fit_cutoff = (
-            df.iloc[split_val - 1]["_timestamp"]
-            if "_timestamp" in df.columns and split_val > 0 else None
-        )
         supplemental = self._supplemental_fit_rows(
             ticker, fit_cutoff=fit_cutoff, actual_fit_count=len(y_fit_actual)
         )
@@ -637,8 +674,8 @@ class EntrenadorAgentes:
         test_window_end = ""
         if "_timestamp" in df.columns and len(df) >= 1:
             try:
-                first_ts = df.iloc[split_test]["_timestamp"]
-                last_ts = df.iloc[len(df) - 1]["_timestamp"]
+                first_ts = test_rows.iloc[0]["_timestamp"]
+                last_ts = test_rows.iloc[-1]["_timestamp"]
                 if pd.notna(first_ts):
                     test_window_start = first_ts.isoformat()
                 if pd.notna(last_ts):
@@ -662,9 +699,26 @@ class EntrenadorAgentes:
         modelo_eval.fit(x_fit, y_fit, sample_weight=fit_weights, verbose=False)
 
         prob_val = modelo_eval.predict_proba(x_val)[:, 1]
-        umbral, metricas_val = self._seleccionar_umbral(y_val, prob_val)
+        umbral, metricas_val = self._seleccionar_umbral(
+            y_val, prob_val, net_returns=val_rows["_net_r"].values)
         prob_te = modelo_eval.predict_proba(x_te)[:, 1]
         eval_test = self._metricas_probabilidades(y_te, prob_te, umbral)
+        economic_test = economic_metrics(
+            test_rows["_net_r"].values, prob_te, umbral, self.round_trip_cost_bps)
+        economic_validation = economic_metrics(
+            val_rows["_net_r"].values, prob_val, umbral, self.round_trip_cost_bps)
+        economic_reasons = economic_rejection_reasons(
+            economic_test, min_trades=self.economic_min_trades,
+            min_expectancy_r=self.economic_min_expectancy_r,
+            min_profit_factor=self.economic_min_profit_factor,
+            max_drawdown_r=self.economic_max_drawdown_r,
+            min_net_r_lift=self.economic_min_net_r_lift)
+        cost_label_integrity = all(
+            np.isfinite(block["_net_r"].values).all()
+            for block in (fit_rows, val_rows, test_rows)
+        )
+        if not cost_label_integrity:
+            economic_reasons.append("FIT/validación/TEST contienen cierres sin riesgo/costes verificables")
         acc = eval_test["accuracy"]
         precision = eval_test["precision"]
         recall = eval_test["recall"]
@@ -683,11 +737,15 @@ class EntrenadorAgentes:
             shadow_incumbent_umbral = self._umbrales_shadow.get(
                 ticker, self.shadow_default_threshold)
         incumbent_balanced = None
+        incumbent_economics = None
         if incumbent is not None:
             try:
                 prob_inc = incumbent.predict_proba(x_te)[:, 1]
                 incumbent_balanced = self._metricas_probabilidades(
                     y_te, prob_inc, incumbent_umbral)["balanced_accuracy"]
+                incumbent_economics = economic_metrics(
+                    test_rows["_net_r"].values, prob_inc, incumbent_umbral,
+                    self.round_trip_cost_bps)
             except Exception:
                 incumbent_balanced = None
         shadow_incumbent_balanced = None
@@ -701,6 +759,9 @@ class EntrenadorAgentes:
                 shadow_incumbent_balanced = None
 
         razones = self._razones_rechazo(eval_test)
+        razones.extend(economic_reasons)
+        if not temporal["temporal_integrity_passed"]:
+            razones.append("Cierres históricos sin closed_utc: causalidad no verificable")
         if incumbent_balanced is not None and eval_test["balanced_accuracy"] < (
                 incumbent_balanced - self.max_balanced_accuracy_drop):
             razones.append(
@@ -708,6 +769,9 @@ class EntrenadorAgentes:
                 f"{eval_test['balanced_accuracy']:.3f} degrada incumbente "
                 f"{incumbent_balanced:.3f}"
             )
+        if incumbent_economics and incumbent_economics["evaluated"] and (
+                economic_test["net_r"] < incumbent_economics["net_r"]):
+            razones.append("R neto TEST degrada modelo de producción incumbente")
         # Keep the exact production-gate reasons from THIS evaluation.  Older
         # builds exposed only a boolean, which made a SHADOW-accepted candidate
         # look contradictory when REAL promotion was still correctly blocked by
@@ -725,13 +789,14 @@ class EntrenadorAgentes:
         metricas = {
             "ticker": ticker,
             "evaluation_id": evaluation_id,
-            "evaluation_model_policy": "fit_only_v3_3",
+            "evaluation_model_policy": "causal_fit_only_cost_aware_v2",
             "model_version": evaluation_id,
             "evaluation_utc": evaluation_utc,
             "evaluation_test_start": test_window_start,
             "evaluation_test_end": test_window_end,
             "muestras": int(len(df)),
             "muestras_fit": int(len(y_fit_actual)),
+            "muestras_fit_reales": int(len(y_fit_actual)),
             "muestras_fit_suplementarias": int(supplemental_count),
             "muestras_fit_total": int(len(y_fit)),
             "muestras_validation": int(len(y_val)),
@@ -740,6 +805,14 @@ class EntrenadorAgentes:
             "signal_learning_weight": round(float(self.signal_learning_weight), 4),
             "signal_learning_max_ratio": round(float(self.signal_learning_max_ratio), 4),
             "validation_test_actual_only": True,
+            "economic_validation": economic_validation,
+            "economic_production_incumbent": incumbent_economics,
+            "economic_test": economic_test,
+            "economic_gate_passed": not economic_reasons,
+            "economic_reasons": list(economic_reasons),
+            "cost_label_integrity_passed": bool(cost_label_integrity),
+            "target_policy": "net_R_when_cost_evidence_available_legacy_gross_shadow_only",
+            **temporal,
             "learning_policy_version": LEARNING_POLICY_VERSION,
             "muestras_test": int(len(y_te)),
             "accuracy": round(acc * 100, 2),
@@ -792,6 +865,14 @@ class EntrenadorAgentes:
                 "max_approval_rate": round(self.max_approval_rate, 6),
                 "min_perdedoras_filtradas": round(self.min_perdedoras_filtradas, 6),
                 "max_balanced_accuracy_drop": round(self.max_balanced_accuracy_drop, 6),
+                "economic_validation": {
+                    "round_trip_cost_bps": self.round_trip_cost_bps,
+                    "min_accepted_test_trades": self.economic_min_trades,
+                    "min_expectancy_r": self.economic_min_expectancy_r,
+                    "min_profit_factor": self.economic_min_profit_factor,
+                    "max_drawdown_r": self.economic_max_drawdown_r,
+                    "min_net_r_lift": self.economic_min_net_r_lift,
+                },
             },
             "automatic_retraining": bool(automatic),
             "production_activation_allowed": bool(allow_production_activation),
@@ -1154,11 +1235,62 @@ class EntrenadorAgentes:
         with self._lock:
             production_loaded = set(self._modelos)
             shadow_loaded = set(self._modelos_shadow)
-        return self.retraining.snapshot(
+        rows = self.retraining.snapshot(
             tickers,
             production_model_loaded=lambda ticker: ticker in production_loaded,
             shadow_model_loaded=lambda ticker: ticker in shadow_loaded,
         )
+        prepared = self._training_rows_for_status()
+        minimum = max(self.min_muestras, next(
+            (n for n in range(1, max(1000, self.min_muestras * 5))
+             if self._chronological_split_sizes(n, automatic=True) is not None),
+            self.auto_min_fit_samples + self.auto_min_validation_samples + self.auto_min_test_samples))
+        for row in rows:
+            ticker = str(row.get("ticker", "")).upper()
+            group = prepared[prepared["ticker"] == ticker] if "ticker" in prepared else prepared
+            ready = False
+            reason = ""
+            if len(group) < minimum:
+                reason = f"Faltan {minimum - len(group)} cierres con features válidas (mínimo {minimum})"
+            else:
+                blocks = self._causal_blocks(group, automatic=True)
+                if blocks is None:
+                    reason = "Muestras insuficientes tras excluir cierres posteriores a validación/TEST"
+                elif any(block["ganadora"].nunique() < 2 for block in blocks[:3]):
+                    reason = "FIT, validación y TEST necesitan ganadoras y perdedoras"
+                else:
+                    ready = True
+                    reason = "Datos listos; candidato pendiente de evaluación"
+                    if not blocks[4]["temporal_integrity_passed"]:
+                        reason += "; cierres antiguos sin fecha de resolución: sólo evidencia SHADOW"
+            row["training_readiness"] = {
+                "ready": ready, "reason": reason,
+                "min_samples": int(minimum), "eligible_samples": len(group),
+            }
+        return rows
+
+    def _training_rows_for_status(self) -> pd.DataFrame:
+        """Reuse prepared evidence between polls while the feedback file is unchanged."""
+        def signature():
+            try:
+                stat = os.stat(self.feedback_path)
+                return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+            except OSError:
+                return None
+        current = signature()
+        with self._lock:
+            if current == self._status_feedback_signature:
+                return self._status_feedback_rows
+        try:
+            prepared = self._prepare_training_rows(pd.read_csv(self.feedback_path))
+        except Exception:
+            # Never cache a transient partial append or read error.
+            return pd.DataFrame()
+        if signature() == current:
+            with self._lock:
+                self._status_feedback_rows = prepared
+                self._status_feedback_signature = current
+        return prepared
 
     # =========================================================
     # PERSISTENCIA (un archivo por ticker)
@@ -1207,13 +1339,15 @@ class EntrenadorAgentes:
             "precision_lift": precision - base_win_rate,
         }
 
-    def _seleccionar_umbral(self, y_val, probabilidades) -> Tuple[float, dict]:
-        """Selecciona umbral SOLO en validación mediante balanced accuracy.
+    def _seleccionar_umbral(self, y_val, probabilidades, *, net_returns=None) -> Tuple[float, dict]:
+        """Selecciona umbral SOLO en validación usando retornos netos conocidos.
 
         Se evita un umbral degenerado que apruebe casi cero señales. El test
         cronológico posterior no participa en esta selección.
         """
         probs = np.asarray(probabilidades, dtype=float)
+        returns = np.asarray(net_returns, dtype=float) if net_returns is not None else None
+        economic_available = bool(returns is not None and np.isfinite(returns).all())
         candidatos = np.unique(np.concatenate([
             np.linspace(0.05, 0.95, 91),
             np.quantile(probs, np.linspace(0.05, 0.95, 19)),
@@ -1233,11 +1367,18 @@ class EntrenadorAgentes:
                 continue
             # Balanced accuracy es el criterio principal; precision y recall
             # rompen empates sin convertir "aprobar casi nada" en una ventaja.
-            score = (
+            classification_score = (
                 m["balanced_accuracy"],
                 m["precision_lift"],
                 m["recall"],
             )
+            if economic_available:
+                economic = economic_metrics(returns, probs, float(umbral), self.round_trip_cost_bps)
+                # Maximize aggregate net validation R with useful coverage.
+                # TEST outcomes never participate in threshold selection.
+                score = (economic["net_r"], *classification_score)
+            else:
+                score = classification_score
             if mejor is None or score > mejor:
                 mejor = score
                 mejor_umbral = float(umbral)

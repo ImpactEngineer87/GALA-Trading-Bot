@@ -15,6 +15,8 @@ import pickle
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Optional
 
+from agents.learning_dataset import LEARNING_POLICY_VERSION
+
 
 class ModelPromotionError(RuntimeError):
     """Raised when a Shadow candidate cannot be safely promoted."""
@@ -98,6 +100,15 @@ def _inspect_shadow_base(
                 )
             else:
                 gate_errors.append("production_gate_passed no es true")
+        # Installed production artifacts remain runtime-compatible. A NEW
+        # normal promotion must carry the current learning/economic evidence;
+        # an old classification-only PASS must not bypass the new policy.
+        if meta.get("learning_policy_version") != LEARNING_POLICY_VERSION:
+            gate_errors.append("requiere nueva evaluación con política de aprendizaje vigente")
+        for evidence in ("economic_gate_passed", "cost_label_integrity_passed",
+                         "temporal_integrity_passed", "validation_test_actual_only"):
+            if meta.get(evidence) is not True:
+                gate_errors.append(f"{evidence} no es true")
         try:
             meta_feature_version = int(meta.get("feature_version", -1))
         except (TypeError, ValueError):
@@ -181,6 +192,9 @@ def _inspect_shadow_base(
         "production_gate_passed": (
             bool(meta.get("production_gate_passed")) if meta else False
         ),
+        "economic_test": dict(meta.get("economic_test") or {}),
+        "economic_gate_passed": meta.get("economic_gate_passed"),
+        "learning_policy_version": meta.get("learning_policy_version"),
         "feature_version": meta.get("feature_version") if meta else None,
         "training_policy_version": (
             meta.get("training_policy_version") if meta else None

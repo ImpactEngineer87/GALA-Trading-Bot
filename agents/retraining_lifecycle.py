@@ -16,11 +16,15 @@ import re
 import stat
 import tempfile
 import threading
+import uuid
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional
 
+from agents.learning_dataset import summarize_closed_trades
 
-STATE_SCHEMA_VERSION = 3
+
+STATE_SCHEMA_VERSION = 4
+_PROCESS_TOKEN = uuid.uuid4().hex
 
 
 def _utc_now() -> str:
@@ -49,6 +53,7 @@ class RetrainingLifecycle:
         self._feedback_cache_counts: Dict[str, int] = {}
         self._feedback_cache_quarantined: Dict[str, int] = {}
         self._feedback_cache_lifetime: Dict[str, int] = {}
+        self._feedback_cache_sources: Dict[str, dict] = {}
         self._feedback_available = False
         self._feedback_integrity_schema = False
         self._loaded_state_schema_version = 1
@@ -136,6 +141,8 @@ class RetrainingLifecycle:
             record["status"] = "TRAINING"
             record["pending"] = True
             record["training_started_utc"] = _utc_now()
+            record["training_owner_pid"] = os.getpid()
+            record["training_owner_token"] = _PROCESS_TOKEN
             self.history.append({'event': 'CANDIDATE_TRAINING', 'ticker': ticker,
                                  'total_observations': int(total_count)})
             self._save_state_locked()
@@ -179,6 +186,8 @@ class RetrainingLifecycle:
             )
             record["last_reason"] = error or reason or ""
             record["training_started_utc"] = ""
+            record["training_owner_pid"] = None
+            record["training_owner_token"] = ""
             record["pending"] = False
             record["status"] = "COLLECTING"
             if accepted:
@@ -194,6 +203,7 @@ class RetrainingLifecycle:
                 key in metrics for key in (
                     "evaluation_id", "balanced_accuracy", "decision_threshold",
                     "production_gate_passed", "shadow_candidate_accepted",
+                    "economic_test", "economic_gate_passed",
                 )
             )
             if has_evaluation:
@@ -287,6 +297,34 @@ class RetrainingLifecycle:
                 record["last_production_gate_policy"] = (
                     dict(policy) if isinstance(policy, dict) else {}
                 )
+                # Keep source mix and economic evidence from this exact run.
+                # Replacing the snapshot clears missing fields instead of mixing
+                # a new classification score with an older profitability result.
+                evaluation_fields = (
+                    "evaluation_id", "evaluation_utc", "muestras_fit",
+                    "muestras_fit_reales", "muestras_fit_suplementarias",
+                    "validation_test_actual_only", "economic_test",
+                    "economic_gate_passed", "economic_reasons",
+                    "cost_label_integrity_passed",
+                    "temporal_integrity_passed",
+                )
+                record["last_evaluation"] = {
+                    key: metrics.get(key) for key in evaluation_fields
+                }
+                record["economic_test"] = (
+                    dict(metrics["economic_test"])
+                    if isinstance(metrics.get("economic_test"), dict) else {}
+                )
+                record["economic_gate_passed"] = metrics.get("economic_gate_passed")
+                record["economic_reasons"] = list(metrics.get("economic_reasons") or [])
+                record["temporal_integrity_passed"] = metrics.get("temporal_integrity_passed")
+                record["muestras_fit_reales"] = int(metrics.get(
+                    "muestras_fit_reales", metrics.get("muestras_fit", 0)
+                ) or 0)
+                record["muestras_fit_suplementarias"] = int(
+                    metrics.get("muestras_fit_suplementarias", 0) or 0
+                )
+                record["validation_test_actual_only"] = metrics.get("validation_test_actual_only")
 
             if not deferred:
                 record["last_model_saved"] = bool(
@@ -399,6 +437,14 @@ class RetrainingLifecycle:
                         )
                     ),
                     "feedback_available": bool(self._feedback_available),
+                    **{
+                        key: int(self._feedback_cache_sources.get(ticker, {}).get(
+                            key, record.get(key, 0)
+                        )) for key in (
+                            "eligible_closed_real", "eligible_closed_paper",
+                            "eligible_closed_legacy", "duplicate_closed_rows",
+                        )
+                    },
                 })
                 rows.append(record)
         return rows
@@ -513,6 +559,16 @@ class RetrainingLifecycle:
                 "last_production_gate_passed": None,
                 "last_production_gate_reasons": [],
                 "last_production_gate_policy": {},
+                "last_evaluation": {},
+                "economic_test": {},
+                "economic_gate_passed": None,
+                "economic_reasons": [],
+                "temporal_integrity_passed": None,
+                "muestras_fit_reales": 0,
+                "muestras_fit_suplementarias": 0,
+                "validation_test_actual_only": None,
+                "training_owner_pid": None,
+                "training_owner_token": "",
                 "last_model_saved": bool(metadata_samples is not None),
                 "counting_basis": (
                     "execution_valid" if self._feedback_integrity_schema
@@ -545,6 +601,17 @@ class RetrainingLifecycle:
                 record["counter_rebase_reason"] = (
                     "V2_9_EXECUTION_VALID_EPOCH"
                 )
+            elif self._feedback_available and last_attempt > total_count:
+                # Identity deduplication can reduce an old raw-row counter.
+                # Keep completed work consumed while preventing progress from
+                # being stuck below a counter that no longer exists.
+                record["legacy_last_attempt_count"] = last_attempt
+                record["last_attempt_count"] = total_count
+                record["last_success_count"] = min(
+                    total_count, max(0, int(record.get("last_success_count", 0)))
+                )
+                record["counter_rebased_utc"] = _utc_now()
+                record["counter_rebase_reason"] = "UNIQUE_ELIGIBLE_CLOSES"
             record["total_observations"] = total_count
             record.setdefault("last_attempt_count", total_count)
             record.setdefault("last_success_count", record["last_attempt_count"])
@@ -573,6 +640,14 @@ class RetrainingLifecycle:
             record.setdefault("last_production_gate_passed", None)
             record.setdefault("last_production_gate_reasons", [])
             record.setdefault("last_production_gate_policy", {})
+            for key, default in (
+                ("last_evaluation", {}), ("economic_test", {}),
+                ("economic_gate_passed", None), ("economic_reasons", []),
+                ("temporal_integrity_passed", None), ("muestras_fit_reales", 0),
+                ("muestras_fit_suplementarias", 0), ("validation_test_actual_only", None),
+                ("training_owner_pid", None), ("training_owner_token", ""),
+            ):
+                record.setdefault(key, default)
             record.setdefault("last_model_saved", False)
             record["counting_basis"] = (
                 "execution_valid" if self._feedback_integrity_schema
@@ -592,8 +667,66 @@ class RetrainingLifecycle:
                 ),
             )
         )
+        for key in (
+            "eligible_closed_real", "eligible_closed_paper",
+            "eligible_closed_legacy", "duplicate_closed_rows",
+        ):
+            record[key] = int(self._feedback_cache_sources.get(ticker, {}).get(
+                key, record.get(key, 0)
+            ))
+        self._recover_interrupted_training(record)
         self._recompute_status(record)
         return record
+
+    @staticmethod
+    def _recover_interrupted_training(record: dict) -> None:
+        """Release a persisted job only when its owner is demonstrably gone.
+
+        Dashboard reads never write this recovery. A live training process keeps
+        ownership even if its job takes longer than expected.
+        """
+        if record.get("status") != "TRAINING":
+            return
+        try:
+            owner_pid = int(record.get("training_owner_pid") or 0)
+        except (TypeError, ValueError):
+            owner_pid = 0
+        owner_token = str(record.get("training_owner_token", "") or "")
+        interrupted = False
+        if owner_pid == os.getpid() and owner_token:
+            interrupted = owner_token != _PROCESS_TOKEN
+        elif owner_pid > 0 and os.name == "posix":
+            try:
+                os.kill(owner_pid, 0)
+            except ProcessLookupError:
+                interrupted = True
+            except PermissionError:
+                return
+            except OSError:
+                return
+        elif owner_pid > 0:
+            # On Windows os.kill(pid, 0) can terminate the target process.
+            # Recover conservatively only from explicit process evidence.
+            return
+        else:
+            # Older builds never recorded ownership. Wait six hours before
+            # treating an unowned legacy job as abandoned.
+            try:
+                started = datetime.fromisoformat(str(record.get("training_started_utc", "")))
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=timezone.utc)
+                interrupted = (datetime.now(timezone.utc) - started).total_seconds() >= 6 * 3600
+            except (TypeError, ValueError):
+                interrupted = False
+        if interrupted:
+            record["status"] = "COLLECTING"
+            record["pending"] = False
+            record["training_started_utc"] = ""
+            record["training_owner_pid"] = None
+            record["training_owner_token"] = ""
+            record["last_result"] = "INTERRUPTED"
+            record["last_reason"] = "Previous training process exited; observations remain pending"
+            record["training_recovered_utc"] = _utc_now()
 
     def _recompute_status(self, record: dict) -> None:
         total = max(0, int(record.get("total_observations", 0)))
@@ -643,21 +776,16 @@ class RetrainingLifecycle:
                 self._feedback_integrity_schema = bool(
                     reader.fieldnames and "execution_valid" in reader.fieldnames
                 )
-                for row in reader:
-                    ticker = str(row.get("ticker", "") or "").upper()
-                    if not ticker:
-                        continue
-                    lifetime[ticker] = lifetime.get(ticker, 0) + 1
-                    valid = row.get("execution_valid")
-                    if valid not in (None, "") and str(valid) != "1":
-                        quarantined[ticker] = quarantined.get(ticker, 0) + 1
-                        continue
-                    counts[ticker] = counts.get(ticker, 0) + 1
+                sources = summarize_closed_trades(list(reader), fieldnames=reader.fieldnames)
+                counts = {ticker: row["eligible_observations"] for ticker, row in sources.items()}
+                quarantined = {ticker: row["quarantined_observations"] for ticker, row in sources.items()}
+                lifetime = {ticker: row["lifetime_observations"] for ticker, row in sources.items()}
             with self._lock:
                 self._feedback_cache_signature = signature
                 self._feedback_cache_counts = dict(counts)
                 self._feedback_cache_quarantined = dict(quarantined)
                 self._feedback_cache_lifetime = dict(lifetime)
+                self._feedback_cache_sources = dict(sources)
                 self._feedback_available = True
         except Exception:
             self._feedback_available = False

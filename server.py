@@ -4492,6 +4492,10 @@ def ai_retraining_status():
                 prod_meta.get("manual_override_gate_errors") or []
             )
         summary = {
+            "eligible_closed_real": sum(int(r.get("eligible_closed_real", 0) or 0) for r in rows),
+            "eligible_closed_paper": sum(int(r.get("eligible_closed_paper", 0) or 0) for r in rows),
+            "eligible_closed_legacy": sum(int(r.get("eligible_closed_legacy", 0) or 0) for r in rows),
+            "training_ready": sum(bool((r.get("training_readiness") or {}).get("ready")) for r in rows),
             "collecting": sum(r.get("status") == "COLLECTING" for r in rows),
             "ready_review": sum(r.get("status") == "READY_REVIEW" for r in rows),
             "pending": sum(r.get("status") == "PENDING_RETRAIN" for r in rows),
@@ -4528,6 +4532,15 @@ def ai_retraining_status():
             "auto_activate_production": bool(trainer.auto_activate_production),
             "warning_samples": int(trainer.retrain_warning_samples),
             "retrain_samples": int(trainer.retrain_trigger_samples),
+            "learning_policy": {
+                "closed_trade_sources": ["REAL", "PAPER"],
+                "resolved_signals_fit_only": True,
+                "signal_weight": float(trainer.signal_learning_weight),
+                "signal_max_fit_ratio": float(trainer.signal_learning_max_ratio),
+                "validation_test_actual_only": True,
+                "round_trip_cost_bps": float(trainer.round_trip_cost_bps),
+                "min_accepted_test_trades": int(trainer.economic_min_trades),
+            },
             "summary": summary,
             "tickers": rows,
         })

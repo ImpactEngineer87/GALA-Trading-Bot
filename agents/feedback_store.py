@@ -23,7 +23,7 @@ import os
 import csv
 import json
 import shutil
-import threading
+import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +32,10 @@ from typing import Dict, Optional
 from agents.contracts import DecisionFinal
 from agents.gala10_features import GALA10_FEATURE_NAMES
 from agents.volume_features import VOLUME_FEATURE_NAMES
+from agents.learning_dataset import (
+    eligible_closed_rows, observation_identity, summarize_closed_trades,
+)
+from core.runtime_store import path_lock
 
 
 import math
@@ -48,7 +52,7 @@ LEGACY_COLUMNAS = [
     "precio_entrada", "precio_salida", "r_multiple", "ganadora",
 ]
 
-COLUMNAS = [
+V2_9_COLUMNAS = [
     "feedback_id", "execution_id", "position_id", "signal_id",
     "reversal_id", "correlation_id", "entry_signal_id", "exit_signal_id",
     "entry_reversal_id", "exit_reversal_id", "entry_correlation_id",
@@ -60,6 +64,8 @@ COLUMNAS = [
     "slippage_linked", "execution_valid", "exclusion_reason",
     *LEGACY_COLUMNAS,
 ]
+
+COLUMNAS = [*V2_9_COLUMNAS, "closed_utc", "risk_per_share"]
 
 
 def _csv_num(x):
@@ -138,15 +144,20 @@ class FeedbackStore:
 
     def __init__(self, ruta_csv: str = "data/agentes_feedback.csv"):
         self.ruta_csv = ruta_csv
-        self._lock = threading.Lock()
+        self._lock = path_lock(ruta_csv)
         # v2.9.3: las aperturas de aprendizaje ya no viven solo en RAM. El sidecar
         # permite cerrar correctamente una operación después de reiniciar el
         # server sin perder su observación PAPER/REAL ni el progreso x/50.
         self._open_state_path = Path(str(ruta_csv) + ".open.json")
         self._abiertas: Dict[str, dict] = {}
-        self._verificar_esquema()
-        self._cargar_abiertas_persistidas()
-        self._cerradas_totales = self._contar_filas()
+        self._closed_rows = []
+        self._closed_by_identity = {}
+        self._closed_by_feedback_id = {}
+        with self._lock:
+            self._verificar_esquema()
+            self._reload_closed_locked()
+            self._cargar_abiertas_persistidas()
+            self._cerradas_totales = self._contar_filas()
 
     def _verificar_esquema(self):
         """Si ya existe un CSV con la cabecera de un esquema ANTERIOR (p. ej. de
@@ -156,9 +167,20 @@ class FeedbackStore:
         if not os.path.exists(self.ruta_csv):
             return
         try:
-            with open(self.ruta_csv, "r", encoding="utf-8", newline="") as f:
+            with open(self.ruta_csv, "r", encoding="utf-8-sig", newline="") as f:
                 primera = f.readline().strip()
             if primera == ",".join(COLUMNAS):
+                return
+            if primera == ",".join(V2_9_COLUMNAS):
+                # Adding outcome availability/risk must preserve the verified
+                # learning history and existing counters. Unknown historical
+                # close times remain empty instead of being invented at upgrade.
+                with open(self.ruta_csv, "r", encoding="utf-8-sig", newline="") as f:
+                    rows = list(csv.DictReader(f))
+                backup = self.ruta_csv + ".before_closed_utc"
+                if not os.path.exists(backup):
+                    shutil.copy2(self.ruta_csv, backup)
+                self._rewrite_schema(rows)
                 return
             if primera == ",".join(LEGACY_COLUMNAS):
                 with open(self.ruta_csv, "r", encoding="utf-8-sig", newline="") as f:
@@ -218,7 +240,62 @@ class FeedbackStore:
                 os.rename(self.ruta_csv, bak)
                 print(f"[Feedback] CSV con esquema anterior → archivado en '{bak}', se arranca limpio")
         except Exception as e:
-            print(f"[Feedback] No se pudo verificar el esquema del CSV: {e}")
+            # Continuing with a mismatched header would silently corrupt labels.
+            raise RuntimeError(f"No se pudo verificar el esquema del feedback: {e}") from e
+
+    def _rewrite_schema(self, rows) -> None:
+        directory = os.path.dirname(self.ruta_csv) or "."
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="", dir=directory,
+                prefix=".feedback-schema-", suffix=".tmp", delete=False,
+            ) as handle:
+                temporary = handle.name
+                writer = csv.DictWriter(handle, fieldnames=COLUMNAS)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow({column: row.get(column, "") for column in COLUMNAS})
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary, os.stat(self.ruta_csv).st_mode & 0o777)
+            os.replace(temporary, self.ruta_csv)
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def _reload_closed_locked(self) -> None:
+        if not os.path.exists(self.ruta_csv):
+            self._closed_rows = []
+        else:
+            with open(self.ruta_csv, "r", encoding="utf-8-sig", newline="") as handle:
+                # An interrupted append must never be mistaken for a committed
+                # close merely because its leading identity columns were written.
+                self._closed_rows = [
+                    dict(row) for row in csv.DictReader(handle)
+                    if None not in row and all(value is not None for value in row.values())
+                ]
+        self._closed_by_identity = {}
+        self._closed_by_feedback_id = {}
+        for row in self._closed_rows:
+            identity = observation_identity(row)
+            if identity is not None:
+                self._closed_by_identity[identity] = row
+            feedback_id = str(row.get("feedback_id", "") or "").strip()
+            if feedback_id:
+                self._closed_by_feedback_id[feedback_id] = row
+
+    @staticmethod
+    def _pending_identity(ticker: str, pending: dict):
+        return observation_identity({
+            **dict(pending.get("lifecycle") or {}), "ticker": ticker,
+        })
+
+    def _committed_close(self, ticker: str, pending: dict):
+        identity = self._pending_identity(ticker, pending)
+        if identity is not None and identity in self._closed_by_identity:
+            return self._closed_by_identity[identity]
+        return self._closed_by_feedback_id.get(str(pending.get("feedback_id", "") or ""))
 
     # ---------------------------------------------------------
     @staticmethod
@@ -243,12 +320,13 @@ class FeedbackStore:
     def _persistir_abiertas_locked(self) -> None:
         self._open_state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": "2.9.3",
+            "version": "4.1",
             "updated_utc": datetime.now(timezone.utc).isoformat(),
             "open": {},
         }
         for ticker, pending in self._abiertas.items():
             payload["open"][ticker] = self._json_safe({
+                "feedback_id": pending.get("feedback_id"),
                 "features": pending.get("features") or {},
                 "precio_entrada": pending.get("precio_entrada"),
                 "stop_loss": pending.get("stop_loss"),
@@ -256,16 +334,24 @@ class FeedbackStore:
                 "lifecycle": pending.get("lifecycle") or {},
                 "tipo": pending.get("tipo"),
                 "timestamp": pending.get("timestamp"),
+                "closing_row": pending.get("closing_row"),
             })
-        tmp = self._open_state_path.with_suffix(self._open_state_path.suffix + ".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
-            fh.flush()
-            try:
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self._open_state_path.parent,
+                prefix=f".{self._open_state_path.name}.", suffix=".tmp", delete=False,
+            ) as fh:
+                tmp = fh.name
+                json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+                fh.flush()
                 os.fsync(fh.fileno())
-            except OSError:
-                pass
-        os.replace(tmp, self._open_state_path)
+            if self._open_state_path.exists():
+                os.chmod(tmp, self._open_state_path.stat().st_mode & 0o777)
+            os.replace(tmp, self._open_state_path)
+        finally:
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
 
     def _cargar_abiertas_persistidas(self) -> None:
         if not self._open_state_path.exists():
@@ -282,7 +368,8 @@ class FeedbackStore:
                 tipo = str(pending.get("tipo", "") or "").strip().upper()
                 if not tk or tipo not in ("BUY", "SELL"):
                     continue
-                self._abiertas[tk] = {
+                restored = {
+                    "feedback_id": str(pending.get("feedback_id", "") or uuid.uuid4().hex),
                     "features": dict(pending.get("features") or {}),
                     "decision": None,
                     "precio_entrada": float(pending.get("precio_entrada") or 0.0),
@@ -294,12 +381,30 @@ class FeedbackStore:
                     "lifecycle": dict(pending.get("lifecycle") or {}),
                     "tipo": tipo,
                     "timestamp": str(pending.get("timestamp", "") or ""),
+                    "closing_row": (
+                        dict(pending["closing_row"])
+                        if isinstance(pending.get("closing_row"), dict) else None
+                    ),
                 }
+                # CSV append commits first; a crash before sidecar cleanup can
+                # leave a stale open. Never replay that already committed label.
+                if self._committed_close(tk, restored) is None:
+                    self._abiertas[tk] = restored
             if self._abiertas:
                 print(
                     "[Feedback] Aperturas de aprendizaje recuperadas: "
                     + ", ".join(sorted(self._abiertas))
                 )
+            # A close intent contains the already computed, verified outcome.
+            # Replaying it only writes learning evidence; it never contacts a
+            # broker or recomputes historical PnL using a new market price.
+            for ticker, pending in list(self._abiertas.items()):
+                row = pending.get("closing_row")
+                if isinstance(row, dict):
+                    try:
+                        self.cerrar(ticker, row.get("precio_salida"), lifecycle=None)
+                    except Exception as exc:
+                        print(f"[Feedback] {ticker}: cierre pendiente de persistencia: {exc}")
         except Exception as exc:
             print(f"[Feedback] No se pudo recuperar estado abierto: {exc}")
 
@@ -315,8 +420,13 @@ class FeedbackStore:
         prop = decision.propuesta
         riesgo_planificado = float(prop.riesgo_por_accion) if prop is not None else 0.0
         timestamp = decision.timestamp.isoformat() if decision.timestamp else ""
+        ticker = str(decision.ticker or "").strip().upper()
+        if not ticker:
+            return
         with self._lock:
-            self._abiertas[decision.ticker] = {
+            self._reload_closed_locked()
+            pending = {
+                "feedback_id": uuid.uuid4().hex,
                 "features": feats,
                 "decision": decision,
                 "precio_entrada": float(precio_entrada),
@@ -326,6 +436,24 @@ class FeedbackStore:
                 "tipo": str(decision.tipo or "").upper(),
                 "timestamp": timestamp,
             }
+            if self._committed_close(ticker, pending) is not None:
+                return
+            existing = self._abiertas.get(ticker)
+            if existing is not None:
+                closing_row = existing.get("closing_row")
+                if isinstance(closing_row, dict):
+                    # Retry a prior disk failure before accepting this next
+                    # position. Failure preserves the old evidence and surfaces.
+                    self.cerrar(ticker, closing_row.get("precio_salida"), lifecycle=None)
+                    existing = self._abiertas.get(ticker)
+                    if self._committed_close(ticker, pending) is not None:
+                        return
+            if existing is not None:
+                identity = self._pending_identity(ticker, pending)
+                if identity is not None and identity == self._pending_identity(ticker, existing):
+                    return
+                raise ValueError(f"{ticker}: apertura pendiente de aprendizaje; no se sobrescribe")
+            self._abiertas[ticker] = pending
             self._persistir_abiertas_locked()
 
     def cerrar(self, ticker: str, precio_salida: float,
@@ -334,12 +462,46 @@ class FeedbackStore:
         Cierra la operación del ticker, calcula el R múltiple real y
         persiste la fila completa en el CSV. Devuelve el registro o None.
         """
+        ticker = str(ticker or "").strip().upper()
         with self._lock:
-            pend = self._abiertas.pop(ticker, None)
-            if pend is not None:
+            pend = self._abiertas.get(ticker)
+            if pend is None:
+                return None
+            self._reload_closed_locked()
+            committed = self._committed_close(ticker, pend)
+            if committed is None:
+                fila = pend.get("closing_row")
+                if not isinstance(fila, dict):
+                    fila = self._construir_cierre(ticker, precio_salida, pend, lifecycle)
+                    if fila is not None:
+                        pend["closing_row"] = fila
+                if fila is None:
+                    return None
+                # Persist the immutable close intent before appending. The engine
+                # has already confirmed this outcome and may release its position,
+                # so recovery needs the outcome as well as the entry features.
                 self._persistir_abiertas_locked()
-        if pend is None:
-            return None
+                # Keep both RAM and durable open state until the CSV row has
+                # been flushed. Any append error therefore remains retryable.
+                self._persistir(fila)
+                self._reload_closed_locked()
+            else:
+                # Retrying after a sidecar failure must make no second CSV row.
+                # Re-flush an existing row before deleting its recovery evidence.
+                with open(self.ruta_csv, "r+b") as handle:
+                    os.fsync(handle.fileno())
+                fila = dict(committed)
+            self._cerradas_totales = len(eligible_closed_rows(self._closed_rows))
+            self._abiertas.pop(ticker, None)
+            try:
+                self._persistir_abiertas_locked()
+            except Exception:
+                self._abiertas[ticker] = pend
+                raise
+            return fila
+
+    def _construir_cierre(self, ticker: str, precio_salida: float, pend: dict,
+                         lifecycle: Optional[dict]) -> Optional[dict]:
 
         decision: Optional[DecisionFinal] = pend.get("decision")
         prop = decision.propuesta if decision is not None else None
@@ -400,9 +562,12 @@ class FeedbackStore:
         order_ids_valid = bool(opening.get("entry_order_id")) and (
             mode == "PAPER" or bool(closing.get("exit_order_id"))
         )
+        economic_valid = all(math.isfinite(float(value)) and float(value) > 0
+                             for value in (entrada, precio_salida, riesgo))
+        mode_valid = mode in ("REAL", "PAPER")
         execution_valid = int(
             required_ids and direction_valid and links_valid and broker_valid
-            and order_ids_valid
+            and order_ids_valid and economic_valid and mode_valid
         )
         reasons = []
         if not required_ids:
@@ -415,11 +580,15 @@ class FeedbackStore:
             reasons.append("BROKER_CONFIRMATION_MISSING")
         if not order_ids_valid:
             reasons.append("ORDER_ID_MISSING")
+        if not economic_valid:
+            reasons.append("INVALID_PRICE_OR_RISK")
+        if not mode_valid:
+            reasons.append("EXECUTION_MODE_INVALID")
         entry_reversal_id = str(opening.get("reversal_id", "") or "")
         exit_reversal_id = str(closing.get("reversal_id", "") or "")
 
         fila = {
-            "feedback_id": uuid.uuid4().hex,
+            "feedback_id": pend.get("feedback_id") or uuid.uuid4().hex,
             "execution_id": opening.get("execution_id", ""),
             "position_id": opening.get("position_id", ""),
             "signal_id": opening.get("signal_id", ""),
@@ -482,40 +651,32 @@ class FeedbackStore:
             "precio_salida": round(float(precio_salida), 4),
             "r_multiple": round(r_mult, 4),
             "ganadora": ganadora,
+            "closed_utc": str(closing.get("closed_utc") or datetime.now(timezone.utc).isoformat()),
+            "risk_per_share": round(float(riesgo), 8),
         }
-        self._persistir(fila)
-        if execution_valid:
-            with self._lock:
-                self._cerradas_totales += 1
         return fila
 
     def total_cerradas(self) -> int:
         with self._lock:
+            self._cerradas_totales = self._contar_filas()
             return self._cerradas_totales
 
     def total_cerradas_ticker(self, ticker: str) -> int:
         """Cuenta las operaciones cerradas de UN ticker (para el reentrenamiento
         del modelo individual de ese activo)."""
-        if not os.path.exists(self.ruta_csv):
-            return 0
         try:
-            import csv as _csv
-            n = 0
             with self._lock:
-                with open(self.ruta_csv, "r", encoding="utf-8", newline="") as f:
-                    for row in _csv.DictReader(f):
-                        valid = row.get("execution_valid")
-                        if row.get("ticker") == ticker and (
-                            valid in (None, "") or str(valid) == "1"
-                        ):
-                            n += 1
-            return n
+                self._reload_closed_locked()
+                summary = summarize_closed_trades(self._closed_rows)
+                return int(summary.get(str(ticker or "").strip().upper(), {}).get(
+                    "eligible_observations", 0
+                ))
         except Exception:
             return 0
 
     def tiene_abierta(self, ticker: str) -> bool:
         with self._lock:
-            return ticker in self._abiertas
+            return str(ticker or "").strip().upper() in self._abiertas
 
     # ---------------------------------------------------------
     def _persistir(self, fila: dict):
@@ -526,23 +687,33 @@ class FeedbackStore:
         # Chequeo de existencia y escritura de forma ATÓMICA bajo el lock, para
         # que dos hilos no escriban ambos la cabecera ni intercalen filas.
         with self._lock:
-            nuevo = not os.path.exists(self.ruta_csv)
-            with open(self.ruta_csv, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=COLUMNAS)
-                if nuevo:
-                    writer.writeheader()
-                writer.writerow(fila)
+            original_size = os.path.getsize(self.ruta_csv) if os.path.exists(self.ruta_csv) else 0
+            try:
+                with open(self.ruta_csv, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=COLUMNAS)
+                    if original_size == 0:
+                        writer.writeheader()
+                    writer.writerow(fila)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except Exception:
+                # Roll back any partial line on a handled I/O error. The open
+                # sidecar is still intact, so a later close can append cleanly.
+                try:
+                    with open(self.ruta_csv, "r+b") as f:
+                        f.truncate(original_size)
+                        f.flush()
+                        os.fsync(f.fileno())
+                except OSError:
+                    pass
+                raise
 
     def _contar_filas(self) -> int:
         if not os.path.exists(self.ruta_csv):
             return 0
         try:
-            with open(self.ruta_csv, "r", encoding="utf-8-sig", newline="") as f:
-                rows = list(csv.DictReader(f))
-            return sum(
-                1 for row in rows
-                if row.get("execution_valid") in (None, "")
-                or str(row.get("execution_valid")) == "1"
-            )
+            with self._lock:
+                self._reload_closed_locked()
+                return len(eligible_closed_rows(self._closed_rows))
         except Exception:
             return 0
