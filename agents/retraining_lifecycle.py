@@ -776,7 +776,9 @@ class RetrainingLifecycle:
                 self._feedback_integrity_schema = bool(
                     reader.fieldnames and "execution_valid" in reader.fieldnames
                 )
-                sources = summarize_closed_trades(list(reader), fieldnames=reader.fieldnames)
+                # DictReader is streamed: building a list of 291k wide rows
+                # caused multi-GB transient allocations during dashboard polls.
+                sources = summarize_closed_trades(reader, fieldnames=reader.fieldnames)
                 counts = {ticker: row["eligible_observations"] for ticker, row in sources.items()}
                 quarantined = {ticker: row["quarantined_observations"] for ticker, row in sources.items()}
                 lifetime = {ticker: row["lifetime_observations"] for ticker, row in sources.items()}
