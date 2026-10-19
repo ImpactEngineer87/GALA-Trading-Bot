@@ -1284,16 +1284,25 @@ class EntrenadorAgentes:
         with self._lock:
             if current == self._status_feedback_signature:
                 return self._status_feedback_rows
-        try:
-            prepared = self._prepare_training_rows(pd.read_csv(self.feedback_path))
-        except Exception:
-            # Never cache a transient partial append or read error.
-            return pd.DataFrame()
-        if signature() == current:
+
+        # Serialize expensive cache misses across concurrent /api/ai/status and
+        # /api/ticker-analysis calls. Recheck after acquiring the load lock:
+        # another request may have completed the refresh while we waited.
+        with self._status_feedback_load_lock:
+            current = signature()
             with self._lock:
-                self._status_feedback_rows = prepared
-                self._status_feedback_signature = current
-        return prepared
+                if current == self._status_feedback_signature:
+                    return self._status_feedback_rows
+            try:
+                prepared = self._prepare_training_rows(pd.read_csv(self.feedback_path))
+            except Exception:
+                # Never cache a transient partial append or read error.
+                return pd.DataFrame()
+            if signature() == current:
+                with self._lock:
+                    self._status_feedback_rows = prepared
+                    self._status_feedback_signature = current
+            return prepared
 
     # =========================================================
     # PERSISTENCIA (un archivo por ticker)
