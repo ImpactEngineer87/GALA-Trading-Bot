@@ -82,8 +82,12 @@ class EntrenadorAgentes:
 
     def __init__(self, config: dict):
         from core.model_identity import ManualRealAuthorization
+        from core.ai_threshold_override import AIThresholdOverrides
         self.manual_real_authorization = ManualRealAuthorization(
             (config.get('live_trading', {}) or {}).get('manual_authorization', {}) or {})
+        self.manual_threshold_overrides = AIThresholdOverrides(
+            (config.get('agents', {}) or {}).get('entrenamiento', {}).get(
+                'manual_threshold_overrides', {}) or {})
         self._production_snapshots = {}
         self._shadow_snapshots = {}
         agents_cfg = config.get("agents", {})
@@ -231,6 +235,26 @@ class EntrenadorAgentes:
         if modelo is None:
             # Sin artefacto aprobado no hay inferencia válida. En PAPER se deja
             # pasar para seguir recolectando ejemplos; en REAL se falla cerrado.
+            return (None, False) if requerir_modelo else (None, True)
+
+        # Manual policy affects only future decisions for this exact loaded
+        # model version. Read every time so the running engine sees changes.
+        try:
+            saved_override = self.manual_threshold_overrides.active(
+                ticker, decision.ai_model_snapshot.get('model_version'))
+            if saved_override:
+                model_threshold = umbral
+                umbral = float(saved_override['threshold'])
+                decision.ai_model_snapshot.update(
+                    model_threshold=model_threshold, threshold=umbral,
+                    threshold_source='MANUAL')
+            else:
+                decision.ai_model_snapshot.update(
+                    threshold=umbral, threshold_source='MODEL')
+        except Exception:
+            # Invalid or unreadable persisted override: block REAL, never
+            # silently fall back to a potentially weaker unknown policy.
+            decision.ai_inference_error = True
             return (None, False) if requerir_modelo else (None, True)
 
         if not self.activo and not requerir_modelo:
