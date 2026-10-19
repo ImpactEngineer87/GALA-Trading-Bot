@@ -1920,16 +1920,9 @@ class ChocoletraBot:
             if not ticker or tipo not in ("BUY", "SELL"):
                 return learning_row
 
-            threshold = None
-            trainer = getattr(self.orquestador, "entrenador", None)
-            if trainer is not None:
-                try:
-                    with trainer._lock:
-                        threshold = trainer._umbrales.get(
-                            ticker, trainer.umbral_meta
-                        )
-                except Exception:
-                    threshold = getattr(trainer, "umbral_meta", None)
+            # Audit the threshold used by this exact decision, rather than
+            # reading a mutable model setting after an operator changes it.
+            threshold = self._effective_ai_threshold(decision, ticker)
 
             hard_reason = str(getattr(decision, "hard_veto_reason", "") or "")
             reason = (
