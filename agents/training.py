@@ -186,6 +186,9 @@ class EntrenadorAgentes:
         self._lock = threading.Lock()
         self._status_feedback_signature = None
         self._status_feedback_rows = pd.DataFrame()
+        # Only one dashboard request may parse/prepare the full feedback CSV
+        # after it changes. Other requests wait for the refreshed cache.
+        self._status_feedback_load_lock = threading.Lock()
         self._modelos: Dict[str, object] = {}     # approved production models
         self._umbrales: Dict[str, float] = {}
         self._modelos_shadow: Dict[str, object] = {}
