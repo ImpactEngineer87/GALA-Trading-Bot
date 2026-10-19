@@ -3393,7 +3393,7 @@ function renderTickerExecution(){
         <td data-label="Ejecución"><select class="exec-mode-select" id="exec-mode-${escaped}" aria-label="Ejecución de ${escaped}"><option value="PAPER">PAPER</option><option value="REAL">REAL</option></select></td>
         <td data-label="Acciones por orden"><input class="exec-shares-input" id="exec-shares-${escaped}" type="number" min="1" step="1" inputmode="numeric" aria-label="Acciones de ${escaped}" aria-describedby="exec-quantity-note-${escaped}"><div class="exec-saved-value" id="exec-quantity-note-${escaped}"></div><button class="exec-cap-action" id="exec-raise-${escaped}" hidden>Ajustar máximo REAL ↑</button></td>
         <td data-label="Salida parcial"><span class="exec-muted" id="exec-plan-${escaped}"></span></td>
-        <td data-label="IA / modelo"><span id="exec-model-${escaped}" class="exec-model-badge"></span><div class="exec-ai-detail" id="exec-ai-${escaped}"></div><button class="btn btn-ghost btn-sm" id="exec-details-${escaped}">Ver modelo ↗</button></td>
+        <td data-label="IA / modelo"><span id="exec-model-${escaped}" class="exec-model-badge"></span><div class="exec-ai-detail" id="exec-ai-${escaped}"></div><div class="exec-row-actions" style="flex-wrap:wrap;gap:5px;margin-top:6px"><input class="exec-shares-input" style="width:74px" id="exec-threshold-${escaped}" type="number" min="30" max="95" step="1" aria-label="Umbral IA % de ${escaped}"><span class="exec-muted">%</span><button class="btn btn-blue btn-sm" id="exec-threshold-save-${escaped}">Aplicar IA</button><button class="btn btn-ghost btn-sm" id="exec-threshold-reset-${escaped}">Usar modelo</button></div><div class="exec-row-feedback" id="exec-threshold-note-${escaped}" role="status" aria-live="polite"></div><button class="btn btn-ghost btn-sm" id="exec-details-${escaped}">Ver modelo ↗</button></td>
         <td data-label="Cambios"><div class="exec-row-actions"><button class="btn btn-blue btn-sm" id="exec-save-${escaped}">Guardar</button><button class="btn btn-ghost btn-sm" id="exec-discard-${escaped}" hidden>Descartar</button></div><div class="exec-row-feedback" id="exec-feedback-${escaped}" role="status" aria-live="polite"></div><button class="exec-cap-action" id="exec-raise-tickers-${escaped}" hidden>Ajustar cupos REAL ↑</button></td>`;
       body.appendChild(tr);
       el('exec-mode-'+ticker).onchange=()=>updateExecShareLimit(ticker);
@@ -3404,6 +3404,8 @@ function renderTickerExecution(){
       el('exec-raise-'+ticker).onclick=()=>raiseRealShareLimitFor(ticker);
       el('exec-raise-tickers-'+ticker).onclick=raiseRealTickerLimit;
       el('exec-details-'+ticker).onclick=()=>showModelDetails(ticker);
+      el('exec-threshold-save-'+ticker).onclick=()=>updateManualAIThreshold(ticker,false);
+      el('exec-threshold-reset-'+ticker).onclick=()=>updateManualAIThreshold(ticker,true);
     }
     const draft=S.execDrafts[ticker];
     if(draft&&!draft.saving&&draft.base.updated_utc!==(row.updated_utc||'') && (draft.base.mode!==row.mode||Number(draft.base.shares)!==Number(row.shares)))draft.conflict=true;
@@ -3429,12 +3431,53 @@ function renderTickerExecution(){
     const ai=aiRowForTicker(ticker),production=!!ai?.production_model_loaded,shadow=!!ai?.shadow_model_loaded;
     const model=el('exec-model-'+ticker);model.className='exec-model-badge '+(production?'production':shadow?'shadow':'');
     model.textContent=production?(ai.production_manual_override?'● Producción · override':'● Producción'):shadow?'● En validación':'○ Sin modelo';
-    el('exec-ai-'+ticker).textContent=(ai?.production_threshold!=null?`Umbral ${(Number(ai.production_threshold)*100).toFixed(0)}% · `:'')+`Cierres IA ${aiCountText(ai?.new_observations)}/${aiCountText(ai?.retrain_samples)}`;
+    const currentThreshold=ai?.effective_threshold ?? ai?.production_threshold;
+    const modelThreshold=ai?.production_threshold;
+    const thresholdField=el('exec-threshold-'+ticker);
+    if(document.activeElement!==thresholdField && !S.thresholdSaving?.[ticker]){
+      thresholdField.value=currentThreshold==null?'':String(Math.round(Number(currentThreshold)*100));
+    }
+    thresholdField.disabled=!production||!!S.thresholdSaving?.[ticker];
+    el('exec-threshold-save-'+ticker).disabled=!production||!!S.thresholdSaving?.[ticker];
+    el('exec-threshold-reset-'+ticker).disabled=!production||ai?.manual_threshold==null||!!S.thresholdSaving?.[ticker];
+    executionMessage(el('exec-threshold-note-'+ticker),S.thresholdSaving?.[ticker]?'Aplicando…':(ai?.manual_threshold!=null?'Manual activo (siguiente señal)':'Umbral del modelo'), '');
+    el('exec-ai-'+ticker).textContent=(currentThreshold!=null?`Umbral efectivo ${(Number(currentThreshold)*100).toFixed(0)}% · modelo ${modelThreshold==null?'—':(Number(modelThreshold)*100).toFixed(0)+'%'} · `:'')+`Cierres IA ${aiCountText(ai?.new_observations)}/${aiCountText(ai?.retrain_samples)}`;
     const save=el('exec-save-'+ticker);save.disabled=running||saving||!draft||!!issue;save.textContent=saving?'Guardando…':'Guardar';
     const discard=el('exec-discard-'+ticker);discard.hidden=!draft;discard.disabled=saving;
     const notice=S.execNotices[ticker];
     executionMessage(el('exec-feedback-'+ticker),saving?'Validando y guardando…':draft?(draft.error||issue||'Cambios sin guardar'):(notice||'Sin cambios'),draft?.error||issue?'error':notice?'saved':'');
   }
+}
+async function updateManualAIThreshold(ticker,reset=false){
+  const ai=aiRowForTicker(ticker),model=ai?.production_model||{};
+  if(!model.loaded||!model.model_version){
+    toast('err','Umbral IA','Se requiere un modelo PRODUCTION cargado');return;
+  }
+  const field=el('exec-threshold-'+ticker);
+  const raw=String(field?.value??'').trim();
+  const percent=Number(raw);
+  if(!reset&&(!raw||!Number.isInteger(percent)||percent<30||percent>95)){
+    toast('err','Umbral IA','Introduzca un porcentaje entero entre 30 y 95');return;
+  }
+  const target=reset?'el umbral original del modelo':percent+'%';
+  if(!confirm(`¿Aplicar ${target} para ${ticker}? La próxima decisión IA usará el valor nuevo incluso con el motor activo. Las posiciones existentes y los límites de riesgo no cambian. El ajuste caduca al cambiar el modelo.`))return;
+  S.thresholdSaving??={};S.thresholdSaving[ticker]=true;renderTickerExecution();
+  try{
+    const url='/api/ai/threshold/'+encodeURIComponent(ticker);
+    const response=await api(url,reset?{method:'DELETE'}:{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        model_version:model.model_version,
+        threshold:percent/100,
+        reason:'Ajuste manual desde tabla de tickers'
+      })
+    });
+    const data=await response.json();
+    if(!response.ok||data.status!=='ok')throw new Error(data.message||'No se pudo guardar');
+    toast('ok','Umbral IA',`${ticker}: ${reset?'restaurado al modelo':percent+'%'} · próxima señal`);
+    await fetchAIStatus();
+  }catch(error){toast('err','Umbral IA',String(error.message||error));}
+  finally{delete S.thresholdSaving[ticker];renderTickerExecution();}
 }
 function updateExecShareLimit(ticker){
   const row=execSavedRow(ticker),mode=el('exec-mode-'+ticker),shares=el('exec-shares-'+ticker);
