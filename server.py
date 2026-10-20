@@ -4368,12 +4368,14 @@ def _ai_trainer_for_status_locked():
     if _ENGINE is not None and BOT_STATE.get('running'):
         return _ENGINE.orquestador.entrenador
     from pathlib import Path
+    from core.project_paths import resolve_runtime_path
     cfg = _read_config_runtime()
     ent = cfg.get('agents', {}).get('entrenamiento', {})
     shadow = cfg.get('agents', {}).get('shadow_mode', {})
     signature = []
-    for root in [ent.get('modelos_dir', 'data/modelos'), shadow.get('modelos_dir', 'data/modelos_shadow')]:
-        for path in sorted(Path(root).glob('modelo_*')):
+    for raw_root in [ent.get('modelos_dir', 'data/modelos'), shadow.get('modelos_dir', 'data/modelos_shadow')]:
+        root = Path(resolve_runtime_path(raw_root))
+        for path in sorted(root.glob('modelo_*')):
             if path.is_file() and path.suffix in ('.pkl', '.json'):
                 stat = path.stat()
                 signature.append((str(path), stat.st_mtime_ns, stat.st_size))
