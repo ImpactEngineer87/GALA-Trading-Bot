@@ -4458,6 +4458,13 @@ def ai_retraining_status():
             except Exception:
                 prod_meta = {}
             row["production_model"] = trainer.production_snapshot(ticker) if hasattr(trainer, "production_snapshot") else {}
+            # Explicit, read-only deployment diagnostics. Never mark missing or
+            # incompatible artifacts as approved; REAL remains fail-closed.
+            loaded = bool(row["production_model"].get("loaded"))
+            issues = getattr(trainer, "model_load_errors", {}) or {}
+            row["production_model_issue"] = (
+                "" if loaded else str(issues.get(ticker) or "modelo de producción no encontrado")
+            )
             shadow_model = trainer.shadow_snapshot(ticker) if hasattr(trainer, "shadow_snapshot") else {}
             row["shadow_model"] = shadow_model
             # v3.3.4: historical score of the SHADOW artifact that is currently
