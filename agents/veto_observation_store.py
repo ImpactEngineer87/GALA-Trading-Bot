@@ -20,6 +20,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from core.project_paths import resolve_runtime_path
 from typing import Dict, Iterable, List, Optional
 
 
@@ -88,7 +89,7 @@ class VetoObservationStore:
         enabled: bool = True,
         max_bars: int = 120,
     ):
-        self.path = Path(path)
+        self.path = Path(resolve_runtime_path(path))
         self.enabled = bool(enabled)
         self.max_bars = max(1, int(max_bars or 120))
         self.state_path = Path(str(self.path) + ".open.json")
