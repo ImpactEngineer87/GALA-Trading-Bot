@@ -63,6 +63,15 @@ class ModelPreservationTests(unittest.TestCase):
             ["modelo_UAL.meta.json", "modelo_UAL.pkl"],
         )
 
+    def test_read_only_inventory_detects_renamed_model(self):
+        from scripts.audit_model_artifacts import inspect_model_directory
+        archived = self.models / "modelo_AMD.pkl.incompatible_20261019T120000Z"
+        archived.write_bytes(b"retained original")
+        snapshot = inspect_model_directory(self.models, ["AMD"])
+        self.assertEqual(snapshot["AMD"][0], "MISSING_PKL")
+        self.assertEqual(snapshot["AMD"][1], [archived])
+        self.assertEqual(archived.read_bytes(), b"retained original")
+
     def test_compatible_model_still_loads_with_unchanged_threshold(self):
         model = self.models / "modelo_RCL.pkl"
         meta = self.models / "modelo_RCL.meta.json"
