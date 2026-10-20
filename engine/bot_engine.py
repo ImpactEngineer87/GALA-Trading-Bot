@@ -49,6 +49,7 @@ from core.time_logic import MotorTemporal, CruceMACD
 from core.order_audit import OrderAuditLedger
 from core.execution_quality import ExecutionQualityLedger
 from core.daily_loss_guard import DailyLossGuard
+from core.memory_diagnostics import memory_usage_mib
 from core.ticker_execution import TickerExecutionRegistry
 from core.live_capacity import RealCapacityManager, max_real_tickers
 from core.runtime_reliability import effective_ai_threshold
@@ -102,6 +103,8 @@ class ChocoletraBot:
     def __init__(self, config_path: str = "config.yaml"):
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
+        self._last_memory_health_log = 0.0
+        self._last_memory_health_warning = 0.0
 
         audit_path = self.config.get("logging", {}).get(
             "auditoria_ordenes", "data/auditoria_ordenes.csv")
@@ -1210,6 +1213,7 @@ class ChocoletraBot:
 
                     self._emit_log("INFO", f"Ciclo | {len(self.tickers)} activos | "
                                            f"{self._ahora_et().strftime('%H:%M:%S')} NY")
+                    self._memory_health("cycle_start")
 
                     # La pérdida diaria se evalúa ANTES de lanzar workers. Si ya
                     # quedó bloqueado (incluido tras reinicio), el motor permanece
@@ -1242,6 +1246,7 @@ class ChocoletraBot:
                                 futuro.result()
                             except Exception as e:
                                 self._emit_log("ERROR", f"Error inesperado en {ticker}: {e}")
+                    self._memory_health("cycle_end")
                 except _DailyLossCycleBlocked:
                     pass
                 except Exception as e:
@@ -1266,6 +1271,32 @@ class ChocoletraBot:
             self._emit_log("INFO", "Bot detenido por el usuario (Ctrl-C)")
         finally:
             self.detener()
+
+    def _memory_health(self, stage: str) -> None:
+        """Log trend information without changing order routing or stop state.
+
+        Above 3.5 GiB report at most once every two minutes; otherwise every
+        five minutes. This records cycle boundaries without generating extra
+        trading orders, exiting threads, or interfering with kill switches.
+        """
+        rss_mib, peak_mib = memory_usage_mib()
+        if rss_mib is None:
+            return
+        now = time.monotonic()
+        if rss_mib >= 3584.0:
+            if now - getattr(self, "_last_memory_health_warning", 0) < 120:
+                return
+            self._last_memory_health_warning = now
+            level = "WARN"
+        else:
+            if now - getattr(self, "_last_memory_health_log", 0) < 300:
+                return
+            level = "INFO"
+        self._last_memory_health_log = now
+        self._emit_log(
+            level,
+            f"[MEMORY] {stage} rss_mib={rss_mib:.0f} peak_mib={float(peak_mib or 0):.0f}"
+        )
 
     def detener(self, fin_sesion: Optional[bool] = None):
         """Serialized stop with recoverable emergency-flatten retries.
