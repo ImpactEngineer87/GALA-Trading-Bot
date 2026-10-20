@@ -8,6 +8,7 @@ import math
 import re
 
 from core.runtime_store import EventHistory, JsonState
+from core.project_paths import resolve_runtime_path
 
 
 _TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,9}$")
@@ -35,10 +36,10 @@ def normalize_ticker(ticker):
 class AIThresholdOverrides:
     def __init__(self, config=None):
         config = config or {}
-        self.state = JsonState(config.get("state_path", "data/ai_threshold_overrides.json"))
-        self.history = EventHistory(config.get(
+        self.state = JsonState(resolve_runtime_path(config.get("state_path", "data/ai_threshold_overrides.json")))
+        self.history = EventHistory(resolve_runtime_path(config.get(
             "audit_path", "data/ai_threshold_overrides_audit.jsonl"
-        ))
+        )))
 
     def active(self, ticker, model_version):
         """Read persisted override on each decision, without engine restart."""
