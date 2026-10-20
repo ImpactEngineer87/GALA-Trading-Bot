@@ -77,12 +77,61 @@ def main():
         expected_features=FEATURES, expected_version=FEATURE_VERSION,
         expected_policy=TRAINING_POLICY_VERSION,
     )
+    from core.ticker_execution import TickerExecutionRegistry
+    live = cfg.get("live_trading", {}) or {}
+    risk = cfg.get("risk", {}) or {}
+    per_ticker = bool(live.get("per_ticker_execution", False))
+    registry_path = resolve_runtime_path(
+        live.get("ticker_execution_path", "data/ticker_execution.json")
+    )
+    registry = TickerExecutionRegistry(
+        registry_path, default_mode="PAPER",
+        initial_real_tickers=live.get("real_tickers", []),
+        default_shares=max(1, int(risk.get("fixed_shares", 1) or 1)),
+    )
+    settings = {row["ticker"]: row for row in registry.snapshot(args.tickers)}
+    global_mode = "PAPER" if bool(risk.get("paper_trading", True)) else "REAL"
+
+    shadow_cfg = (cfg.get("agents") or {}).get("shadow_mode", {}) or {}
+    shadow_dir = Path(resolve_runtime_path(
+        shadow_cfg.get("modelos_dir", "data/modelos_shadow")
+    ))
+    shadow_enabled = bool(shadow_cfg.get("enabled", False))
+    shadow_scope = {str(t).strip().upper() for t in (shadow_cfg.get("tickers") or [])}
+    shadows = inspect_model_directory(
+        shadow_dir, args.tickers, expected_features=FEATURES,
+        expected_version=FEATURE_VERSION, expected_policy=TRAINING_POLICY_VERSION,
+    )
+
+    real_issues = []
+    paper_missing = []
+    print("Ticker  Mode    PRODUCTION                    SHADOW                         Note")
     for ticker, (status, archives) in result.items():
-        note = f" | previously renamed models={len(archives)}" if archives else ""
-        print(f"{ticker:5} {status}{note}")
-    print("Models requiring investigation:",
-          ", ".join(t for t, (status, _) in result.items()
-                    if status != "FILES_AND_METADATA_PRESENT") or "none")
+        mode = settings[ticker]["mode"] if per_ticker else global_mode
+        if not shadow_enabled:
+            shadow_status = "DISABLED"
+        elif shadow_scope and ticker not in shadow_scope:
+            shadow_status = "OUT_OF_SCOPE"
+        else:
+            shadow_status = shadows[ticker][0]
+        if mode == "REAL" and status != "FILES_AND_METADATA_PRESENT":
+            note = "REAL_MODEL_BLOCKER"
+            real_issues.append(ticker)
+        elif mode == "PAPER" and status != "FILES_AND_METADATA_PRESENT":
+            note = "PAPER_NO_PROD_EXPECTED"
+            paper_missing.append(ticker)
+        else:
+            note = "FILES_ONLY_NOT_APPROVAL"
+        if archives:
+            note += f" | previous_archive={len(archives)}"
+        print(f"{ticker:6}  {mode:5}   {status:29} {shadow_status:29} {note}")
+    print(f"Configured mixed execution: {per_ticker}; mode file: {registry_path}")
+    print("REAL tickers requiring production artifact investigation:",
+          ", ".join(real_issues) or "none")
+    print("PAPER tickers without PRODUCTION (normal during evaluation):",
+          ", ".join(paper_missing) or "none")
+    print("Presence of files does NOT prove model usability, validation, or broker approval.")
+    print("Never promote SHADOW automatically or bypass production TEST gates.")
 
 
 if __name__ == "__main__":
