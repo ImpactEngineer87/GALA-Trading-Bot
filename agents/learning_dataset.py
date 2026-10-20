@@ -109,11 +109,36 @@ def eligible_closed_rows(
 
 
 def eligible_closed_trades(df, *, allow_legacy: bool = True):
-    """Return a DataFrame using the same filtering/deduplication as x/50."""
-    rows = df.to_dict("records")
-    indices = [index for index in _unique_indices(rows) if closed_row_is_eligible(
-        rows[index], fieldnames=df.columns, allow_legacy=allow_legacy
-    )]
+    """Use the original deduplication policy without allocating wide row dicts.
+
+    A 100 MB / 60+ column pandas CSV can become millions of Python objects
+    when expanded via df.to_dict("records"), exhausting an 8 GB VPS. Only
+    identity and eligibility columns are inspected row by row. The last row for
+    each identity wins before validation, exactly as in eligible_closed_rows.
+    """
+    needed = (
+        "modo", "ticker", "position_id", "execution_id", "timestamp",
+        "tipo", "precio_entrada", "precio_salida", "execution_valid",
+    )
+    columns = [column for column in needed if column in df.columns]
+    latest = {}
+    unlinked_valid = []
+    for index, values in enumerate(df[columns].itertuples(index=False, name=None)):
+        row = dict(zip(columns, values))
+        identity = observation_identity(row)
+        eligible = closed_row_is_eligible(
+            row, fieldnames=df.columns, allow_legacy=allow_legacy
+        )
+        if identity is not None:
+            latest[identity] = (index, eligible)
+        elif eligible:
+            unlinked_valid.append(index)
+
+    indices = sorted(
+        unlinked_valid + [
+            index for index, eligible in latest.values() if eligible
+        ]
+    )
     result = df.iloc[indices].copy()
     if "ticker" in result.columns:
         result["ticker"] = result["ticker"].astype(str).str.strip().str.upper()
@@ -126,14 +151,33 @@ def summarize_closed_trades(
     rows: Iterable[Mapping], *, fieldnames: Optional[Iterable[str]] = None,
     allow_legacy: bool = True,
 ) -> dict[str, dict]:
-    """Count unique eligible closes, modes, quarantines and duplicate ledger rows."""
-    rows = list(rows)
-    fields = set(fieldnames) if fieldnames is not None else {
-        field for row in rows for field in row
-    }
-    unique = set(_unique_indices(rows))
+    """Count verified closes in one pass without retaining every wide CSV row.
+
+    Latest duplicate identity wins, INCLUDING when the latest row is invalid.
+    The small latest-state map retains only ticker/mode/eligibility, not entire
+    feedback records. A DictReader with fieldnames therefore stays streaming.
+    If callers omit fieldnames, preserve the historic union-of-columns contract.
+    """
+    if fieldnames is None:
+        rows = list(rows)
+        fields = {field for row in rows for field in row}
+    else:
+        fields = set(fieldnames)
+
     summary = {}
-    for index, row in enumerate(rows):
+    latest = {}
+
+    def account(ticker, mode, eligible):
+        record = summary[ticker]
+        if not eligible:
+            record["quarantined_observations"] += 1
+            return
+        record["eligible_observations"] += 1
+        record[
+            f"eligible_closed_{mode if mode in ('real', 'paper') else 'legacy'}"
+        ] += 1
+
+    for row in rows:
         ticker = _text(row.get("ticker")).upper()
         if not ticker:
             continue
@@ -144,13 +188,19 @@ def summarize_closed_trades(
             "lifetime_observations": 0,
         })
         record["lifetime_observations"] += 1
-        if index not in unique:
-            record["duplicate_closed_rows"] += 1
-            continue
-        if not closed_row_is_eligible(row, fieldnames=fields, allow_legacy=allow_legacy):
-            record["quarantined_observations"] += 1
-            continue
-        record["eligible_observations"] += 1
         mode = _text(row.get("modo")).lower()
-        record[f"eligible_closed_{mode if mode in ('real', 'paper') else 'legacy'}"] += 1
+        eligible = closed_row_is_eligible(
+            row, fieldnames=fields, allow_legacy=allow_legacy
+        )
+        identity = observation_identity(row)
+        if identity is None:
+            # Sparse legacy records have no safe identity; each remains distinct.
+            account(ticker, mode, eligible)
+        else:
+            if identity in latest:
+                record["duplicate_closed_rows"] += 1
+            latest[identity] = (ticker, mode, eligible)
+
+    for ticker, mode, eligible in latest.values():
+        account(ticker, mode, eligible)
     return summary

@@ -118,6 +118,65 @@ def register(app, host):
             shadow_model=(trainer.shadow_snapshot(ticker) if hasattr(trainer, 'shadow_snapshot') else {}),
         )
 
+    @app.route('/api/ai/threshold/<ticker>', methods=['GET', 'POST', 'DELETE'])
+    def ai_manual_threshold_v330(ticker):
+        """Operator-adjustable probability threshold, version-pinned and audited.
+
+        The trading engine must NOT be stopped to change this independent
+        future-decision parameter: stopping the engine may trigger liquidation.
+        The ordinary dashboard authentication + CSRF middleware applies.
+        """
+        ticker = str(ticker or "").strip().upper()
+        if ticker not in host['BOT_STATE'].get('tickers', []):
+            return jsonify(status='error', message='Unknown ticker'), 404
+        with host['_ENGINE_CONTROL_LOCK']:
+            trainer = host['_ai_trainer_for_status']()
+            overrides = trainer.manual_threshold_overrides
+            model = trainer.production_snapshot(ticker)
+            version = model.get('model_version')
+            model_threshold = model.get('threshold')
+
+            if request.method == 'GET':
+                try:
+                    active = overrides.active(ticker, version)
+                except (OSError, ValueError, TypeError, AttributeError) as exc:
+                    return jsonify(status='error', message=f'Invalid threshold override state: {exc}'), 500
+                return jsonify(status='ok', ticker=ticker, model=model,
+                    override=active,
+                    effective_threshold=(active['threshold'] if active
+                                         else model_threshold),
+                    bot_running=bool(host['BOT_STATE'].get('running')))
+
+            if request.method == 'DELETE':
+                try:
+                    overrides.reset(ticker, session.get('username'))
+                except (OSError, ValueError, TypeError) as exc:
+                    return jsonify(status='error', message=str(exc)), 400
+                host['_log']('INFO', f'[AI-THRESHOLD] {ticker} reset by operator')
+                return jsonify(status='ok', ticker=ticker,
+                    effective_threshold=model_threshold, override=None)
+
+            data = request.get_json(silent=True) or {}
+            try:
+                if not isinstance(data, dict):
+                    raise ValueError('Expected JSON object')
+                if not model.get('loaded') or not trainer.modelo_disponible(ticker) or not version:
+                    raise ValueError('Loaded PRODUCTION model required')
+                if data.get('model_version') != version:
+                    raise ValueError('Model changed; refresh before adjusting threshold')
+                if 'threshold' not in data:
+                    raise ValueError('Provide threshold (0.30-0.95)')
+                row = overrides.set(
+                    ticker, version, data['threshold'], session.get('username'),
+                    data.get('reason', 'Ajuste desde el dashboard'))
+            except (OSError, ValueError, TypeError) as exc:
+                return jsonify(status='error', message=str(exc)), 400
+            host['_log']('WARN',
+                f'[AI-THRESHOLD] {ticker} manual threshold set to {row["threshold"]:.2%} '
+                f'by {session.get("username")} (model version pinned)')
+            return jsonify(status='ok', ticker=ticker, override=row,
+                effective_threshold=row['threshold'], model_threshold=model_threshold)
+
     @app.route('/api/execution-diagnostics')
     def execution_diagnostics_v330():
         cfg = host['_read_config_runtime']()

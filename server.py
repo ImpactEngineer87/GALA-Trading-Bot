@@ -3836,6 +3836,11 @@ def get_ticker_execution():
     from core.ticker_analysis import partial_share_plan
     for row in rows:
         row["real_allowed"] = (not allowed) or row["ticker"] in allowed
+        row["real_block_reason"] = (
+            "" if row["real_allowed"] else
+            "Fuera de live_trading.allowed_tickers. "
+            "Requiere aprobación explícita en configuración y Live Guard."
+        )
         row["max_real_shares"] = max_real_shares
         row["partial_plan"] = partial_share_plan(
             row.get("shares", 1), partial_pct, partial_enabled
@@ -4368,12 +4373,14 @@ def _ai_trainer_for_status_locked():
     if _ENGINE is not None and BOT_STATE.get('running'):
         return _ENGINE.orquestador.entrenador
     from pathlib import Path
+    from core.project_paths import resolve_runtime_path
     cfg = _read_config_runtime()
     ent = cfg.get('agents', {}).get('entrenamiento', {})
     shadow = cfg.get('agents', {}).get('shadow_mode', {})
     signature = []
-    for root in [ent.get('modelos_dir', 'data/modelos'), shadow.get('modelos_dir', 'data/modelos_shadow')]:
-        for path in sorted(Path(root).glob('modelo_*')):
+    for raw_root in [ent.get('modelos_dir', 'data/modelos'), shadow.get('modelos_dir', 'data/modelos_shadow')]:
+        root = Path(resolve_runtime_path(raw_root))
+        for path in sorted(root.glob('modelo_*')):
             if path.is_file() and path.suffix in ('.pkl', '.json'):
                 stat = path.stat()
                 signature.append((str(path), stat.st_mtime_ns, stat.st_size))
@@ -4456,6 +4463,20 @@ def ai_retraining_status():
             except Exception:
                 prod_meta = {}
             row["production_model"] = trainer.production_snapshot(ticker) if hasattr(trainer, "production_snapshot") else {}
+            # Explicit, read-only deployment diagnostics. Never mark missing or
+            # incompatible artifacts as approved; REAL remains fail-closed.
+            loaded = bool(row["production_model"].get("loaded"))
+            issues = getattr(trainer, "model_load_errors", {}) or {}
+            row["production_model_issue"] = (
+                "" if loaded else str(issues.get(ticker) or "modelo de producción no encontrado")
+            )
+            model_version = row["production_model"].get("model_version")
+            override = trainer.manual_threshold_overrides.active(ticker, model_version)
+            row["manual_threshold"] = override["threshold"] if override else None
+            row["effective_threshold"] = (
+                row["manual_threshold"] if override else row["production_threshold"]
+            )
+            row["threshold_source"] = "MANUAL" if override else "MODEL"
             shadow_model = trainer.shadow_snapshot(ticker) if hasattr(trainer, "shadow_snapshot") else {}
             row["shadow_model"] = shadow_model
             # v3.3.4: historical score of the SHADOW artifact that is currently

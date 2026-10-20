@@ -904,7 +904,7 @@
           <tbody id="aiLifecycleRows"><tr><td colspan="20">Cargando estado IA…</td></tr></tbody>
         </table>
       </div>
-      <div class="section-note" style="margin-top:8px">El progreso cuenta cierres ejecutados con integridad válida; se conserva al reiniciar. <strong>Las señales resueltas</strong> pueden complementar FIT con peso reducido y solo con TP/SL no ambiguos; no suman al contador de cierres. VALIDACIÓN y TEST usan exclusivamente cierres REAL/PAPER válidos. El TEST económico compara retornos después de costes estimados; R expresa el resultado respecto al riesgo inicial y no equivale a dinero ganado. Entrenar o aprobar un candidato no garantiza rentabilidad futura. <span style="color:var(--green)">BA aceptada SHADOW</span> describe el modelo instalado; rechazar otro candidato conserva ese modelo. La promoción a producción y el modo REAL siguen requiriendo revisión manual.</div>
+      <details class="section-note" style="margin-top:8px"><summary>Cómo se cuentan las señales y qué requiere REAL</summary><p>x/50 cuenta cierres REAL/PAPER ejecutados y verificados y sobrevive reinicios. Las señales no ejecutadas con TP/SL inequívoco pueden aportar ejemplos FIT de menor peso; no cuentan como cierres ni pasan a VALIDACIÓN/TEST. Un candidato REJECTED no reemplaza el modelo SHADOW aceptado. REAL exige producción compatible, validación y pruebas del broker; ninguna rentabilidad está garantizada.</p></details>
     </div>
     <div class="card signal-chart-card" id="signalChartCard">
       <div class="signal-chart-head">
@@ -2995,7 +2995,7 @@ async function fetchAIStatus(){
     const sum = d.summary || {};
     const summary = el('aiLifecycleSummary');
     if(summary){
-      summary.textContent = `${sum.ready_models||0}/${S.aiStatus.length||0} modelos · ${sum.eligible_observations||0} ejecutadas válidas · ${sum.learning_trainable||0} señales extra utilizables · ${sum.pending||0} pendientes · ${sum.training||0} entrenando`;
+      summary.textContent = `${d.automatic_retraining?'Auto IA activo':'Auto IA DESACTIVADO'} · ${sum.ready_models||0}/${S.aiStatus.length||0} modelos · ${sum.eligible_observations||0} cierres válidos · ${sum.learning_total||0} señales registradas · ${sum.learning_trainable||0} aptas FIT · ${sum.pending||0} pendientes`;
       summary.className = 'pill ' + ((sum.pending||sum.training) ? 'real' : 'paper');
     }
     const body = el('aiLifecycleRows');
@@ -3009,7 +3009,8 @@ async function fetchAIStatus(){
       const evaluation = aiEvaluation(row);
       const fitActual = row.muestras_fit_reales ?? evaluation.muestras_fit_reales ?? row.last_fit_samples ?? evaluation.muestras_fit;
       const fitSignals = row.muestras_fit_suplementarias ?? evaluation.muestras_fit_suplementarias;
-      const fitText = fitActual == null && fitSignals == null ? 'Sin entrenamiento registrado' : `${aiCountText(fitActual)} cierres + ${aiCountText(fitSignals)} señales`;
+      const hasEvaluation=!!(row.last_evaluation_id||row.last_evaluation_utc||Number(row.last_test_samples||0));
+      const fitText=!hasEvaluation && Number(fitActual||0)===0 && Number(fitSignals||0)===0?'Sin FIT evaluado':`${aiCountText(fitActual)} cierres + ${aiCountText(fitSignals)} señales`;
       const actualOnly = row.validation_test_actual_only ?? evaluation.validation_test_actual_only;
       const fitDetail = actualOnly === true ? 'VALIDACIÓN / TEST: solo cierres ejecutados' : 'Fuentes de VALIDACIÓN / TEST no registradas';
       const economicSnapshot = aiEconomicSnapshot(row), economic = economicSnapshot.metrics;
@@ -3033,7 +3034,7 @@ async function fetchAIStatus(){
       const learningMissed = Number(row.learning_execution_missed||0);
       const learningResolved = Number(row.learning_resolved||0);
       const learningExcluded = Math.max(0,learningResolved-learningTrainable);
-      const learningText = `${learningTrainable} utilizables / ${learningTotal} total${learningExcluded ? ` · ${learningExcluded} excluidas` : ''}${learningMissed ? ` · ${learningMissed} no ejecutadas` : ''}${learningOpen ? ` · ${learningOpen} pendientes` : ''}`;
+      const learningText = `${learningTotal} señales · ${learningResolved} resueltas · ${learningTrainable} aptas FIT`;
       const shadowAccepted = row.last_shadow_candidate_accepted;
       const shadowResult = shadowAccepted === true
         ? 'ACCEPTED'
@@ -3093,12 +3094,12 @@ async function fetchAIStatus(){
       return `<tr>
         <td class="notranslate" translate="no"><strong translate="no">${escHtml(row.ticker||'—')}</strong></td>
         <td>${escHtml(model)}</td>
-        <td title="${escHtml(readinessDetail)}">${progress}<span class="ai-cell-note">${escHtml(readinessText)}</span></td>
+        <td title="${escHtml(readinessDetail)}">${progress}</td>
         <td title="Cierres verificados disponibles para entrenar. El contador total de operaciones cerradas también conserva filas no elegibles para IA.">${closedSources}</td>
         <td title="Auditoría separada: útiles = el veto habría evitado una pérdida; perdidas = una señal vetada habría sido ganadora. No suma al contador de cierres.">${vetoText}</td>
         <td title="Señales no ejecutadas resueltas por TP/SL. Solo las no ambiguas pueden complementar FIT con peso reducido; nunca suman al contador de cierres ni entran a VALIDACIÓN/TEST.">${learningText}</td>
         <td title="Ejecutadas válidas para IA / ejecuciones afectadas o legacy en cuarentena">${dataset}</td>
-        <td>${fitText}<span class="ai-cell-note">${escHtml(fitDetail)}</span></td>
+        <td title="${escHtml(fitDetail)}">${fitText}</td>
         <td><span class="ai-state ${escHtml(row.status||'COLLECTING')}">${escHtml(row.status||'COLLECTING')}</span></td>
         <td title="Resultado del candidato más reciente dentro de SHADOW; REJECTED no degrada el modelo aceptado anterior.">${escHtml(shadowResult)}</td>
         <td title="${escHtml(acceptedShadowTitle)}">${acceptedShadow}</td>
@@ -3106,7 +3107,7 @@ async function fetchAIStatus(){
         <td title="Incumbente SHADOW evaluado sobre exactamente el mismo TEST">${shadowInc}</td>
         <td><span class="ai-delta ${deltaClass}">${delta}</span></td>
         <td title="Puerta independiente para permitir promoción normal a PRODUCTION">${prodGateText}</td>
-        <td class="${economicSnapshot.gate===true?'ai-economic-pass':economicSnapshot.gate===false?'ai-economic-fail':''}" title="${escHtml(economicTitle)}">${economicText}<span class="ai-cell-note">${escHtml(economicDetail)}</span></td>
+        <td class="${economicSnapshot.gate===true?'ai-economic-pass':economicSnapshot.gate===false?'ai-economic-fail':''}" title="${escHtml(economicTitle)}">${economicText}</td>
         <td title="Incumbente PRODUCTION evaluado sobre exactamente el mismo TEST">${prodInc}</td>
         <td title="Umbral elegido en VALIDACIÓN y luego congelado para este TEST">${threshold}</td>
         <td title="${escHtml(evalTitle)}">${escHtml(evalText)}</td>
@@ -3393,7 +3394,7 @@ function renderTickerExecution(){
         <td data-label="Ejecución"><select class="exec-mode-select" id="exec-mode-${escaped}" aria-label="Ejecución de ${escaped}"><option value="PAPER">PAPER</option><option value="REAL">REAL</option></select></td>
         <td data-label="Acciones por orden"><input class="exec-shares-input" id="exec-shares-${escaped}" type="number" min="1" step="1" inputmode="numeric" aria-label="Acciones de ${escaped}" aria-describedby="exec-quantity-note-${escaped}"><div class="exec-saved-value" id="exec-quantity-note-${escaped}"></div><button class="exec-cap-action" id="exec-raise-${escaped}" hidden>Ajustar máximo REAL ↑</button></td>
         <td data-label="Salida parcial"><span class="exec-muted" id="exec-plan-${escaped}"></span></td>
-        <td data-label="IA / modelo"><span id="exec-model-${escaped}" class="exec-model-badge"></span><div class="exec-ai-detail" id="exec-ai-${escaped}"></div><button class="btn btn-ghost btn-sm" id="exec-details-${escaped}">Ver modelo ↗</button></td>
+        <td data-label="IA / modelo"><span id="exec-model-${escaped}" class="exec-model-badge"></span><div class="exec-ai-detail" id="exec-ai-${escaped}"></div><div class="exec-row-actions" style="gap:5px;flex-wrap:wrap"><button class="btn btn-ghost btn-sm" id="exec-details-${escaped}">Ver modelo ↗</button><button class="btn btn-ghost btn-sm" id="exec-threshold-${escaped}">Umbral IA ↗</button></div></td>
         <td data-label="Cambios"><div class="exec-row-actions"><button class="btn btn-blue btn-sm" id="exec-save-${escaped}">Guardar</button><button class="btn btn-ghost btn-sm" id="exec-discard-${escaped}" hidden>Descartar</button></div><div class="exec-row-feedback" id="exec-feedback-${escaped}" role="status" aria-live="polite"></div><button class="exec-cap-action" id="exec-raise-tickers-${escaped}" hidden>Ajustar cupos REAL ↑</button></td>`;
       body.appendChild(tr);
       el('exec-mode-'+ticker).onchange=()=>updateExecShareLimit(ticker);
@@ -3404,6 +3405,7 @@ function renderTickerExecution(){
       el('exec-raise-'+ticker).onclick=()=>raiseRealShareLimitFor(ticker);
       el('exec-raise-tickers-'+ticker).onclick=raiseRealTickerLimit;
       el('exec-details-'+ticker).onclick=()=>showModelDetails(ticker);
+      el('exec-threshold-'+ticker).onclick=()=>showManualAIThreshold(ticker);
     }
     const draft=S.execDrafts[ticker];
     if(draft&&!draft.saving&&draft.base.updated_utc!==(row.updated_utc||'') && (draft.base.mode!==row.mode||Number(draft.base.shares)!==Number(row.shares)))draft.conflict=true;
@@ -3429,12 +3431,51 @@ function renderTickerExecution(){
     const ai=aiRowForTicker(ticker),production=!!ai?.production_model_loaded,shadow=!!ai?.shadow_model_loaded;
     const model=el('exec-model-'+ticker);model.className='exec-model-badge '+(production?'production':shadow?'shadow':'');
     model.textContent=production?(ai.production_manual_override?'● Producción · override':'● Producción'):shadow?'● En validación':'○ Sin modelo';
-    el('exec-ai-'+ticker).textContent=(ai?.production_threshold!=null?`Umbral ${(Number(ai.production_threshold)*100).toFixed(0)}% · `:'')+`Cierres IA ${aiCountText(ai?.new_observations)}/${aiCountText(ai?.retrain_samples)}`;
+    const effective=ai?.effective_threshold??ai?.production_threshold;
+    const configured=ai?.production_threshold;
+    el('exec-ai-'+ticker).textContent=(effective!=null?`Umbral ${(Number(effective)*100).toFixed(0)}%${ai?.manual_threshold!=null?' manual':''} · `:'')+`Cierres ${aiCountText(ai?.new_observations)}/${aiCountText(ai?.retrain_samples)}`;
+    const thresholdButton=el('exec-threshold-'+ticker);
+    thresholdButton.disabled=!production;
+    thresholdButton.title=production?`Modelo base: ${configured==null?'N/A':Math.round(Number(configured)*100)+'%'}`:(ai?.production_model_issue||'Requiere modelo PRODUCTION compatible');
     const save=el('exec-save-'+ticker);save.disabled=running||saving||!draft||!!issue;save.textContent=saving?'Guardando…':'Guardar';
     const discard=el('exec-discard-'+ticker);discard.hidden=!draft;discard.disabled=saving;
     const notice=S.execNotices[ticker];
     executionMessage(el('exec-feedback-'+ticker),saving?'Validando y guardando…':draft?(draft.error||issue||'Cambios sin guardar'):(notice||'Sin cambios'),draft?.error||issue?'error':notice?'saved':'');
   }
+}
+async function showManualAIThreshold(ticker){
+  try{
+    const r=await api('/api/ai/threshold/'+encodeURIComponent(ticker)),d=await r.json();
+    if(!r.ok||d.status!=='ok')throw new Error(d.message||'Error consultando umbral');
+    if(!d.model?.loaded||!d.model?.model_version)throw new Error('Se requiere un modelo PRODUCTION cargado');
+    S.manualAIEditor={ticker,version:d.model.model_version};
+    const effective=d.effective_threshold??d.model.threshold;
+    showV330Dialog(`<h2>${escHtml(ticker)} · Umbral IA</h2>
+      <p>Umbral del modelo: ${d.model.threshold==null?'—':Math.round(Number(d.model.threshold)*100)+'%'} · Actual: ${effective==null?'—':Math.round(Number(effective)*100)+'%'}</p>
+      <form onsubmit="event.preventDefault();saveManualAIThreshold(false)" style="display:grid;gap:10px;max-width:500px">
+      <label>Umbral manual para señales futuras (%) <input id="manualAIThresholdPct" class="exec-shares-input" style="width:110px" type="number" min="30" max="95" step="1" value="${Math.round(Number(effective)*100)}" required></label>
+      <p class="section-note">No reentrena, no modifica posiciones, ni cambia REAL/PAPER o los límites del broker. Caduca si cambia el modelo.</p>
+      <div class="exec-row-actions"><button class="btn btn-blue btn-sm" type="submit">Aplicar</button><button class="btn btn-ghost btn-sm" type="button" onclick="saveManualAIThreshold(true)" ${d.override?'':'disabled'}>Restaurar modelo</button></div></form>`);
+  }catch(e){toast('err','Umbral IA',String(e.message||e));}
+}
+async function saveManualAIThreshold(reset){
+  const state=S.manualAIEditor;if(!state)return;
+  const raw=String(el('manualAIThresholdPct')?.value??'').trim(),pct=Number(raw);
+  if(!reset&&(!raw||!Number.isInteger(pct)||pct<30||pct>95)){
+    toast('err','Umbral IA','Introduzca un porcentaje entero de 30 a 95');return;
+  }
+  if(!confirm(`¿${reset?'Restaurar umbral':'Aplicar '+pct+'%'} en ${state.ticker}? Solo cambia señales futuras.`))return;
+  try{
+    const res=await api('/api/ai/threshold/'+encodeURIComponent(state.ticker),reset?{method:'DELETE'}:{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model_version:state.version,threshold:pct/100,reason:'Umbral desde dashboard'})
+    });
+    const data=await res.json();
+    if(!res.ok||data.status!=='ok')throw new Error(data.message||'No se guardó');
+    el('v330Dialog').close();
+    toast('ok','Umbral IA',state.ticker+': guardado para próximas señales');
+    await fetchAIStatus();
+  }catch(e){toast('err','Umbral IA',String(e.message||e));}
 }
 function updateExecShareLimit(ticker){
   const row=execSavedRow(ticker),mode=el('exec-mode-'+ticker),shares=el('exec-shares-'+ticker);
