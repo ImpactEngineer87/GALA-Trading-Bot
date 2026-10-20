@@ -182,12 +182,12 @@ class FeedbackStore:
                 # Adding outcome availability/risk must preserve the verified
                 # learning history and existing counters. Unknown historical
                 # close times remain empty instead of being invented at upgrade.
-                with open(self.ruta_csv, "r", encoding="utf-8-sig", newline="") as f:
-                    rows = list(csv.DictReader(f))
                 backup = self.ruta_csv + ".before_closed_utc"
                 if not os.path.exists(backup):
                     shutil.copy2(self.ruta_csv, backup)
-                self._rewrite_schema(rows)
+                # Stream legacy schema rows; do not materialize 291k dicts.
+                with open(self.ruta_csv, "r", encoding="utf-8-sig", newline="") as f:
+                    self._rewrite_schema(csv.DictReader(f))
                 return
             if primera == ",".join(LEGACY_COLUMNAS):
                 with open(self.ruta_csv, "r", encoding="utf-8-sig", newline="") as f:
@@ -241,11 +241,12 @@ class FeedbackStore:
                 )
                 return
             if primera:
-                bak, i = self.ruta_csv + ".old", 1
-                while os.path.exists(bak):
-                    bak = f"{self.ruta_csv}.old{i}"; i += 1
-                os.rename(self.ruta_csv, bak)
-                print(f"[Feedback] CSV con esquema anterior → archivado en '{bak}', se arranca limpio")
+                # Never silently start an empty training history after an
+                # unrecognized deployment schema. Preserve original bytes.
+                raise ValueError(
+                    "Esquema de feedback no reconocido; CSV ORIGINAL conservado. "
+                    "Requiere revisión/migración explícita, no reinicio limpio."
+                )
         except Exception as e:
             # Continuing with a mismatched header would silently corrupt labels.
             raise RuntimeError(f"No se pudo verificar el esquema del feedback: {e}") from e
