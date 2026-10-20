@@ -24,7 +24,10 @@ DEFAULT_TICKERS = (
 )
 
 
-def inspect_model_directory(directory: Path, tickers, expected_features=None, expected_policy=None):
+def inspect_model_directory(
+    directory: Path, tickers, expected_features=None,
+    expected_version=None, expected_policy=None,
+):
     result = {}
     for ticker in tickers:
         ticker = str(ticker).strip().upper()
@@ -43,7 +46,7 @@ def inspect_model_directory(directory: Path, tickers, expected_features=None, ex
                 elif (
                     expected_features is not None
                     and (meta.get("features") != expected_features or
-                         meta.get("feature_version") != 4 or
+                         meta.get("feature_version") != expected_version or
                          meta.get("training_policy_version") != expected_policy)
                 ):
                     status = "SCHEMA_MISMATCH"
@@ -71,7 +74,8 @@ def main():
     from agents.training import FEATURES, FEATURE_VERSION, TRAINING_POLICY_VERSION
     result = inspect_model_directory(
         directory, args.tickers,
-        expected_features=FEATURES, expected_policy=TRAINING_POLICY_VERSION,
+        expected_features=FEATURES, expected_version=FEATURE_VERSION,
+        expected_policy=TRAINING_POLICY_VERSION,
     )
     for ticker, (status, archives) in result.items():
         note = f" | previously renamed models={len(archives)}" if archives else ""
