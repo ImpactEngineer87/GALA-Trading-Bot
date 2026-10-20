@@ -894,6 +894,7 @@
           <div class="section-note" id="aiLearningPolicy">Aprende de cierres REAL y PAPER verificados y de señales resueltas con peso reducido. Cargando umbrales y programación…</div>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <button class="btn btn-ghost btn-sm" id="aiAutoRetrainToggle" onclick="toggleAutomaticRetraining()" disabled>Auto IA: comprobando…</button>
           <button class="btn btn-ghost btn-sm" onclick="triggerTraining()">🧠 Reentrenar pendientes</button>
           <span class="pill paper" id="aiLifecycleSummary">Cargando…</span>
         </div>
@@ -2977,6 +2978,14 @@ function renderAILearningSummary(data){
   const readinessKnown=rows.some(row=>typeof (row.training_readiness || {}).ready === 'boolean');
   setText('aiTrainingReady',readinessKnown ? `${ready}/${rows.length}` : '—');
   const schedule=data.only_after_session ? 'Después de la sesión NY' : 'Al alcanzar el objetivo';
+  S.aiAutoTrainingEnabled=data.automatic_retraining===true;
+  S.aiAutoTrainingWarning=String(data.automatic_retraining_warning||'');
+  const trainingToggle=el('aiAutoRetrainToggle');
+  if(trainingToggle){
+    trainingToggle.disabled=!!S.aiAutoTrainingSaving||!!S.aiAutoTrainingWarning;
+    trainingToggle.textContent=S.aiAutoTrainingWarning?'Auto IA: revisión requerida':(S.aiAutoTrainingEnabled?'Auto IA: activado':'Auto IA: desactivado');
+    trainingToggle.title=S.aiAutoTrainingWarning||'Cambiar reentrenamiento SHADOW post-sesión. No altera REAL ni activa modelos en producción.';
+  }
   setText('aiTrainingSchedule',`${data.automatic_retraining ? schedule : 'Inicio manual'} · ${aiCountText(summary.pending ?? rows.filter(row=>row.status==='PENDING_RETRAIN').length)} pendientes · ${aiCountText(summary.training ?? rows.filter(row=>row.status==='TRAINING').length)} entrenando`);
   const economic=rows.map(aiEconomicSnapshot).filter(snapshot=>snapshot.evaluated);
   const passed=economic.filter(snapshot=>snapshot.gate===true).length;
@@ -3121,6 +3130,27 @@ async function fetchAIStatus(){
 // ─────────────────────────────────────────────────────────
 // AI TRAINING
 // ─────────────────────────────────────────────────────────
+async function toggleAutomaticRetraining(){
+  if(S.aiAutoTrainingSaving||S.aiAutoTrainingWarning)return;
+  const enabled=!S.aiAutoTrainingEnabled;
+  if(!confirm(enabled
+    ? '¿Habilitar reentrenamiento IA automático SOLO al final de la sesión NY? Requiere cierres verificados suficientes por ticker. Las señales resueltas complementan FIT, no aumentan cierres ni pasan a TEST. Nunca promociona modelos a REAL y no cambia el trading actual.'
+    : '¿Deshabilitar nuevos reentrenamientos automáticos? No borra modelos, señales ni historial. Los trabajos ya iniciados no se cancelan.'
+  ))return;
+  S.aiAutoTrainingSaving=true;
+  const button=el('aiAutoRetrainToggle');if(button)button.disabled=true;
+  try{
+    const r=await api('/api/ai/retraining-control',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({enabled})
+    });
+    const d=await r.json();
+    if(!r.ok||d.status!=='ok)throw new Error(d.message||'No se pudo guardar la configuración IA');
+    toast('ok','Reentrenamiento IA',enabled?'Auto SHADOW post-sesión habilitado':'Auto SHADOW post-sesión deshabilitado');
+    await fetchAIStatus();
+  }catch(e){toast('err','Reentrenamiento IA',String(e.message||e));}
+  finally{S.aiAutoTrainingSaving=false;await fetchAIStatus();}
+}
 async function triggerTraining(){
   try {
     const r = await api('/api/ai/train',{method:'POST'});
