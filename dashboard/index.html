@@ -2979,7 +2979,9 @@ function renderAILearningSummary(data){
   setText('aiTrainingReady',readinessKnown ? `${ready}/${rows.length}` : '—');
   const schedule=data.only_after_session ? 'Después de la sesión NY' : 'Al alcanzar el objetivo';
   S.aiAutoTrainingEnabled=data.automatic_retraining===true;
-  S.aiAutoTrainingWarning=String(data.automatic_retraining_warning||'');
+  S.aiAutoTrainingWarning=String(data.automatic_retraining_warning||
+    (data.end_session_training_hook_enabled===false?'El disparador de fin de sesión está deshabilitado en config.yaml':'')
+  );
   const trainingToggle=el('aiAutoRetrainToggle');
   if(trainingToggle){
     trainingToggle.disabled=!!S.aiAutoTrainingSaving||!!S.aiAutoTrainingWarning;
