@@ -280,7 +280,8 @@ class FeedbackStore:
         try:
             raw = json.loads(self._open_state_path.read_text(encoding="utf-8-sig"))
             opened = raw.get("open", {}) if isinstance(raw, dict) else {}
-            return [row for row in opened.values() if isinstance(row, dict)] if isinstance(opened, dict) else []
+            return [dict(row, ticker=str(ticker).upper()) for ticker, row in opened.items()
+                    if isinstance(row, dict)] if isinstance(opened, dict) else []
         except (OSError, ValueError, TypeError):
             return []
 
