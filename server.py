@@ -3836,6 +3836,11 @@ def get_ticker_execution():
     from core.ticker_analysis import partial_share_plan
     for row in rows:
         row["real_allowed"] = (not allowed) or row["ticker"] in allowed
+        row["real_block_reason"] = (
+            "" if row["real_allowed"] else
+            "Fuera de live_trading.allowed_tickers. "
+            "Requiere aprobación explícita en configuración y Live Guard."
+        )
         row["max_real_shares"] = max_real_shares
         row["partial_plan"] = partial_share_plan(
             row.get("shares", 1), partial_pct, partial_enabled
