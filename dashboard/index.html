@@ -2995,7 +2995,7 @@ async function fetchAIStatus(){
     const sum = d.summary || {};
     const summary = el('aiLifecycleSummary');
     if(summary){
-      summary.textContent = `${sum.ready_models||0}/${S.aiStatus.length||0} modelos · ${sum.eligible_observations||0} ejecutadas válidas · ${sum.learning_trainable||0} señales extra utilizables · ${sum.pending||0} pendientes · ${sum.training||0} entrenando`;
+      summary.textContent = `${d.automatic_retraining?'Auto IA activo':'Auto IA DESACTIVADO'} · ${sum.ready_models||0}/${S.aiStatus.length||0} modelos · ${sum.eligible_observations||0} cierres válidos · ${sum.learning_total||0} señales registradas · ${sum.learning_trainable||0} aptas FIT · ${sum.pending||0} pendientes`;
       summary.className = 'pill ' + ((sum.pending||sum.training) ? 'real' : 'paper');
     }
     const body = el('aiLifecycleRows');
