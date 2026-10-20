@@ -26,6 +26,7 @@ DESCRIPCIÓN:
 """
 
 import os
+import time
 import pickle
 import shutil
 import threading
@@ -47,6 +48,7 @@ from agents.learning_economics import (
 from agents.retraining_lifecycle import RetrainingLifecycle
 from agents.volume_features import VOLUME_FEATURE_NAMES
 from core.project_paths import resolve_runtime_path
+from core.memory_diagnostics import memory_usage_mib
 
 
 # AI v4: only causal, non-constant model inputs.  GSCO has no aligned
@@ -190,6 +192,7 @@ class EntrenadorAgentes:
         # Only one dashboard request may parse/prepare the full feedback CSV
         # after it changes. Other requests wait for the refreshed cache.
         self._status_feedback_load_lock = threading.Lock()
+        self._last_status_memory_log = 0.0
         self._modelos: Dict[str, object] = {}     # approved production models
         self.model_load_errors: Dict[str, str] = {}
         self._umbrales: Dict[str, float] = {}
@@ -1295,11 +1298,27 @@ class EntrenadorAgentes:
             with self._lock:
                 if current == self._status_feedback_signature:
                     return self._status_feedback_rows
+            started = time.monotonic()
+            before_mib, _ = memory_usage_mib()
             try:
-                prepared = self._prepare_training_rows(pd.read_csv(self.feedback_path))
+                raw = pd.read_csv(self.feedback_path)
+                parsed_mib, _ = memory_usage_mib()
+                prepared = self._prepare_training_rows(raw)
+                del raw
             except Exception:
                 # Never cache a transient partial append or read error.
                 return pd.DataFrame()
+            after_mib, _ = memory_usage_mib()
+            if time.monotonic() - getattr(self, "_last_status_memory_log", 0.0) >= 120:
+                self._last_status_memory_log = time.monotonic()
+                print(
+                    "[AI-MEMORY] feedback_status_refresh "
+                    f"rss_before={float(before_mib or 0):.0f}MiB "
+                    f"rss_after_csv={float(parsed_mib or 0):.0f}MiB "
+                    f"rss_after_prepare={float(after_mib or 0):.0f}MiB "
+                    f"eligible_rows={len(prepared)} "
+                    f"elapsed_sec={time.monotonic()-started:.1f}"
+                )
             if signature() == current:
                 with self._lock:
                     self._status_feedback_rows = prepared
