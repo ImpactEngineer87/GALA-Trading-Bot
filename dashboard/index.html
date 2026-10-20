@@ -904,7 +904,7 @@
           <tbody id="aiLifecycleRows"><tr><td colspan="20">Cargando estado IA…</td></tr></tbody>
         </table>
       </div>
-      <div class="section-note" style="margin-top:8px">El progreso cuenta cierres ejecutados con integridad válida; se conserva al reiniciar. <strong>Las señales resueltas</strong> pueden complementar FIT con peso reducido y solo con TP/SL no ambiguos; no suman al contador de cierres. VALIDACIÓN y TEST usan exclusivamente cierres REAL/PAPER válidos. El TEST económico compara retornos después de costes estimados; R expresa el resultado respecto al riesgo inicial y no equivale a dinero ganado. Entrenar o aprobar un candidato no garantiza rentabilidad futura. <span style="color:var(--green)">BA aceptada SHADOW</span> describe el modelo instalado; rechazar otro candidato conserva ese modelo. La promoción a producción y el modo REAL siguen requiriendo revisión manual.</div>
+      <details class="section-note" style="margin-top:8px"><summary>Cómo se cuentan las señales y qué requiere REAL</summary><p>x/50 cuenta cierres REAL/PAPER ejecutados y verificados y sobrevive reinicios. Las señales no ejecutadas con TP/SL inequívoco pueden aportar ejemplos FIT de menor peso; no cuentan como cierres ni pasan a VALIDACIÓN/TEST. Un candidato REJECTED no reemplaza el modelo SHADOW aceptado. REAL exige producción compatible, validación y pruebas del broker; ninguna rentabilidad está garantizada.</p></details>
     </div>
     <div class="card signal-chart-card" id="signalChartCard">
       <div class="signal-chart-head">
@@ -3009,7 +3009,8 @@ async function fetchAIStatus(){
       const evaluation = aiEvaluation(row);
       const fitActual = row.muestras_fit_reales ?? evaluation.muestras_fit_reales ?? row.last_fit_samples ?? evaluation.muestras_fit;
       const fitSignals = row.muestras_fit_suplementarias ?? evaluation.muestras_fit_suplementarias;
-      const fitText = fitActual == null && fitSignals == null ? 'Sin entrenamiento registrado' : `${aiCountText(fitActual)} cierres + ${aiCountText(fitSignals)} señales`;
+      const hasEvaluation=!!(row.last_evaluation_id||row.last_evaluation_utc||Number(row.last_test_samples||0));
+      const fitText=!hasEvaluation && Number(fitActual||0)===0 && Number(fitSignals||0)===0?'Sin FIT evaluado':`${aiCountText(fitActual)} cierres + ${aiCountText(fitSignals)} señales`;
       const actualOnly = row.validation_test_actual_only ?? evaluation.validation_test_actual_only;
       const fitDetail = actualOnly === true ? 'VALIDACIÓN / TEST: solo cierres ejecutados' : 'Fuentes de VALIDACIÓN / TEST no registradas';
       const economicSnapshot = aiEconomicSnapshot(row), economic = economicSnapshot.metrics;
@@ -3033,7 +3034,7 @@ async function fetchAIStatus(){
       const learningMissed = Number(row.learning_execution_missed||0);
       const learningResolved = Number(row.learning_resolved||0);
       const learningExcluded = Math.max(0,learningResolved-learningTrainable);
-      const learningText = `${learningTrainable} utilizables / ${learningTotal} total${learningExcluded ? ` · ${learningExcluded} excluidas` : ''}${learningMissed ? ` · ${learningMissed} no ejecutadas` : ''}${learningOpen ? ` · ${learningOpen} pendientes` : ''}`;
+      const learningText = `${learningTotal} señales · ${learningResolved} resueltas · ${learningTrainable} aptas FIT`;
       const shadowAccepted = row.last_shadow_candidate_accepted;
       const shadowResult = shadowAccepted === true
         ? 'ACCEPTED'
@@ -3093,12 +3094,12 @@ async function fetchAIStatus(){
       return `<tr>
         <td class="notranslate" translate="no"><strong translate="no">${escHtml(row.ticker||'—')}</strong></td>
         <td>${escHtml(model)}</td>
-        <td title="${escHtml(readinessDetail)}">${progress}<span class="ai-cell-note">${escHtml(readinessText)}</span></td>
+        <td title="${escHtml(readinessDetail)}">${progress}</td>
         <td title="Cierres verificados disponibles para entrenar. El contador total de operaciones cerradas también conserva filas no elegibles para IA.">${closedSources}</td>
         <td title="Auditoría separada: útiles = el veto habría evitado una pérdida; perdidas = una señal vetada habría sido ganadora. No suma al contador de cierres.">${vetoText}</td>
         <td title="Señales no ejecutadas resueltas por TP/SL. Solo las no ambiguas pueden complementar FIT con peso reducido; nunca suman al contador de cierres ni entran a VALIDACIÓN/TEST.">${learningText}</td>
         <td title="Ejecutadas válidas para IA / ejecuciones afectadas o legacy en cuarentena">${dataset}</td>
-        <td>${fitText}<span class="ai-cell-note">${escHtml(fitDetail)}</span></td>
+        <td title="${escHtml(fitDetail)}">${fitText}</td>
         <td><span class="ai-state ${escHtml(row.status||'COLLECTING')}">${escHtml(row.status||'COLLECTING')}</span></td>
         <td title="Resultado del candidato más reciente dentro de SHADOW; REJECTED no degrada el modelo aceptado anterior.">${escHtml(shadowResult)}</td>
         <td title="${escHtml(acceptedShadowTitle)}">${acceptedShadow}</td>
@@ -3106,7 +3107,7 @@ async function fetchAIStatus(){
         <td title="Incumbente SHADOW evaluado sobre exactamente el mismo TEST">${shadowInc}</td>
         <td><span class="ai-delta ${deltaClass}">${delta}</span></td>
         <td title="Puerta independiente para permitir promoción normal a PRODUCTION">${prodGateText}</td>
-        <td class="${economicSnapshot.gate===true?'ai-economic-pass':economicSnapshot.gate===false?'ai-economic-fail':''}" title="${escHtml(economicTitle)}">${economicText}<span class="ai-cell-note">${escHtml(economicDetail)}</span></td>
+        <td class="${economicSnapshot.gate===true?'ai-economic-pass':economicSnapshot.gate===false?'ai-economic-fail':''}" title="${escHtml(economicTitle)}">${economicText}</td>
         <td title="Incumbente PRODUCTION evaluado sobre exactamente el mismo TEST">${prodInc}</td>
         <td title="Umbral elegido en VALIDACIÓN y luego congelado para este TEST">${threshold}</td>
         <td title="${escHtml(evalTitle)}">${escHtml(evalText)}</td>
