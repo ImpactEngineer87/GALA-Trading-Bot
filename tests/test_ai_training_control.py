@@ -181,6 +181,9 @@ class DashboardTrainingControlTests(unittest.TestCase):
             ses["username"] = "operator"
             ses["csrf_token"] = "csrf-test-token"
         with patch.object(server, "_ai_trainer_for_status", return_value=self.trainer), \
+             patch.object(server, "_read_config_runtime", return_value={
+                 "agents": {"entrenamiento": {"reentrenar_fin_sesion": True}}
+             }), \
              patch.object(server, "_log"), \
              patch("requests.sessions.Session.request", side_effect=AssertionError("broker network")):
             denied = client.post("/api/ai/retraining-control", json={"enabled": True})
