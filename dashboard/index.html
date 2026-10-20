@@ -3145,7 +3145,7 @@ async function toggleAutomaticRetraining(){
       body:JSON.stringify({enabled})
     });
     const d=await r.json();
-    if(!r.ok||d.status!=='ok)throw new Error(d.message||'No se pudo guardar la configuración IA');
+    if(!r.ok||d.status!=='ok')throw new Error(d.message||'No se pudo guardar la configuración IA');
     toast('ok','Reentrenamiento IA',enabled?'Auto SHADOW post-sesión habilitado':'Auto SHADOW post-sesión deshabilitado');
     await fetchAIStatus();
   }catch(e){toast('err','Reentrenamiento IA',String(e.message||e));}
