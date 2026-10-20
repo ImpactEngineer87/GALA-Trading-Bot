@@ -4313,6 +4313,11 @@ def ai_retraining_control():
                 return jsonify(
                     status='error', message='enabled debe ser true o false',
                 ), 400
+            if data['enabled'] and not trainer.shadow_enabled:
+                return jsonify(
+                    status='error',
+                    message='El modo SHADOW debe estar activo para habilitar reentrenamiento automático',
+                ), 409
             try:
                 state = trainer.ai_training_control.set_enabled(
                     data['enabled'], session.get('username')
