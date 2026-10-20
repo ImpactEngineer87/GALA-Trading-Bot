@@ -121,3 +121,57 @@ Source rollback must be an intentional, reviewed Git operation while the
 broker is flat, not `git reset --hard`. **Never delete or restore live
 `data/` wholesale as a code rollback.** The current branch changes no
 persisted data migration format.
+
+
+## 2026-10-20: evidence and UI recovery additions
+
+The same review branch now includes:
+
+- A streaming `FeedbackStore` execution-side cache; it no longer retains
+  the full 291k-record feedback dataset in memory. Crash recovery indexes only
+  pending trade identifiers, and x/50 counters still use last-valid-close
+  identity rules. An unrecognized historical CSV schema now fails closed
+  **without renaming or starting a blank training dataset**.
+- Original-root anchored signal-learning, AI-veto, feedback and override paths.
+- Version-pinned manual threshold from former PR #12: one compact "Umbral IA"
+  dialog per PRODUCTION ticker. It does **not** bypass trading/risk controls.
+- Honest dashboard counters: recorded signals, resolved signals, FIT-eligible
+  supplemental signals, verified closed trades, and historic FIT evaluations
+  are different things; no invalid rows are invented to make TEST pass.
+- A clear indicator when automatic retraining is disabled. The earlier VPS
+  config showed `automatic_retraining.enabled=false`; it will not retrain on
+  its own until explicitly enabled with appropriate operational safeguards.
+
+### Extra read-only diagnostics
+
+```bash
+cd /opt/gala/GALA-Trading-Bot
+./.venv/bin/python scripts/audit_signal_learning.py
+./.venv/bin/python scripts/audit_model_artifacts.py
+grep -nE 'allowed_tickers|automatic_retraining|reentrenar_fin_sesion' config.yaml
+```
+
+Do not post `.env`, authorization tokens or complete account numbers.
+
+### Additional tests before service restart
+
+```bash
+cd /opt/gala/GALA-Trading-Bot
+for t in test_feedback_streaming_recovery.py test_manual_ai_threshold.py \
+         test_ai_feedback_memory.py test_model_artifact_preservation.py \
+         test_learning_feedback.py test_signal_learning.py \
+         test_ai_learning_training.py test_ai_status_initialization.py \
+         test_retraining_lifecycle_persistence.py; do
+    ./.venv/bin/python -m unittest discover -s tests -p "$t" -v || break
+done
+```
+
+The newest changes have not been verified on the VPS. Do NOT claim they fix
+all memory issues or that AMD/UAL/RCL are production-ready until artifact
+diagnostics and the PAPER-only soak run. Do not auto-activate REAL.
+
+### September comparison
+
+A September baseline must be identified by actual commit/tag and verified
+runtime records, not an assumed downgrade. Switching to a September branch
+without assessing model-schema and broker changes could obscure learning data.
