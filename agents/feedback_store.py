@@ -36,6 +36,7 @@ from agents.learning_dataset import (
     eligible_closed_rows, observation_identity, summarize_closed_trades,
 )
 from core.runtime_store import path_lock
+from core.project_paths import resolve_runtime_path
 
 
 import math
@@ -143,19 +144,25 @@ class FeedbackStore:
     """
 
     def __init__(self, ruta_csv: str = "data/agentes_feedback.csv"):
-        self.ruta_csv = ruta_csv
-        self._lock = path_lock(ruta_csv)
+        self.ruta_csv = resolve_runtime_path(ruta_csv)
+        self._lock = path_lock(self.ruta_csv)
         # v2.9.3: las aperturas de aprendizaje ya no viven solo en RAM. El sidecar
         # permite cerrar correctamente una operación después de reiniciar el
         # server sin perder su observación PAPER/REAL ni el progreso x/50.
-        self._open_state_path = Path(str(ruta_csv) + ".open.json")
+        self._open_state_path = Path(str(self.ruta_csv) + ".open.json")
         self._abiertas: Dict[str, dict] = {}
-        self._closed_rows = []
+        # Keep only compact counters and rows needed for open-position replay.
+        # Never materialize the entire 291k x 60+ field history into RAM.
+        self._closed_rows = []  # legacy compatibility; no full history retained
         self._closed_by_identity = {}
         self._closed_by_feedback_id = {}
+        self._closed_summary = {}
+        self._closed_count = 0
+        self._closed_signature = None
+        self._closed_index_targets = None
         with self._lock:
             self._verificar_esquema()
-            self._reload_closed_locked()
+            self._reload_closed_locked(extra_pendings=self._recovery_open_targets())
             self._cargar_abiertas_persistidas()
             self._cerradas_totales = self._contar_filas()
 
@@ -264,26 +271,83 @@ class FeedbackStore:
             if temporary and os.path.exists(temporary):
                 os.unlink(temporary)
 
-    def _reload_closed_locked(self) -> None:
-        if not os.path.exists(self.ruta_csv):
-            self._closed_rows = []
-        else:
-            with open(self.ruta_csv, "r", encoding="utf-8-sig", newline="") as handle:
-                # An interrupted append must never be mistaken for a committed
-                # close merely because its leading identity columns were written.
-                self._closed_rows = [
-                    dict(row) for row in csv.DictReader(handle)
-                    if None not in row and all(value is not None for value in row.values())
-                ]
-        self._closed_by_identity = {}
-        self._closed_by_feedback_id = {}
-        for row in self._closed_rows:
-            identity = observation_identity(row)
-            if identity is not None:
-                self._closed_by_identity[identity] = row
-            feedback_id = str(row.get("feedback_id", "") or "").strip()
+    def _recovery_open_targets(self) -> list:
+        """Read only persisted OPEN identifiers before crash-replay checks.
+
+        The original recovery routine still verifies whether the corresponding
+        close is already in the CSV; only those specific rows must be indexed.
+        """
+        try:
+            raw = json.loads(self._open_state_path.read_text(encoding="utf-8-sig"))
+            opened = raw.get("open", {}) if isinstance(raw, dict) else {}
+            return [row for row in opened.values() if isinstance(row, dict)] if isinstance(opened, dict) else []
+        except (OSError, ValueError, TypeError):
+            return []
+
+    def _reload_closed_locked(self, extra_pendings=()) -> None:
+        """Stream history; only cache rows corresponding to pending close IDs.
+
+        The CSV is immutable evidence except append/schema migration. The
+        eligibility summary and the most recent row for each pending identity
+        are sufficient for counters and idempotent crash recovery.
+        """
+        targets = list(self._abiertas.items())
+        for pending in extra_pendings or ():
+            if isinstance(pending, dict):
+                targets.append((str(pending.get("ticker", "") or "").upper(), pending))
+        identities, feedback_ids = set(), set()
+        for ticker, pending in targets:
+            key = self._pending_identity(ticker, pending)
+            if key is not None:
+                identities.add(key)
+            feedback_id = str(pending.get("feedback_id", "") or "").strip()
             if feedback_id:
-                self._closed_by_feedback_id[feedback_id] = row
+                feedback_ids.add(feedback_id)
+        index_targets = (frozenset(identities), frozenset(feedback_ids))
+        try:
+            stat = os.stat(self.ruta_csv)
+            signature = (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        except OSError:
+            signature = None
+        if signature == self._closed_signature and index_targets == self._closed_index_targets:
+            return
+
+        by_identity, by_feedback_id = {}, {}
+        summary = {}
+        if signature is not None:
+            with open(self.ruta_csv, "r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+
+                def valid_rows():
+                    for row in reader:
+                        if None in row or any(value is None for value in row.values()):
+                            # An interrupted append is not an eligible close.
+                            continue
+                        identity = observation_identity(row)
+                        feedback_id = str(row.get("feedback_id", "") or "").strip()
+                        if identity is not None and identity in identities:
+                            by_identity[identity] = dict(row)
+                        if feedback_id and feedback_id in feedback_ids:
+                            by_feedback_id[feedback_id] = dict(row)
+                        yield row
+
+                summary = summarize_closed_trades(valid_rows(), fieldnames=reader.fieldnames)
+
+        self._closed_rows = []
+        self._closed_by_identity = by_identity
+        self._closed_by_feedback_id = by_feedback_id
+        self._closed_summary = summary
+        self._closed_count = sum(
+            int(item.get("eligible_observations", 0)) for item in summary.values()
+        )
+        try:
+            stat_after = os.stat(self.ruta_csv)
+            after = (stat_after.st_mtime_ns, stat_after.st_size, stat_after.st_ino)
+        except OSError:
+            after = None
+        # If an external writer appended during our read, retry next time.
+        self._closed_signature = signature if after == signature else None
+        self._closed_index_targets = index_targets
 
     @staticmethod
     def _pending_identity(ticker: str, pending: dict):
@@ -424,7 +488,6 @@ class FeedbackStore:
         if not ticker:
             return
         with self._lock:
-            self._reload_closed_locked()
             pending = {
                 "feedback_id": uuid.uuid4().hex,
                 "features": feats,
@@ -436,6 +499,7 @@ class FeedbackStore:
                 "tipo": str(decision.tipo or "").upper(),
                 "timestamp": timestamp,
             }
+            self._reload_closed_locked(extra_pendings=[dict(pending, ticker=ticker)])
             if self._committed_close(ticker, pending) is not None:
                 return
             existing = self._abiertas.get(ticker)
@@ -491,7 +555,7 @@ class FeedbackStore:
                 with open(self.ruta_csv, "r+b") as handle:
                     os.fsync(handle.fileno())
                 fila = dict(committed)
-            self._cerradas_totales = len(eligible_closed_rows(self._closed_rows))
+            self._cerradas_totales = self._closed_count
             self._abiertas.pop(ticker, None)
             try:
                 self._persistir_abiertas_locked()
@@ -667,8 +731,7 @@ class FeedbackStore:
         try:
             with self._lock:
                 self._reload_closed_locked()
-                summary = summarize_closed_trades(self._closed_rows)
-                return int(summary.get(str(ticker or "").strip().upper(), {}).get(
+                return int(self._closed_summary.get(str(ticker or "").strip().upper(), {}).get(
                     "eligible_observations", 0
                 ))
         except Exception:
@@ -714,6 +777,6 @@ class FeedbackStore:
         try:
             with self._lock:
                 self._reload_closed_locked()
-                return len(eligible_closed_rows(self._closed_rows))
+                return self._closed_count
         except Exception:
             return 0
