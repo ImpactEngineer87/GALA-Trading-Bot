@@ -4465,6 +4465,13 @@ def ai_retraining_status():
             row["production_model_issue"] = (
                 "" if loaded else str(issues.get(ticker) or "modelo de producción no encontrado")
             )
+            model_version = row["production_model"].get("model_version")
+            override = trainer.manual_threshold_overrides.active(ticker, model_version)
+            row["manual_threshold"] = override["threshold"] if override else None
+            row["effective_threshold"] = (
+                row["manual_threshold"] if override else row["production_threshold"]
+            )
+            row["threshold_source"] = "MANUAL" if override else "MODEL"
             shadow_model = trainer.shadow_snapshot(ticker) if hasattr(trainer, "shadow_snapshot") else {}
             row["shadow_model"] = shadow_model
             # v3.3.4: historical score of the SHADOW artifact that is currently
