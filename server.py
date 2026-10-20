@@ -4297,6 +4297,61 @@ def market_quote():
 # =============================================================
 # AI TRAINING
 # =============================================================
+@app.route('/api/ai/retraining-control', methods=['GET', 'POST'])
+def ai_retraining_control():
+    """Audited operator opt-in; never starts training or places broker orders.
+
+    A POST affects only future eligible post-session SHADOW retraining. The
+    current engine sees it on its next closed trade and end-session check.
+    Config.yaml, existing models, learning state, and REAL modes are unchanged.
+    """
+    with _ENGINE_CONTROL_LOCK:
+        trainer = _ai_trainer_for_status()
+        current_cfg = _read_config_runtime()
+        training_cfg = ((current_cfg.get('agents') or {}).get('entrenamiento') or {})
+        session_hook_enabled = bool(training_cfg.get('reentrenar_fin_sesion', True))
+        if request.method == 'POST':
+            data = request.get_json(silent=True)
+            if not isinstance(data, dict) or type(data.get('enabled')) is not bool:
+                return jsonify(
+                    status='error', message='enabled debe ser true o false',
+                ), 400
+            if data['enabled'] and not trainer.shadow_enabled:
+                return jsonify(
+                    status='error',
+                    message='El modo SHADOW debe estar activo para habilitar reentrenamiento automático',
+                ), 409
+            if data['enabled'] and not session_hook_enabled:
+                return jsonify(
+                    status='error',
+                    message='reentrenar_fin_sesion está deshabilitado en config.yaml; no hay disparador automático',
+                ), 409
+            try:
+                state = trainer.ai_training_control.set_enabled(
+                    data['enabled'], session.get('username')
+                )
+            except (OSError, ValueError, TypeError) as exc:
+                return jsonify(status='error', message=str(exc)), 400
+            _log(
+                'WARN',
+                f"[IA] Reentrenamiento SHADOW post-sesión "
+                f"{'HABILITADO' if state['enabled'] else 'DESHABILITADO'} "
+                f"por {session.get('username')}. REAL sin cambios."
+            )
+        policy = trainer.refresh_automatic_retraining_policy()
+        return jsonify(
+            status='ok',
+            automatic_retraining=bool(trainer.auto_retrain_enabled),
+            only_after_session=bool(trainer.auto_retrain_only_after_session),
+            end_session_hook_enabled=session_hook_enabled,
+            auto_activate_production=False,
+            source=trainer.auto_retraining_policy_source,
+            warning=trainer.auto_retraining_policy_error or '',
+            training_started=False,
+            broker_orders_sent=False,
+        )
+
+
 @app.route('/api/ai/train', methods=['POST'])
 def trigger_training():
     """Manual fallback: retrain only tickers already eligible for x/50.
@@ -4345,7 +4400,7 @@ def trigger_training():
         "[IA] Reentrenamiento manual pending-only: " + ", ".join(eligible),
     )
     programado = trainer.solicitar_reentreno_todos(
-        eligible, solo_elegibles=True
+        eligible, solo_elegibles=True, manual=True
     )
     return jsonify({
         "status": "ok" if programado else "error",
@@ -4431,6 +4486,7 @@ def ai_retraining_status():
     """Per-ticker model availability and 30/50 retraining progress."""
     try:
         trainer = _ai_trainer_for_status()
+        trainer.refresh_automatic_retraining_policy()
         tickers = list(BOT_STATE.get("tickers") or [])
         rows = trainer.retraining_status(tickers)
         veto_rows = _veto_summary_rows(tickers)
@@ -4549,6 +4605,12 @@ def ai_retraining_status():
         return jsonify({
             "status": "ok",
             "automatic_retraining": bool(trainer.auto_retrain_enabled),
+            "automatic_retraining_source": trainer.auto_retraining_policy_source,
+            "automatic_retraining_warning": trainer.auto_retraining_policy_error,
+            "end_session_training_hook_enabled": bool(
+                (((_read_config_runtime().get("agents") or {}).get("entrenamiento") or {})
+                 .get("reentrenar_fin_sesion", True))
+            ),
             "only_after_session": bool(trainer.auto_retrain_only_after_session),
             "auto_activate_production": bool(trainer.auto_activate_production),
             "warning_samples": int(trainer.retrain_warning_samples),

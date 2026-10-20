@@ -135,13 +135,22 @@ class EntrenadorAgentes:
             learning_cfg.get("max_counterfactual_to_actual_fit_ratio", 1.0)
         ))
         auto_cfg = cfg.get("automatic_retraining", {}) or {}
+        from core.ai_training_control import AITrainingControl
+        self.ai_training_control = AITrainingControl(
+            cfg.get("ai_training_control", {}) or {}
+        )
+        self._configured_auto_training = {
+            "configured_enabled": bool(auto_cfg.get("enabled", self.activo)),
+            "configured_only_after_session": bool(auto_cfg.get("only_after_session", False)),
+            "configured_auto_activate_production": bool(auto_cfg.get("auto_activate_production", False)),
+        }
+        self.auto_retrain_enabled = False
+        self.auto_retrain_only_after_session = True
+        self.auto_activate_production = False
+        self.auto_retraining_policy_source = "CONFIG"
+        self.auto_retraining_policy_error = ""
+        self.refresh_automatic_retraining_policy()
         self.reentrenar_cada_n: int = int(cfg.get("reentrenar_cada_n", 50))
-        self.auto_retrain_enabled: bool = bool(
-            auto_cfg.get("enabled", self.activo))
-        self.auto_retrain_only_after_session: bool = bool(
-            auto_cfg.get("only_after_session", False))
-        self.auto_activate_production: bool = bool(
-            auto_cfg.get("auto_activate_production", False))
         self.retrain_warning_samples: int = int(
             auto_cfg.get("warning_samples", 30))
         self.retrain_trigger_samples: int = int(
@@ -373,6 +382,32 @@ class EntrenadorAgentes:
     # ENTRENAMIENTO (por ticker)
     # =========================================================
 
+    def refresh_automatic_retraining_policy(self) -> dict:
+        """Refresh the operator's persisted setting without restarting the bot.
+
+        Invalid/unreadable state fails closed rather than starting heavy XGBoost
+        jobs unexpectedly. Automatic jobs are SHADOW-only irrespective of any
+        legacy auto-activate setting.
+        """
+        try:
+            policy = self.ai_training_control.policy(**self._configured_auto_training)
+        except (OSError, ValueError, TypeError) as exc:
+            policy = {
+                "enabled": False,
+                "only_after_session": True,
+                "auto_activate_production": False,
+                "source": "ERROR",
+                "error": str(exc),
+            }
+        self.auto_retrain_enabled = bool(policy["enabled"])
+        self.auto_retrain_only_after_session = bool(policy["only_after_session"])
+        self.auto_activate_production = False
+        self.auto_retraining_policy_source = str(policy.get("source", "CONFIG"))
+        self.auto_retraining_policy_error = str(policy.get("error", ""))
+        return {
+            **policy, "auto_activate_production": False,
+        }
+
     def quizas_reentrenar_ticker(self, ticker: str, total_cerradas_ticker: int) -> Optional[dict]:
         """Update the per-ticker counter and schedule only when policy permits.
 
@@ -384,6 +419,7 @@ class EntrenadorAgentes:
         if not ticker:
             return None
         progress = self.retraining.register_closed(ticker, total_cerradas_ticker)
+        self.refresh_automatic_retraining_policy()
         if not self.auto_retrain_enabled:
             return progress
         if self.auto_retrain_only_after_session:
@@ -423,7 +459,7 @@ class EntrenadorAgentes:
 
             metricas = self.entrenar_ticker(
                 ticker,
-                allow_production_activation=self.auto_activate_production,
+                allow_production_activation=False,
                 automatic=True,
             )
             accepted = bool(metricas and metricas.get("shadow_candidate_accepted"))
@@ -1124,6 +1160,7 @@ class EntrenadorAgentes:
         tickers,
         *,
         solo_elegibles: bool = False,
+        manual: bool = False,
     ) -> bool:
         """Schedule retraining without blocking the trading engine.
 
@@ -1133,8 +1170,11 @@ class EntrenadorAgentes:
         """
         lista = list(dict.fromkeys(str(t).upper() for t in (tickers or []) if str(t).strip()))
         if solo_elegibles:
-            if not self.auto_retrain_enabled:
+            self.refresh_automatic_retraining_policy()
+            if not manual and not self.auto_retrain_enabled:
                 return False
+            # Only actual verified closures advance this trigger. Supplemental
+            # resolved signals are admitted to FIT only, never VALIDATION/TEST.
             lista = self.retraining.eligible_tickers(lista)
         elif not self.activo and not self.shadow_enabled:
             return False
@@ -1190,7 +1230,7 @@ class EntrenadorAgentes:
 
                 metrics = self.entrenar_ticker(
                     ticker,
-                    allow_production_activation=self.auto_activate_production,
+                    allow_production_activation=False,
                     automatic=True,
                 )
 
