@@ -46,6 +46,7 @@ from agents.learning_economics import (
 )
 from agents.retraining_lifecycle import RetrainingLifecycle
 from agents.volume_features import VOLUME_FEATURE_NAMES
+from core.project_paths import resolve_runtime_path
 
 
 # AI v4: only causal, non-constant model inputs.  GSCO has no aligned
@@ -88,12 +89,12 @@ class EntrenadorAgentes:
         self._shadow_snapshots = {}
         agents_cfg = config.get("agents", {})
         cfg = agents_cfg.get("entrenamiento", {})
-        self.reportes_dir = cfg.get('reportes_dir', 'data/reportes')
+        self.reportes_dir = resolve_runtime_path(cfg.get('reportes_dir', 'data/reportes'))
         shadow_cfg = agents_cfg.get("shadow_mode", {})
         self.activo: bool = cfg.get("activo", True)
         self.shadow_enabled: bool = bool(shadow_cfg.get("enabled", False))
-        self.shadow_models_dir: str = shadow_cfg.get(
-            "modelos_dir", "data/modelos_shadow")
+        self.shadow_models_dir: str = resolve_runtime_path(shadow_cfg.get(
+            "modelos_dir", "data/modelos_shadow"))
         self.shadow_tickers = {
             str(t).upper() for t in shadow_cfg.get("tickers", []) if str(t).strip()
         }
@@ -108,8 +109,8 @@ class EntrenadorAgentes:
         self.shadow_min_improvement: float = float(
             shadow_cfg.get("min_improvement_pp", 0.0)) / 100.0
         # Carpeta para los modelos por ticker (uno por acción).
-        self.modelos_dir: str = cfg.get("modelos_dir", "data/modelos")
-        self.feedback_path: str = cfg.get("feedback_path", "data/agentes_feedback.csv")
+        self.modelos_dir: str = resolve_runtime_path(cfg.get("modelos_dir", "data/modelos"))
+        self.feedback_path: str = resolve_runtime_path(cfg.get("feedback_path", "data/agentes_feedback.csv"))
         # v3.3.7: supplemental signal familiarization.  x/50 and all
         # validation/test metrics remain based on execution-valid CLOSED trades.
         # Resolved non-executed signals may augment FIT only with a lower weight.
@@ -118,7 +119,7 @@ class EntrenadorAgentes:
         self.signal_learning_training_enabled: bool = bool(
             learning_cfg.get("use_for_training", True)
         )
-        self.signal_learning_path: str = str(
+        self.signal_learning_path: str = resolve_runtime_path(
             learning_cfg.get("path", "data/signal_learning_observations.csv")
         )
         self.signal_learning_weight: float = min(1.0, max(0.0, float(
@@ -139,7 +140,7 @@ class EntrenadorAgentes:
             auto_cfg.get("warning_samples", 30))
         self.retrain_trigger_samples: int = int(
             auto_cfg.get("retrain_samples", self.reentrenar_cada_n))
-        self.retrain_state_path: str = str(
+        self.retrain_state_path: str = resolve_runtime_path(
             auto_cfg.get("state_path", "data/retraining_state.json"))
         self.min_muestras: int = cfg.get("min_muestras", 40)
         self.umbral_meta: float = cfg.get("umbral_meta_filtro", 0.50)
@@ -190,6 +191,7 @@ class EntrenadorAgentes:
         # after it changes. Other requests wait for the refreshed cache.
         self._status_feedback_load_lock = threading.Lock()
         self._modelos: Dict[str, object] = {}     # approved production models
+        self.model_load_errors: Dict[str, str] = {}
         self._umbrales: Dict[str, float] = {}
         self._modelos_shadow: Dict[str, object] = {}
         self._umbrales_shadow: Dict[str, float] = {}
@@ -1464,66 +1466,66 @@ class EntrenadorAgentes:
         return os.path.join(self.shadow_models_dir, f"modelo_{ticker}.meta.json")
 
     def _archivar_modelo_incompatible(self, ticker: str, motivo: str):
-        """Move an obsolete/corrupt artifact away from the active model path."""
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        movidos = []
-        for path in (self._ruta_modelo(ticker), self._ruta_meta(ticker)):
-            if not os.path.exists(path):
-                continue
-            destino = f"{path}.incompatible_{stamp}"
-            try:
-                os.replace(path, destino)
-                movidos.append(destino)
-            except OSError:
-                pass
-        if movidos:
-            print(
-                f"[Agentes] Artefacto {ticker} archivado por incompatibilidad "
-                f"({motivo}); no se cargará en vivo."
-            )
+        """Fail closed WITHOUT renaming operator-owned production artifacts.
+
+        Prior versions moved a model and its metadata away on any load error.
+        That can make an otherwise recoverable deployment issue look like a
+        missing model. Preservation is mandatory: diagnosis is read-only.
+        """
+        self.model_load_errors[ticker] = str(motivo)
+        print(
+            f"[Agentes] PRODUCTION {ticker}: no cargable ({motivo}). "
+            "Artefactos conservados en su ruta original; REAL bloqueado."
+        )
 
     def _cargar_si_existe(self):
         try:
             if not os.path.isdir(self.modelos_dir):
+                print(f"[Agentes] Directorio de modelos PRODUCTION ausente: {self.modelos_dir}")
                 return
-            for nombre in os.listdir(self.modelos_dir):
-                if nombre.startswith("modelo_") and nombre.endswith(".pkl"):
-                    ticker = nombre[len("modelo_"):-len(".pkl")]
-                    try:
-                        meta_path = self._ruta_meta(ticker)
-                        if not os.path.exists(meta_path):
-                            # Artefacto legado sin esquema de volumen validado.
-                            self._archivar_modelo_incompatible(
-                                ticker, "sin metadata")
-                            continue
-                        with open(meta_path, "r", encoding="utf-8") as f:
-                            meta = json.load(f)
-                        if meta.get("feature_version") != FEATURE_VERSION \
-                           or meta.get("features") != FEATURES \
-                           or meta.get("training_policy_version") != TRAINING_POLICY_VERSION:
-                            self._archivar_modelo_incompatible(
-                                ticker, "versión/esquema distinto")
-                            continue
-                        with open(os.path.join(self.modelos_dir, nombre), "rb") as f:
-                            modelo = pickle.load(f)
-                        if int(getattr(modelo, "n_features_in_", -1)) != len(FEATURES):
-                            self._archivar_modelo_incompatible(
-                                ticker, "número de features distinto")
-                            continue
-                        self._modelos[ticker] = modelo
-                        from core.model_identity import model_snapshot
-                        self._production_snapshots[ticker] = model_snapshot(meta, self._ruta_modelo(ticker), True)
-                        self._umbrales[ticker] = float(
-                            meta.get("decision_threshold", self.umbral_meta))
-                        self._ultimo_reentreno[ticker] = int(meta.get("muestras", 0))
-                    except Exception:
-                        self._archivar_modelo_incompatible(
-                            ticker, "archivo ilegible")
+            for nombre in sorted(os.listdir(self.modelos_dir)):
+                if not (nombre.startswith("modelo_") and nombre.endswith(".pkl")):
+                    continue
+                ticker = nombre[len("modelo_"):-len(".pkl")].upper()
+                try:
+                    meta_path = self._ruta_meta(ticker)
+                    if not os.path.isfile(meta_path):
+                        self._archivar_modelo_incompatible(ticker, "metadata faltante")
                         continue
+                    with open(meta_path, "r", encoding="utf-8") as handle:
+                        meta = json.load(handle)
+                    if (
+                        meta.get("feature_version") != FEATURE_VERSION
+                        or meta.get("features") != FEATURES
+                        or meta.get("training_policy_version") != TRAINING_POLICY_VERSION
+                    ):
+                        self._archivar_modelo_incompatible(
+                            ticker, "versión/esquema de modelo incompatible"
+                        )
+                        continue
+                    with open(self._ruta_modelo(ticker), "rb") as handle:
+                        modelo = pickle.load(handle)
+                    if int(getattr(modelo, "n_features_in_", -1)) != len(FEATURES):
+                        self._archivar_modelo_incompatible(ticker, "número de features distinto")
+                        continue
+                    self._modelos[ticker] = modelo
+                    from core.model_identity import model_snapshot
+                    self._production_snapshots[ticker] = model_snapshot(
+                        meta, self._ruta_modelo(ticker), True
+                    )
+                    self._umbrales[ticker] = float(
+                        meta.get("decision_threshold", self.umbral_meta)
+                    )
+                    self._ultimo_reentreno[ticker] = int(meta.get("muestras", 0))
+                except Exception as exc:
+                    self._archivar_modelo_incompatible(
+                        ticker, f"error de lectura: {type(exc).__name__}"
+                    )
+                    continue
             if self._modelos:
                 print(f"[Agentes] Modelos por ticker cargados: {sorted(self._modelos.keys())}")
-        except Exception as e:
-            print(f"[Agentes] No se pudieron cargar los modelos por ticker: {e}")
+        except Exception as exc:
+            print(f"[Agentes] No se pudieron listar los modelos por ticker: {exc}")
 
     def _cargar_shadow_si_existe(self):
         if not self.shadow_enabled or not os.path.isdir(self.shadow_models_dir):
