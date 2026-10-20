@@ -34,7 +34,26 @@ def main():
     print(f"Feedback ledger: {feedback_path} exists={feedback_path.exists()}")
     print(f"Retraining state: {state_path} exists={state_path.exists()}")
     print(f"Signal learning enabled={learning.get('enabled', True)}, use_for_training={learning.get('use_for_training', True)}")
-    print(f"AI filter activo={training.get('activo', True)}, auto_retraining={auto.get('enabled')}, after_session={auto.get('only_after_session')}")
+    from core.ai_training_control import AITrainingControl
+    try:
+        policy = AITrainingControl(training.get("ai_training_control", {}) or {}).policy(
+            configured_enabled=bool(auto.get("enabled", training.get("activo", True))),
+            configured_only_after_session=bool(auto.get("only_after_session", False)),
+            configured_auto_activate_production=bool(auto.get("auto_activate_production", False)),
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        policy = {
+            "enabled": False, "only_after_session": True,
+            "auto_activate_production": False, "source": "ERROR",
+            "error": str(exc),
+        }
+    print(f"AI filter activo={training.get('activo', True)}"
+          f", automatic_training={policy['enabled']}"
+          f", after_session={policy['only_after_session']}"
+          f", source={policy['source']}"
+          f", automatic_production_promotion=False")
+    if policy.get("error"):
+        print(f"Training control problem: {policy['error']}")
     print("All counts below are read-only, based on the current persisted CSV.")
     # Keep at most one small terminal status per observation ID. A signal may
     # have OPEN and RESOLVED events; counting raw CSV rows would double count.
