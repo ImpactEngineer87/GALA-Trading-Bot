@@ -5,10 +5,16 @@ recovery timestamp; this alone cannot prove a fill. Only a fresh authoritative
 broker order read in the guarded SmartExit recovery path can confirm it.
 """
 import json
+import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
 import yaml
+
+# Allow both `python scripts/audit_recovered_flat_evidence.py` and
+# `python -m scripts.audit_recovered_flat_evidence`, as with other audits.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.execution_v2 import SmartExit
 from core.project_paths import resolve_runtime_path
@@ -22,7 +28,7 @@ def _positive(value):
 
 
 def main():
-    cfg = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8")) or {}
+    cfg = yaml.safe_load((PROJECT_ROOT / "config.yaml").read_text(encoding="utf-8")) or {}
     path = Path(resolve_runtime_path((cfg.get("execution_engine", {}) or {}).get(
         "history_path", "data/execution_v2.jsonl"
     )))
