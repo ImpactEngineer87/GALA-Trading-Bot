@@ -31,8 +31,11 @@ to reread **known previously submitted order IDs**.
 The proposed patch:
 
 1. Runs only after the existing broker-flat and no-WORKING-order safeguards.
-2. Confirms that the stored original exit intent matches the requesting
-   ticker's side and share quantity.
+2. Confirms that the stored exit intent matches the requesting ticker's
+   **exact engine position ID, side and share quantity**. Newly created
+   SmartExit states retain the original position ID supplied by the engine.
+   Legacy pending journals without that provenance are never upgraded to
+   verified training evidence simply because the broker is flat.
 3. Uses existing `detalle_orden` GET lookups to reread the exact, known
    exit order IDs. It never places or cancels orders.
 4. Accepts completed evidence **only if** unique IDs, terminal broker states,
