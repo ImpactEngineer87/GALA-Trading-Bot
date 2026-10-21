@@ -33,7 +33,8 @@ class SmartExitVerifiedRecoveryTests(unittest.TestCase):
     def state(self, *, qty=5, side="BUY", order_ids=("limit-1", "market-2")):
         state = {
             "ticker": "META", "side": side, "quantity": qty,
-            "reason": "CLOSE", "quote": {}, "limit": None,
+            "reason": "CLOSE", "position_id": "position-2026-META",
+            "execution_id": "execution-2026-META", "quote": {}, "limit": None,
             "reference_price": None,
             "legs": [
                 {"order_id": order_id, "status": "SUBMITTED",
@@ -44,10 +45,12 @@ class SmartExitVerifiedRecoveryTests(unittest.TestCase):
         self.bot.pending.put(self.key, state)
         return state
 
-    def recover(self, state, *, side="BUY", qty=5):
+    def recover(self, state, *, side="BUY", qty=5,
+                position_id="position-2026-META"):
         return self.bot._recover_flat(
             self.key, state, "Broker confirmed FLAT; old order is not WORKING",
             account="test-account", requested_side=side, requested_quantity=qty,
+            requested_position_id=position_id,
         )
 
     def test_complete_two_leg_broker_fills_recover_true_weighted_price(self):
@@ -98,14 +101,18 @@ class SmartExitVerifiedRecoveryTests(unittest.TestCase):
                 self.assertFalse(res["fill_price_verified"])
                 self.assertEqual(self.bot.history.recent()[-1]["event"], "EXIT_RECOVERED_FLAT")
 
-    def test_stale_request_side_or_quantity_cannot_claim_old_broker_fills(self):
+    def test_stale_request_side_quantity_or_identity_cannot_claim_old_broker_fills(self):
         self.broker_details["one-order"] = {
             "status": "FILLED", "filled": 5, "avg_price": 100,
         }
-        for side, qty in (("SELL", 5), ("BUY", 6)):
-            with self.subTest(side=side, qty=qty):
+        for side, qty, identity in (
+            ("SELL", 5, "position-2026-META"),
+            ("BUY", 6, "position-2026-META"),
+            ("BUY", 5, "different-position-id"),
+        ):
+            with self.subTest(side=side, qty=qty, identity=identity):
                 state = self.state(order_ids=("one-order",))
-                res = self.recover(state, side=side, qty=qty)
+                res = self.recover(state, side=side, qty=qty, position_id=identity)
                 self.assertFalse(res["fill_price_verified"])
         self.executor.detalle_orden.assert_not_called()
 
