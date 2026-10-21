@@ -1535,7 +1535,8 @@ class EjecutorHibridoDeOrdenes:
             context = getattr(self._lifecycle_local, 'fields', None) or {}
             try:
                 return self._smart_exit.close(ticker, tipo_entrada, cantidad, account_number, motivo,
-                                              context.get('exit_signal_price'))
+                                              context.get('exit_signal_price'),
+                                              position_id=context.get('position_id'))
             except Exception as exc:
                 return {'status': 'RECONCILIAR', 'posicion_plana': False,
                         'mensaje': f'Execution recovery required: {type(exc).__name__}'}
