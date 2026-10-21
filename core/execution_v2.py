@@ -109,7 +109,7 @@ class SmartExit:
             return None
 
     def _new_state(self, ticker, side, quantity, reason, reference_price=None,
-                   recovery_from=None):
+                   recovery_from=None, position_id=None):
         q = self._quote(ticker)
         emergency = self._is_emergency(reason)
         limit = marketable_price(
@@ -121,6 +121,7 @@ class SmartExit:
             'side': side,
             'quantity': int(quantity),
             'reason': reason,
+            'position_id': str(position_id or ''),
             'created_utc': utc_now(),
             'reference_price': reference_price,
             'quote': q,
@@ -182,7 +183,8 @@ class SmartExit:
         return (avg, last_filled_id) if math.isfinite(avg) and avg > 0 else None
 
     def _recover_flat(self, key, state, reason, *, account=None,
-                      requested_side=None, requested_quantity=None):
+                      requested_side=None, requested_quantity=None,
+                      requested_position_id=None):
         """Broker is flat but historical fill evidence is incomplete.
 
         Safety and model-learning are intentionally separated: the position is
@@ -199,6 +201,8 @@ class SmartExit:
                 and str(state.get('side', '') or '').upper()
                     == str(requested_side or '').upper()
                 and int(state.get('quantity', 0)) == int(requested_quantity)
+                and bool(state.get('position_id'))
+                and str(state.get('position_id')) == str(requested_position_id or '')
             )
         except (TypeError, ValueError, OverflowError):
             matches_request = False
@@ -289,7 +293,7 @@ class SmartExit:
         return True
 
     def _replace_stale_emergency_state(self, key, state, ticker, side, quantity,
-                                       reason, reference_price):
+                                       reason, reference_price, position_id=None):
         old_ids = [str(x.get('order_id', '') or '') for x in state.get('legs', [])]
         recovery = {
             'old_execution_id': state.get('execution_id', ''),
@@ -299,7 +303,7 @@ class SmartExit:
         }
         new_state = self._new_state(
             ticker, side, quantity, reason, reference_price,
-            recovery_from=recovery,
+            recovery_from=recovery, position_id=position_id,
         )
         # One atomic replacement: there is never a window where a crash loses the
         # durable intent while broker exposure still exists.
@@ -326,7 +330,7 @@ class SmartExit:
         return new_state
 
     def _replace_stale_normal_state(self, key, state, ticker, side, quantity,
-                                    reason, reference_price):
+                                    reason, reference_price, position_id=None):
         """Rebuild a proven-stale normal exit from current broker exposure.
 
         v3.3.5 extends stale-journal recovery to reversals/TP/opposite-signal
@@ -343,7 +347,7 @@ class SmartExit:
         }
         new_state = self._new_state(
             ticker, side, quantity, reason, reference_price,
-            recovery_from=recovery,
+            recovery_from=recovery, position_id=position_id,
         )
         self.pending.put(key, new_state)
         self.history.append({
@@ -367,7 +371,8 @@ class SmartExit:
         )
         return new_state
 
-    def close(self, ticker, side, quantity, account, reason, reference_price=None):
+    def close(self, ticker, side, quantity, account, reason, reference_price=None,
+              position_id=None):
         key = hashlib.sha256(str(account).encode()).hexdigest()[:16] + ':' + ticker
         emergency = self._is_emergency(reason)
         # This method is called within the executor's symbol lock.
@@ -383,7 +388,8 @@ class SmartExit:
                         'broker_status': 'FLAT', 'order_id': '', 'avg_price': 0,
                         'fill_price_verified': False}
             state = self._new_state(
-                ticker, broker_side, broker_qty, reason, reference_price
+                ticker, broker_side, broker_qty, reason, reference_price,
+                position_id=position_id,
             )
             self.pending.put(key, state)
 
@@ -456,7 +462,7 @@ class SmartExit:
                     key, state,
                     'Prior exit is no longer WORKING and Schwab confirms the position is flat',
                     account=account, requested_side=side,
-                    requested_quantity=quantity,
+                    requested_quantity=quantity, requested_position_id=position_id,
                 )
             if not emergency:
                 requested_side = str(side or '').upper()
@@ -473,14 +479,16 @@ class SmartExit:
                 # broker-confirmed remaining quantity and continue with the normal
                 # marketable-LIMIT policy.
                 state = self._replace_stale_normal_state(
-                    key, state, ticker, broker_side, broker_qty, reason, reference_price
+                    key, state, ticker, broker_side, broker_qty, reason, reference_price,
+                    position_id=position_id,
                 )
             else:
                 # Emergency/KILL path: safety takes precedence over stale historical
                 # accounting. Rebuild from *current* broker side/quantity and submit a
                 # fresh MARKET close only after proving there are no live orders.
                 state = self._replace_stale_emergency_state(
-                    key, state, ticker, broker_side, broker_qty, reason, reference_price
+                    key, state, ticker, broker_side, broker_qty, reason, reference_price,
+                    position_id=position_id,
                 )
 
         # At most one LIMIT attempt and one MARKET remainder per operation.
@@ -518,10 +526,11 @@ class SmartExit:
                             key, state,
                             'Schwab is flat after a terminal/unknown prior exit; fill accounting was incomplete',
                             account=account, requested_side=side,
-                            requested_quantity=quantity,
+                            requested_quantity=quantity, requested_position_id=position_id,
                         )
                     state = self._replace_stale_emergency_state(
-                        key, state, ticker, broker_side, broker_qty, reason, reference_price
+                        key, state, ticker, broker_side, broker_qty, reason, reference_price,
+                        position_id=position_id,
                     )
                     continue
                 return self._pending_result(state, 'Position and confirmed fills disagree; reconcile before retry')
