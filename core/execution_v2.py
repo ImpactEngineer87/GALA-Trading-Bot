@@ -135,7 +135,54 @@ class SmartExit:
             state['recovery_from'] = recovery_from
         return state
 
-    def _recover_flat(self, key, state, reason):
+    @staticmethod
+    def _verified_fill_legs(state):
+        """Return actual broker-weighted exit fill price and order id, or None.
+
+        A FLAT position, quoted price, limit price, incomplete order list, or
+        duplicate order identity is never sufficient for training evidence.
+        Require a terminal broker order detail and a real execution price for
+        *every* filled share, with total shares exactly equal to the original
+        exit intent. Partial fills in canceled LIMIT legs are allowed.
+        """
+        try:
+            target = int(state.get('quantity', 0))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if target <= 0 or not state.get('legs'):
+            return None
+        seen = set()
+        qty = 0.0
+        gross = 0.0
+        last_filled_id = ''
+        for leg in state['legs']:
+            if not isinstance(leg, dict):
+                return None
+            oid = str(leg.get('order_id', '') or '').strip()
+            status = str(leg.get('status', '') or '').upper()
+            try:
+                filled = float(leg.get('filled', 0) or 0)
+                price = float(leg.get('avg_price', 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if (not oid or oid in seen or status not in TERMINAL
+                    or not math.isfinite(filled) or filled < 0):
+                return None
+            seen.add(oid)
+            if filled:
+                if (status not in {'FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED'}
+                        or not math.isfinite(price) or price <= 0):
+                    return None
+                qty += filled
+                gross += filled * price
+                last_filled_id = oid
+        if not last_filled_id or not math.isclose(qty, target, abs_tol=1e-6, rel_tol=0):
+            return None
+        avg = gross / qty
+        return (avg, last_filled_id) if math.isfinite(avg) and avg > 0 else None
+
+    def _recover_flat(self, key, state, reason, *, account=None,
+                      requested_side=None, requested_quantity=None):
         """Broker is flat but historical fill evidence is incomplete.
 
         Safety and model-learning are intentionally separated: the position is
@@ -143,6 +190,35 @@ class SmartExit:
         ``fill_price_verified=False`` tells the engine to quarantine this close
         from the verified x/50 learning set.
         """
+        # The pending journal may belong to a previous trade in the same
+        # ticker. Do not attribute its executions to a later position, even if
+        # Schwab is flat. Match the requesting side and expected share count.
+        try:
+            matches_request = (
+                account is not None
+                and str(state.get('side', '') or '').upper()
+                    == str(requested_side or '').upper()
+                and int(state.get('quantity', 0)) == int(requested_quantity)
+            )
+        except (TypeError, ValueError, OverflowError):
+            matches_request = False
+        if matches_request:
+            # Read-only broker details: no new order, cancel, or fill is
+            # generated. Never trust stale cached fields after a GET failure.
+            for leg in state.get('legs', []):
+                try:
+                    if not leg.get('order_id'):
+                        break
+                    self._refresh(account, leg)
+                except Exception:
+                    leg['status'] = 'UNKNOWN'
+                    leg['filled'] = 0
+                    leg['avg_price'] = 0
+            evidence = self._verified_fill_legs(state)
+            if evidence is not None:
+                state['recovered_from_broker_flat'] = True
+                state['fill_evidence_source'] = 'BROKER_ORDER_EXECUTION_LEGS'
+                return self._complete(key, state)
         last = (state.get('legs') or [{}])[-1]
         last_id = str(last.get('order_id', '') or '')
         event = {
@@ -379,6 +455,8 @@ class SmartExit:
                 return self._recover_flat(
                     key, state,
                     'Prior exit is no longer WORKING and Schwab confirms the position is flat',
+                    account=account, requested_side=side,
+                    requested_quantity=quantity,
                 )
             if not emergency:
                 requested_side = str(side or '').upper()
@@ -439,6 +517,8 @@ class SmartExit:
                         return self._recover_flat(
                             key, state,
                             'Schwab is flat after a terminal/unknown prior exit; fill accounting was incomplete',
+                            account=account, requested_side=side,
+                            requested_quantity=quantity,
                         )
                     state = self._replace_stale_emergency_state(
                         key, state, ticker, broker_side, broker_qty, reason, reference_price
@@ -503,10 +583,12 @@ class SmartExit:
                 self.executor.esperar_posicion_plana(account, ticker, timeout_s=self.executor.flat_timeout_s)
 
     def _complete(self, key, state):
-        fills = [leg for leg in state['legs'] if leg['filled'] > 0]
-        if any(leg['avg_price'] <= 0 or not math.isfinite(leg['avg_price']) for leg in fills):
-            return self._pending_result(state, 'Position flat, but actual fill prices are unavailable')
-        avg = sum(leg['filled'] * leg['avg_price'] for leg in fills) / state['quantity']
+        verified = self._verified_fill_legs(state)
+        if verified is None:
+            return self._pending_result(
+                state, 'Position flat, but complete broker fill evidence is unavailable'
+            )
+        avg, last_id = verified
         q = state['quote']
         reference = state.get('reference_price')
         benchmark = q.get('bid') if state['side'] == 'BUY' else q.get('ask')
@@ -518,7 +600,6 @@ class SmartExit:
                  'slippage_usd': sign * (avg - reference) * state['quantity'] if reference else None,
                  'quote_slippage_usd': sign * (avg - benchmark) * state['quantity'] if benchmark else None}
         self.history.append(event)
-        last_id = state['legs'][-1]['order_id'] if state['legs'] else ''
         self.executor._audit('EXIT_FILLED', ticker=state['ticker'], lado=state['side'],
             order_id=last_id, cantidad=state['quantity'], precio=avg, estado='FILLED',
             motivo=state['reason'], detalle={'execution_id': state['execution_id'],
