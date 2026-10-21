@@ -14,6 +14,13 @@ from core.execution_v2 import SmartExit
 from core.project_paths import resolve_runtime_path
 
 
+def _positive(value):
+    try:
+        return float(value or 0) > 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def main():
     cfg = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8")) or {}
     path = Path(resolve_runtime_path((cfg.get("execution_engine", {}) or {}).get(
@@ -43,8 +50,7 @@ def main():
                 row["no_exit_legs"] += 1
             if any(not leg.get("order_id") for leg in legs if isinstance(leg, dict)):
                 row["missing_order_identity"] += 1
-            if any(float(leg.get("filled", 0) or 0) > 0
-                   and float(leg.get("avg_price", 0) or 0) <= 0
+            if any(_positive(leg.get("filled")) and not _positive(leg.get("avg_price"))
                    for leg in legs if isinstance(leg, dict)):
                 row["positive_fills_missing_price"] += 1
             if SmartExit._verified_fill_legs(event):
