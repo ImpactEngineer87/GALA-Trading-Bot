@@ -6,6 +6,7 @@ Do not print broker account numbers, credentials, raw order IDs, or URLs.
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import json
 import re
@@ -31,8 +32,8 @@ AUDIT_EVENTS = {
 }
 
 
-def _path(value):
-    return Path(resolve_runtime_path(value))
+def _path(value, runtime_root):
+    return Path(resolve_runtime_path(value, project_root=runtime_root))
 
 
 def _positive(value):
@@ -59,16 +60,16 @@ def _safe_reason(value):
     return "(see private broker audit)" if reason else "(no reason recorded)"
 
 
-def inspect(config):
+def inspect(config, runtime_root=ROOT):
     log_path = _path((config.get("logging") or {}).get(
         "auditoria_ordenes", "data/auditoria_ordenes.csv"
-    ))
+    ), runtime_root)
     history_path = _path((config.get("execution_engine") or {}).get(
         "history_path", "data/execution_v2.jsonl"
-    ))
+    ), runtime_root)
     auto = (((config.get("agents") or {}).get("entrenamiento") or {})
             .get("automatic_retraining") or {})
-    state_path = _path(auto.get("state_path", "data/retraining_state.json"))
+    state_path = _path(auto.get("state_path", "data/retraining_state.json"), runtime_root)
     recent = {t: deque(maxlen=5) for t in TICKERS}
     recovery = {t: deque(maxlen=4) for t in TICKERS}
 
@@ -153,5 +154,14 @@ def inspect(config):
 
 
 if __name__ == "__main__":
-    cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8")) or {}
-    inspect(cfg)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--runtime-root", type=Path, default=ROOT,
+        help="Read config/data from the active installation while running an isolated worktree",
+    )
+    args = parser.parse_args()
+    runtime_root = args.runtime_root.resolve()
+    cfg = yaml.safe_load(
+        (runtime_root / "config.yaml").read_text(encoding="utf-8")
+    ) or {}
+    inspect(cfg, runtime_root)
