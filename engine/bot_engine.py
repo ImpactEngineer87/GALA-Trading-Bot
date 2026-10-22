@@ -3242,6 +3242,7 @@ class ChocoletraBot:
             self._emit_log("INFO", f"[{ticker}] Entrada {status} — hueco liberado")
             self._audit_event(
                 "ENTRY_TERMINATED", ticker=ticker, lado=pos.get("tipo", ""),
+                signal_id=str(getattr(pos.get("decision"), "signal_id", "") or ""),
                 estado=status, order_id=oid,
                 cantidad=pos.get("orden").cantidad if pos.get("orden") else "",
                 motivo="Entrada finalizada sin posición",
@@ -3311,6 +3312,7 @@ class ChocoletraBot:
             self._emit_log("INFO", f"[{ticker}] Entrada no llenada en {int(edad)}s — cancelada")
             self._audit_event(
                 "ENTRY_TIMEOUT_CANCELED", ticker=ticker, lado=pos.get("tipo", ""),
+                signal_id=str(getattr(pos.get("decision"), "signal_id", "") or ""),
                 estado=(cancelacion or {}).get("broker_status", "SIN_ORDER_ID"),
                 order_id=oid,
                 cantidad=pos.get("orden").cantidad if pos.get("orden") else "",
@@ -3814,6 +3816,7 @@ class ChocoletraBot:
                 self._audit_event(
                     "PENDING_ENTRY_CANCEL_FAILED", ticker=ticker,
                     lado=pos.get("tipo", ""),
+                    signal_id=str(getattr(pos.get("decision"), "signal_id", "") or ""),
                     estado=(cancelacion or {}).get("broker_status", "DESCONOCIDO"),
                     order_id=oid,
                     latency_ms=(cancelacion or {}).get("latency_ms"),
@@ -3833,6 +3836,7 @@ class ChocoletraBot:
         self._emit_log("INFO", f"[{ticker}] Entrada pendiente cancelada")
         self._audit_event(
             "PENDING_ENTRY_CANCELED", ticker=ticker, lado=pos.get("tipo", ""),
+            signal_id=str(getattr(pos.get("decision"), "signal_id", "") or ""),
             estado=(cancelacion or {}).get("broker_status", "CANCELED")
             if not paper_ticker else "SIMULADA",
             order_id=oid,
