@@ -992,6 +992,14 @@
         <div class="daily-risk-sub" id="tr-pnl-detail">Abierto $0.00 · Cerrado hoy $0.00</div>
       </div>
     </div>
+    <div class="card" style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+        <div class="card-title" style="margin:0">🏦 P/L Schwab · posiciones REAL abiertas</div>
+        <button class="btn btn-ghost btn-sm" onclick="fetchBrokerPositionPnL()">↻ Consultar Schwab</button>
+      </div>
+      <div class="section-note">Consulta manual de solo lectura. El P/L Day de las posiciones abiertas del broker no equivale al P/L de operaciones cerradas del bot ni al P/L Day total de Thinkorswim. Ningún dato desconocido se muestra como $0.</div>
+      <div id="brokerPositionPnL" class="section-note" style="margin-top:10px">Sin consultar · No se ha solicitado el valor de Schwab.</div>
+    </div>
     <div class="card">
       <div class="card-title">Posiciones abiertas — estado real del motor</div>
       <div class="section-note">Esta sección muestra únicamente posiciones actualmente abiertas. La cantidad inicial, el parcial 70/30 y la cantidad restante provienen directamente del motor de trading.</div>
@@ -2331,6 +2339,37 @@ function drawSignalChart(){
       <text id="crosshairTimeText" y="${H-B+17}" fill="#0f172a" text-anchor="middle" font-size="11" font-family="monospace" font-weight="800"></text>
     </g>
   </svg>`;
+}
+
+// ─────────────────────────────────────────────────────────
+// BROKER-NATIVE OPEN POSITION P/L (MANUAL FETCH)
+// ─────────────────────────────────────────────────────────
+async function fetchBrokerPositionPnL(){
+  const box=el('brokerPositionPnL');
+  if(!box)return;
+  box.textContent='Consultando posiciones abiertas en Schwab…';
+  try{
+    const response=await api('/api/broker/open-position-pnl');
+    const payload=await response.json();
+    if(!response.ok||payload.status!=='ok'){
+      box.textContent='No disponible: '+String(payload.message||'Schwab no confirmó posiciones');
+      return;
+    }
+    const positions=Array.isArray(payload.positions)?payload.positions:[];
+    const known=Number(payload.known_count||0), missing=Number(payload.unknown_count||0);
+    const amount=payload.position_day_pnl;
+    const amountText=amount==null
+      ? 'Total no verificable (datos P/L incompletos)'
+      : money(Number(amount));
+    const seen=String(payload.as_of_utc||'').replace('T',' ').slice(0,19);
+    const lines=positions.map(p=>{
+      const pnl=p.broker_position_day_pnl==null?'P/L N/D':money(Number(p.broker_position_day_pnl));
+      return `${String(p.ticker||'').replace(/[^A-Z0-9.-]/g,'')} ${Number(p.quantity||0)} acc · ${pnl}`;
+    });
+    box.textContent=`Fuente SCHWAB · ${seen} UTC · Posiciones abiertas: ${positions.length} · ${amountText} · P/L disponible ${known}, no disponible ${missing}${lines.length?' · '+lines.join(' | '):''}`;
+  }catch(e){
+    box.textContent='No disponible: error consultando Schwab';
+  }
 }
 
 // ─────────────────────────────────────────────────────────
