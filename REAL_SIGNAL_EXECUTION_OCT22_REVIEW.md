@@ -175,3 +175,44 @@ Operator ran the read-only audit from the **live runtime files**:
   executions**, not approvals, canceled LIMITs, or signal observations.
   No automatic model retraining, risk-guard override, manual promotion
   or broker order replays are introduced.
+
+
+## Manual AI retraining button fix (2026-10-23)
+
+Screenshot after the first live dashboard deployment showed:
+- `Auto IA OFF`, `17/17` datasets suitable for FIT/validation/TEST,
+  but **only** RCL `60/50`, MSFT `51/50`, ADBE `55/50` were
+  `PENDING_RETRAIN`. Readiness and `x/50` trigger are distinct counters.
+- Clicking `Reentrenar pendientes` was unable to start. Proven bug:
+  `server.py:/api/ai/train` passed `solo_elegibles=True`, and
+  `EntrenadorAgentes.solicitar_reentreno_todos()` unconditionally
+  returned False if `automatic_retraining.enabled=False`. It accidentally
+  applied the automatic worker gate to explicit manual requests.
+
+Fix:
+- `/api/ai/train` explicitly passes `manual_request=True`; the
+  training scheduler honors this **only for pending-only manual requests**.
+  Unattended `al_fin_sesion()` keeps `manual_request=False` and remains
+  blocked when Auto IA OFF. `eligible_tickers()` still enforces >=50 new
+  verified closed observations; no history/counter changes to pass the gate.
+- Manual route still refuses while the trading engine is running.
+  The worker still computes candidate in SHADOW, preserves actual-only
+  validation and TEST, and **cannot promote PRODUCTION automatically**
+  unless the existing separate configured authorization applies.
+- Dashboard renames the misleading `17/17` label to
+  `Datos aptos para evaluación`, tells the operator the job is queued,
+  and refreshes lifecycle at 1/5/15 seconds rather than implying an
+  accepted model immediately.
+- Tests in `tests/test_manual_retrain_auto_off.py` check manual access,
+  scheduler isolation, 50-close eligibility, no unauthorized production
+  activation, and deferred insufficient evidence.
+
+Deployment: Source changes in GitHub branch alone do not update a
+previously running Python process. Run new tests and full offline
+regression in the original source checkout after safely pausing only
+when there is no unresolved GALA-managed Schwab exposure. Restart only
+the dashboard/server on manual scheduler after broker preflight.
+Trigger the Train button only with trading engine STATIONARY and
+watch `journalctl -u gala -f --no-pager`. A SHADOW candidate can be
+REJECTED or WAITING_DATA; that is an evaluation outcome, not evidence
+the Train button failed.
