@@ -84,6 +84,12 @@ def audit(signals_path, orders_path, date, tickers, learning_path=None):
     linked = defaultdict(Counter)
     linked_skip_reason = {}
     unlinked = Counter()
+    # Old monitor-thread cancellation events do not always carry signal_id.
+    # Link them only when an exact (ticker, date, Schwab order_id) belongs
+    # uniquely to a previously linked ENTRY_SUBMITTED event. Never infer by
+    # time proximity, price, or a shared ticker alone.
+    entry_order_owners = {}
+    ambiguous_orders = set()
     if orders_path.exists():
         with orders_path.open(encoding="utf-8-sig", newline="") as f:
             for row in csv.DictReader(f):
@@ -97,6 +103,15 @@ def audit(signals_path, orders_path, date, tickers, learning_path=None):
                 signal_id = str(row.get("signal_id") or "").strip()
                 if signal_id:
                     linked[(ticker, signal_id)][event] += 1
+                    if event == "ENTRY_SUBMITTED":
+                        order_id = str(row.get("order_id") or "").strip()
+                        if order_id:
+                            key = (ticker, order_id)
+                            previous = entry_order_owners.get(key)
+                            if previous and previous != signal_id:
+                                ambiguous_orders.add(key)
+                            else:
+                                entry_order_owners[key] = signal_id
                     if event == "SIGNAL_EXECUTION_SKIPPED":
                         reason = str(row.get("motivo") or "").strip()
                         linked_skip_reason[(ticker, signal_id)] = re.sub(
@@ -104,6 +119,27 @@ def audit(signals_path, orders_path, date, tickers, learning_path=None):
                         )[:75]
                 else:
                     unlinked[(ticker, event)] += 1
+    if orders_path.exists() and entry_order_owners:
+        with orders_path.open(encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                if str(row.get("fecha") or "").strip()[:10] != date:
+                    continue
+                ticker = str(row.get("ticker") or "").upper()
+                event = str(row.get("evento") or "").upper()
+                if ticker not in targets or event not in {
+                    "ENTRY_TIMEOUT_CANCELED", "ENTRY_TERMINATED",
+                    "PENDING_ENTRY_CANCELED", "PENDING_ENTRY_CANCEL_FAILED",
+                }:
+                    continue
+                if str(row.get("signal_id") or "").strip():
+                    continue
+                order_id = str(row.get("order_id") or "").strip()
+                if not order_id or (ticker, order_id) in ambiguous_orders:
+                    continue
+                owner = entry_order_owners.get((ticker, order_id))
+                if owner:
+                    linked[(ticker, owner)][event] += 1
+                    unlinked[(ticker, event)] -= 1
     output = []
     for signal in signals:
         event_counts = linked.get((signal["ticker"], signal["signal_id"]), {})
@@ -173,7 +209,7 @@ def main():
                   f"AI={item['decision'] or 'N/A':18s} mode={item['mode'] or 'N/A':5s} "
                   f"order={events}"
                   + (f" | reason={reason}" if reason else ""))
-        unlinked_count = sum(v for (t, _), v in unlinked.items() if t == ticker)
+        unlinked_count = sum(max(0, v) for (t, _), v in unlinked.items() if t == ticker)
         print("  Unlinked audit events:", unlinked_count,
               "(cannot automatically attribute to any one signal)")
     print("\nNo broker state inferred, no files/counters/orders changed.")
