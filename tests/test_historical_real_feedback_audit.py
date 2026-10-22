@@ -48,6 +48,9 @@ class HistoricalRealFeedbackAuditTests(unittest.TestCase):
         self.assertEqual(rows["META"]["excluded"], 2)
         self.assertEqual(rows["META"]["local_fill_link_candidate"], 1)
         self.assertEqual(rows["META"]["missing_exit_id"], 1)
+        self.assertEqual(rows["META"]["audit_exit_filled_missing_price"], 0)
+        self.assertEqual(rows["META"]["audit_exit_filled_missing_quantity"], 0)
+        self.assertEqual(rows["META"]["audit_exit_filled_missing_id"], 0)
         self.assertEqual(before, (self.feedback.read_bytes(), self.executions.read_bytes()))
 
     def test_broker_fill_must_match_real_ticker_and_position_identity(self):
@@ -65,6 +68,26 @@ class HistoricalRealFeedbackAuditTests(unittest.TestCase):
         rows = audit(self.feedback, self.executions)
         self.assertEqual(rows["NKE"]["local_fill_link_candidate"], 0)
         self.assertEqual(rows["NKE"]["ambiguous_or_unlinked_local_fill"], 1)
+
+    def test_reports_incomplete_broker_audit_fields_separately(self):
+        self.write(self.feedback, [
+            {"ticker": "NVDA", "modo": "REAL", "execution_valid": "0",
+             "exclusion_reason": "BROKER_CONFIRMATION_MISSING",
+             "exit_order_id": "oid-9", "position_id": "p-9", "execution_id": "e-9"},
+        ])
+        self.write(self.executions, [
+            {"ticker": "NVDA", "modo": "REAL", "evento": "EXIT_FILLED",
+             "estado": "FILLED", "order_id": "oid-9", "precio": "",
+             "cantidad": "", "position_id": "", "execution_id": ""},
+        ])
+        stats = audit(self.feedback, self.executions)["NVDA"]
+        self.assertEqual(stats["audit_exit_filled_all_modes"], 1)
+        self.assertEqual(stats["audit_exit_filled_incomplete"], 1)
+        self.assertEqual(stats["audit_exit_filled_missing_price"], 1)
+        self.assertEqual(stats["audit_exit_filled_missing_quantity"], 1)
+        self.assertEqual(stats["audit_exit_filled_missing_position_id"], 1)
+        self.assertEqual(stats["audit_exit_filled_missing_execution_id"], 1)
+        self.assertEqual(stats["local_fill_link_candidate"], 0)
 
     def test_missing_audit_ledger_leaves_feedback_untouched(self):
         self.write(self.feedback, [
