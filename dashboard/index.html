@@ -884,7 +884,7 @@
     <div class="stats-row ai-learning-cards" aria-live="polite">
       <div class="stat-card green"><div class="stat-value" id="aiVerifiedClosed">—</div><div class="stat-label">Cierres verificados para IA</div><div class="daily-risk-sub" id="aiClosedSources">REAL — · PAPER —</div></div>
       <div class="stat-card purple"><div class="stat-value" id="aiResolvedSignals">—</div><div class="stat-label">Señales resueltas utilizables</div><div class="daily-risk-sub" id="aiSignalSources">Esperando resultados confirmados</div></div>
-      <div class="stat-card orange"><div class="stat-value" id="aiTrainingReady">—</div><div class="stat-label">Tickers listos para entrenar</div><div class="daily-risk-sub" id="aiTrainingSchedule">Cargando programación</div></div>
+      <div class="stat-card orange"><div class="stat-value" id="aiTrainingReady">—</div><div class="stat-label">Datos aptos para evaluación</div><div class="daily-risk-sub" id="aiTrainingSchedule">Cargando programación</div></div>
       <div class="stat-card"><div class="stat-value" id="aiEconomicEvidence">—</div><div class="stat-label">TEST con puerta económica aprobada</div><div class="daily-risk-sub" id="aiEconomicDetail">Resultados de candidatos, con costes estimados</div></div>
     </div>
     <div class="card" style="margin-bottom:16px">
@@ -3167,9 +3167,17 @@ async function triggerTraining(){
   try {
     const r = await api('/api/ai/train',{method:'POST'});
     const d = await r.json();
-    if(r.ok) toast('ok','Entrenamiento iniciado 🧠',d.message);
-    else toast('err','Entrenamiento no iniciado',d.message || 'No hay tickers elegibles');
-    setTimeout(fetchAIStatus, 1000);
+    if(r.ok) {
+      toast('ok','Evaluación SHADOW en cola 🧠',d.message || 'Iniciada manualmente');
+      // The worker updates lifecycle asynchronously. Never imply that the
+      // candidate was accepted or made PRODUCTION by an HTTP 200 response.
+      setTimeout(fetchAIStatus, 1000);
+      setTimeout(fetchAIStatus, 5000);
+      setTimeout(fetchAIStatus, 15000);
+    } else {
+      toast('err','Entrenamiento no iniciado',d.message || 'No hay tickers con 50 cierres nuevos');
+      setTimeout(fetchAIStatus, 1000);
+    }
   } catch(e){ toast('err','Error','No se pudo iniciar el entrenamiento'); }
 }
 
