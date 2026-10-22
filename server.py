@@ -4381,12 +4381,12 @@ def trigger_training():
         "[IA] Reentrenamiento manual pending-only: " + ", ".join(eligible),
     )
     programado = trainer.solicitar_reentreno_todos(
-        eligible, solo_elegibles=True
+        eligible, solo_elegibles=True, manual_request=True
     )
     return jsonify({
         "status": "ok" if programado else "error",
         "message": (
-            "Reentrenamiento manual programado: " + ", ".join(eligible)
+            "Evaluación SHADOW manual encolada: " + ", ".join(eligible)
             if programado else
             "No se pudo iniciar el worker de reentrenamiento"
         ),
