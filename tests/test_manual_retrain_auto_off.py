@@ -3,6 +3,7 @@
 All worker starts are mocked. Never touches a real broker or model directory.
 """
 import unittest
+import threading
 from unittest.mock import MagicMock, patch
 
 from agents.training import EntrenadorAgentes
@@ -56,6 +57,47 @@ class ManualAiTrainControlsTests(unittest.TestCase):
         self.assertFalse(launched)
         thread_cls.assert_not_called()
         trainer.retraining.eligible_tickers.assert_called_once_with(["BA"])
+
+    def test_manual_batch_trains_shadow_only_and_persists_candidate_result(self):
+        trainer = self.trainer(False)
+        trainer._lock = threading.RLock()
+        trainer._entrenando = set()
+        trainer.auto_activate_production = False
+        trainer.retraining.register_closed.return_value = {
+            "total_observations": 511
+        }
+        metrics = {
+            "shadow_candidate_accepted": False,
+            "shadow_candidate_reason": "candidate did not pass normal TEST gates",
+        }
+        trainer.entrenar_ticker = MagicMock(return_value=metrics)
+        result = trainer._retrain_eligible_batch(["RCL"])
+        self.assertEqual(result["RCL"], metrics)
+        trainer.entrenar_ticker.assert_called_once_with(
+            "RCL", allow_production_activation=False, automatic=True,
+        )
+        self.assertEqual(
+            trainer.retraining.mark_result.call_args.kwargs["consume_batch"], True
+        )
+        self.assertEqual(
+            trainer.retraining.mark_result.call_args.kwargs["accepted"], False
+        )
+        self.assertEqual(trainer._entrenando, set())
+
+    def test_missing_training_data_keeps_50_trades_pending(self):
+        trainer = self.trainer(False)
+        trainer._lock = threading.RLock()
+        trainer._entrenando = set()
+        trainer.auto_activate_production = False
+        trainer.retraining.register_closed.return_value = {
+            "total_observations": 511
+        }
+        trainer.entrenar_ticker = MagicMock(return_value=None)
+        trainer._retrain_eligible_batch(["RCL"])
+        kwargs = trainer.retraining.mark_result.call_args.kwargs
+        self.assertFalse(kwargs["consume_batch"])
+        self.assertTrue(kwargs["deferred"])
+        self.assertFalse(kwargs["accepted"])
 
     @patch("agents.training.threading.Thread")
     def test_auto_enabled_keeps_existing_scheduler_path(self, thread_cls):
