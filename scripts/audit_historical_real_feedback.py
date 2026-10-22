@@ -61,12 +61,24 @@ def audit(feedback_path, order_audit_path, tickers=TICKERS):
                 if mode != "REAL":
                     stats[t]["audit_exit_filled_nonreal_mode"] += 1
                     continue
-                if not _positive(row.get("precio")) or not _positive(row.get("cantidad")):
-                    stats[t]["audit_exit_filled_missing_price_or_quantity"] += 1
-                    continue
+                missing_price = not _positive(row.get("precio"))
+                missing_qty = not _positive(row.get("cantidad"))
                 oid = _nonempty(row.get("order_id"))
-                if not oid:
+                missing_id = not bool(oid)
+                missing_position = not bool(_nonempty(row.get("position_id")))
+                missing_execution = not bool(_nonempty(row.get("execution_id")))
+                if missing_price:
+                    stats[t]["audit_exit_filled_missing_price"] += 1
+                if missing_qty:
+                    stats[t]["audit_exit_filled_missing_quantity"] += 1
+                if missing_id:
                     stats[t]["audit_exit_filled_missing_id"] += 1
+                if missing_position:
+                    stats[t]["audit_exit_filled_missing_position_id"] += 1
+                if missing_execution:
+                    stats[t]["audit_exit_filled_missing_execution_id"] += 1
+                if missing_price or missing_qty or missing_id:
+                    stats[t]["audit_exit_filled_incomplete"] += 1
                     continue
                 stats[t]["audit_exit_filled_qualified"] += 1
                 confirmed[oid].append((
@@ -147,10 +159,12 @@ def main():
             "all_modes": s["audit_exit_filled_all_modes"],
             "valid_REAL_events": s["audit_exit_filled_qualified"],
             "non_REAL_mode": s["audit_exit_filled_nonreal_mode"],
-            "incomplete_event": (
-                s["audit_exit_filled_missing_price_or_quantity"]
-                + s["audit_exit_filled_missing_id"]
-            ),
+            "incomplete_event": s["audit_exit_filled_incomplete"],
+            "missing_price": s["audit_exit_filled_missing_price"],
+            "missing_quantity": s["audit_exit_filled_missing_quantity"],
+            "missing_order_id": s["audit_exit_filled_missing_id"],
+            "missing_position_id": s["audit_exit_filled_missing_position_id"],
+            "missing_execution_id": s["audit_exit_filled_missing_execution_id"],
             "valid_feedback_exit_id_matches": s["valid_exit_id_local_match"],
             "excluded_no_local_match": s["no_local_EXIT_FILLED_match"],
             "excluded_ambiguous_link": s["ambiguous_or_unlinked_local_fill"],
