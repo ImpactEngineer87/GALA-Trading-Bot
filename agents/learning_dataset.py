@@ -171,6 +171,8 @@ def summarize_closed_trades(
         record = summary[ticker]
         if not eligible:
             record["quarantined_observations"] += 1
+            if mode in ("real", "paper"):
+                record[f"quarantined_closed_{mode}"] += 1
             return
         record["eligible_observations"] += 1
         record[
@@ -184,7 +186,9 @@ def summarize_closed_trades(
         record = summary.setdefault(ticker, {
             "eligible_observations": 0, "eligible_closed_real": 0,
             "eligible_closed_paper": 0, "eligible_closed_legacy": 0,
-            "quarantined_observations": 0, "duplicate_closed_rows": 0,
+            "quarantined_observations": 0,
+            "quarantined_closed_real": 0, "quarantined_closed_paper": 0,
+            "duplicate_closed_rows": 0,
             "lifetime_observations": 0,
         })
         record["lifetime_observations"] += 1
