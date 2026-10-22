@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import sys
 from collections import defaultdict, deque
 from pathlib import Path
@@ -34,6 +35,13 @@ def _path(value):
     return Path(resolve_runtime_path(value))
 
 
+def _positive(value):
+    try:
+        return float(value or 0) > 0
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
 def _safe_reason(value):
     # Legacy broker exception descriptions occasionally include request URLs
     # and account IDs. Limit operator output to recognized static SmartExit
@@ -45,7 +53,9 @@ def _safe_reason(value):
         "Prior", "prior", "Ticker", "ticker", "Ambiguous",
     )
     if any(reason.startswith(marker) for marker in safe_markers):
-        return " ".join(reason.split())[:150]
+        if "http" in reason.lower() or "token" in reason.lower():
+            return "(see private broker audit)"
+        return re.sub(r"\\b\\d{4,}\\b", "[REDACTED]", " ".join(reason.split()))[:150]
     return "(see private broker audit)" if reason else "(no reason recorded)"
 
 
@@ -105,10 +115,10 @@ def inspect(config):
                     "qty": row.get("quantity", ""),
                     "legs": len(legs),
                     "filled_legs": sum(
-                        1 for leg in legs if float(leg.get("filled") or 0) > 0
+                        1 for leg in legs if _positive(leg.get("filled"))
                     ),
                     "priced_legs": sum(
-                        1 for leg in legs if float(leg.get("avg_price") or 0) > 0
+                        1 for leg in legs if _positive(leg.get("avg_price"))
                     ),
                     "position_id_present": bool(row.get("position_id")),
                 })
