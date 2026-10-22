@@ -500,6 +500,29 @@ class SmartExit:
             actual = int(snap.get('long', 0)) if state['side'] == 'BUY' else int(snap.get('short', 0))
             opposite = int(snap.get('short', 0)) if state['side'] == 'BUY' else int(snap.get('long', 0))
             if opposite or actual != expected or expected < 0:
+                # A protective STOP, a partially filled LIMIT, or a prior exit
+                # can flatten Schwab without leaving a fully readable order
+                # journal. If the broker is authoritatively FLAT and there are
+                # no outstanding WORKING orders, do not leave this ticker stuck
+                # forever in RECONCILIAR merely because fills are incomplete.
+                # Reconcile local exposure, but keep the close excluded from
+                # AI training unless exact broker fill evidence is recovered.
+                if actual == 0 and opposite == 0:
+                    working_ids = self._working_orders_for_ticker(account, ticker)
+                    if working_ids is None:
+                        return self._pending_result(
+                            state, 'Schwab is flat but WORKING-order snapshot unavailable'
+                        )
+                    if working_ids:
+                        return self._pending_result(
+                            state, 'Schwab is flat but WORKING orders remain'
+                        )
+                    return self._recover_flat(
+                        key, state,
+                        'Schwab confirms FLAT with no WORKING orders; recorded exit fills disagree',
+                        account=account, requested_side=side,
+                        requested_quantity=quantity, requested_position_id=position_id,
+                    )
                 if emergency:
                     working_ids = self._working_orders_for_ticker(account, ticker)
                     if working_ids is None:
@@ -535,7 +558,29 @@ class SmartExit:
                     continue
                 return self._pending_result(state, 'Position and confirmed fills disagree; reconcile before retry')
             if actual == 0:
-                return self._complete(key, state)
+                if self._verified_fill_legs(state) is not None:
+                    return self._complete(key, state)
+                # Some terminal broker orders expose FILLED and quantity but
+                # not the executionLegs price. Remaining in RECONCILIAR does
+                # not protect an already-flat account; it only strands local
+                # state and prevents normal learning/next signals. Quarantine
+                # the label, but release the stale exit after the no-WORKING
+                # broker safety check.
+                working_ids = self._working_orders_for_ticker(account, ticker)
+                if working_ids is None:
+                    return self._pending_result(
+                        state, 'Schwab is flat but WORKING-order snapshot unavailable'
+                    )
+                if working_ids:
+                    return self._pending_result(
+                        state, 'Schwab is flat but WORKING orders remain'
+                    )
+                return self._recover_flat(
+                    key, state,
+                    'Schwab confirms FLAT with no WORKING orders; exit price unverified',
+                    account=account, requested_side=side,
+                    requested_quantity=quantity, requested_position_id=position_id,
+                )
             if len(state['legs']) >= (2 if state['limit'] is not None else 1):
                 return self._pending_result(state, 'Exit ended with residual exposure; operator reconciliation required')
             is_limit = not state['legs'] and state['limit'] is not None
