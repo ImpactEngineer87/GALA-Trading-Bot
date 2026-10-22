@@ -55,7 +55,7 @@ def _safe_reason(value):
     if any(reason.startswith(marker) for marker in safe_markers):
         if "http" in reason.lower() or "token" in reason.lower():
             return "(see private broker audit)"
-        return re.sub(r"\\b\\d{4,}\\b", "[REDACTED]", " ".join(reason.split()))[:150]
+        return re.sub(r"\b\d{4,}\b", "[REDACTED]", " ".join(reason.split()))[:150]
     return "(see private broker audit)" if reason else "(no reason recorded)"
 
 
