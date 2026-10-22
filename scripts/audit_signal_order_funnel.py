@@ -83,6 +83,7 @@ def audit(signals_path, orders_path, date, tickers, learning_path=None):
                     learning_by_id[signal_id] = reason
     linked = defaultdict(Counter)
     linked_skip_reason = {}
+    cancel_age_by_signal = {}
     unlinked = Counter()
     # Old monitor-thread cancellation events do not always carry signal_id.
     # Link them only when an exact (ticker, date, Schwab order_id) belongs
@@ -112,6 +113,14 @@ def audit(signals_path, orders_path, date, tickers, learning_path=None):
                                 ambiguous_orders.add(key)
                             else:
                                 entry_order_owners[key] = signal_id
+                    if event == "ENTRY_TIMEOUT_CANCELED":
+                        age = re.search(
+                            r"\b(\d{1,4})s\b", str(row.get("motivo") or "")
+                        )
+                        if age:
+                            cancel_age_by_signal[(ticker, signal_id)] = int(
+                                age.group(1)
+                            )
                     if event == "SIGNAL_EXECUTION_SKIPPED":
                         reason = str(row.get("motivo") or "").strip()
                         linked_skip_reason[(ticker, signal_id)] = re.sub(
@@ -139,6 +148,14 @@ def audit(signals_path, orders_path, date, tickers, learning_path=None):
                 owner = entry_order_owners.get((ticker, order_id))
                 if owner:
                     linked[(ticker, owner)][event] += 1
+                    if event == "ENTRY_TIMEOUT_CANCELED":
+                        age = re.search(
+                            r"\b(\d{1,4})s\b", str(row.get("motivo") or "")
+                        )
+                        if age:
+                            cancel_age_by_signal[(ticker, owner)] = int(
+                                age.group(1)
+                            )
                     unlinked[(ticker, event)] -= 1
     output = []
     for signal in signals:
@@ -151,6 +168,9 @@ def audit(signals_path, orders_path, date, tickers, learning_path=None):
                 (signal["ticker"], signal["signal_id"]), ""
             ),
             "learning_skip_reason": learning_by_id.get(signal["signal_id"], ""),
+            "cancel_elapsed_sec": cancel_age_by_signal.get(
+                (signal["ticker"], signal["signal_id"])
+            ),
             "has_submission": any(
                 e in event_counts for e in ("ENTRY_SUBMITTED", "ENTRY_ACKNOWLEDGED",
                                           "ENTRY_FILLED", "ENTRY_RECONCILE_REQUIRED")
@@ -205,9 +225,11 @@ def main():
                 item["execution_skip_reason"]
                 or item["learning_skip_reason"]
             )
+            age = item.get("cancel_elapsed_sec")
             print(f"  {item['time_ny']} {item['signal']:5s} "
                   f"AI={item['decision'] or 'N/A':18s} mode={item['mode'] or 'N/A':5s} "
                   f"order={events}"
+                  + (f" | cancel_after={age}s" if age is not None else "")
                   + (f" | reason={reason}" if reason else ""))
         unlinked_count = sum(max(0, v) for (t, _), v in unlinked.items() if t == ticker)
         print("  Unlinked audit events:", unlinked_count,
