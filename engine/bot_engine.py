@@ -33,6 +33,7 @@ import sys
 import time
 import os
 import json
+import math
 import yaml
 import threading
 import uuid
@@ -2851,6 +2852,10 @@ class ChocoletraBot:
                 res.get("avg_price") or orden_aj.precio_limite,
                 parcial=(filled_now < orden_aj.cantidad),
                 oid=res.get("order_id", ""),
+                broker_price_verified=bool(
+                    res.get("order_id")
+                    and self._positive_broker_fill_price(res.get("avg_price"))
+                ),
             )
         self._emit_log("INFO", f"[{ticker}] Entrada REAL colocada, esperando llenado | {orden_aj}")
         return True
@@ -3051,7 +3056,17 @@ class ChocoletraBot:
             **lifecycle,
             "modo": execution_mode,
             "entry_order_id": entry_order_id,
-            "entry_confirmed": bool(transition_ok),
+            # A local state-machine transition does NOT independently prove a
+            # REAL Schwab entry fill price. Continue tracking/protecting a
+            # price-unverified position but quarantine it from AI labels.
+            "entry_confirmed": bool(
+                transition_ok and (
+                    paper_ticker or (
+                        entry_order_id
+                        and (execution_context or {}).get("broker_price_verified") is True
+                    )
+                )
+            ),
             "state_before": PositionState.OUT.value,
             "state_after": target_state.value,
             "position_side": target_state.value,
@@ -3131,6 +3146,11 @@ class ChocoletraBot:
                     "submitted_limit_price", entrada
                 ),
                 "fill_price": entrada,
+                "broker_price_verified": bool(
+                    paper_ticker or (execution_context or {}).get(
+                        "broker_price_verified"
+                    )
+                ),
             },
         )
         history_row = self._history_event(
@@ -3233,7 +3253,11 @@ class ChocoletraBot:
             self._abrir_desde_llenado(
                 ticker, pos, filled,
                 det.get("avg_price") or pos["orden"].precio_limite,
-                parcial=(filled < pos["orden"].cantidad), oid=oid)
+                parcial=(filled < pos["orden"].cantidad), oid=oid,
+                broker_price_verified=bool(
+                    oid and self._positive_broker_fill_price(det.get("avg_price"))
+                ),
+            )
             return
 
         if status in ("CANCELED", "REJECTED", "EXPIRED", "REPLACED"):
@@ -3320,8 +3344,17 @@ class ChocoletraBot:
                 motivo=f"Entrada no llenada en {int(edad)}s",
             )
 
+    @staticmethod
+    def _positive_broker_fill_price(value) -> bool:
+        try:
+            price = float(value)
+            return math.isfinite(price) and price > 0.0
+        except (TypeError, ValueError, OverflowError):
+            return False
+
     def _abrir_desde_llenado(self, ticker: str, pos: dict, filled: int, avg_price: float,
-                             parcial: bool, oid: str) -> bool:
+                             parcial: bool, oid: str,
+                             broker_price_verified: bool = False) -> bool:
         """Abre la posición con la cantidad y el precio REALES del llenado. Si el
         llenado fue parcial, cancela el remanente y RE-LEE la cantidad definitiva
         (pudieron ejecutarse más acciones entre la lectura y la cancelación) para
@@ -3347,7 +3380,18 @@ class ChocoletraBot:
             filled_final = int(det.get("filled", 0) or 0)
             if filled_final > filled:
                 filled = filled_final
-                avg_price = det.get("avg_price") or avg_price
+                if self._positive_broker_fill_price(det.get("avg_price")):
+                    avg_price = det["avg_price"]
+                    broker_price_verified = bool(oid)
+                else:
+                    # We know more shares executed, but do not know the
+                    # weighted price for ALL of them; keep AI entry quarantined.
+                    broker_price_verified = False
+            elif filled_final == filled and self._positive_broker_fill_price(
+                det.get("avg_price")
+            ):
+                avg_price = det["avg_price"]
+                broker_price_verified = bool(oid)
             elif cancelacion.get("terminal_by_absence"):
                 # NOT_WORKING may mean the remainder filled while cancellation
                 # raced.  Re-read the authoritative broker position before sizing
@@ -3373,10 +3417,18 @@ class ChocoletraBot:
                         if broker_qty > filled:
                             filled = broker_qty
                             avg_price = broker_pos.get("precio") or avg_price
+                            # Schwab position average cost is NOT an
+                            # order execution-leg fill. Protect exposure,
+                            # but do not create a verified AI entry label.
+                            broker_price_verified = False
                         break
         orden_fill = self._ajustar_orden_llenada(orden, filled, avg_price)
         execution_context = dict(pos.get("execution_context") or {})
         execution_context["fill_price"] = float(avg_price)
+        execution_context["broker_price_verified"] = bool(
+            broker_price_verified and oid
+            and self._positive_broker_fill_price(avg_price)
+        )
         ok = self._registrar_posicion_abierta(
             ticker, orden_fill, pos["decision"], entry_order_id=oid,
             execution_context=execution_context,
@@ -3407,6 +3459,9 @@ class ChocoletraBot:
                         **dict(pos.get("execution_context") or {}),
                         "fill_price": p.get("precio")
                         or pos["orden"].precio_limite,
+                        # Position average cost may include previous lots;
+                        # it is not authoritative evidence of this order fill.
+                        "broker_price_verified": False,
                     },
                 )
                 if ok:
