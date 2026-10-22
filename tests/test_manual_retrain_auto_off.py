@@ -35,7 +35,7 @@ class ManualAiTrainControlsTests(unittest.TestCase):
         )
         kwargs = thread_cls.call_args.kwargs
         self.assertEqual(kwargs["target"], trainer._retrain_eligible_batch)
-        self.assertEqual(kwargs["args"], (["RCL", "MSFT", "ADBE"],))
+        self.assertEqual(kwargs["args"], (["RCL", "MSFT", "ADBE"], True))
         thread_cls.return_value.start.assert_called_once()
         self.assertFalse(trainer.auto_retrain_enabled)
 
@@ -62,7 +62,7 @@ class ManualAiTrainControlsTests(unittest.TestCase):
         trainer = self.trainer(False)
         trainer._lock = threading.RLock()
         trainer._entrenando = set()
-        trainer.auto_activate_production = False
+        trainer.auto_activate_production = True
         trainer.retraining.register_closed.return_value = {
             "total_observations": 511
         }
@@ -71,7 +71,7 @@ class ManualAiTrainControlsTests(unittest.TestCase):
             "shadow_candidate_reason": "candidate did not pass normal TEST gates",
         }
         trainer.entrenar_ticker = MagicMock(return_value=metrics)
-        result = trainer._retrain_eligible_batch(["RCL"])
+        result = trainer._retrain_eligible_batch(["RCL"], manual_request=True)
         self.assertEqual(result["RCL"], metrics)
         trainer.entrenar_ticker.assert_called_once_with(
             "RCL", allow_production_activation=False, automatic=True,
