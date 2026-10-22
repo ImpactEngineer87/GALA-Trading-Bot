@@ -1124,16 +1124,20 @@ class EntrenadorAgentes:
         tickers,
         *,
         solo_elegibles: bool = False,
+        manual_request: bool = False,
     ) -> bool:
-        """Schedule retraining without blocking the trading engine.
+        """Schedule strictly eligible SHADOW training without enabling auto AI.
 
-        ``solo_elegibles=True`` is used by the end-of-session workflow and
-        trains only tickers that accumulated the configured 50 new observations.
-        The manual dashboard action keeps the explicit all-ticker behavior.
+        The scheduler must honor automatic_retraining.enabled. A deliberate
+        dashboard manual request may run while Auto IA is OFF, but STILL uses
+        eligible_tickers/x50 and the normal FIT/VALIDATION/TEST gates.
+        API /api/ai/train checks that the REAL engine is stopped first.
         """
         lista = list(dict.fromkeys(str(t).upper() for t in (tickers or []) if str(t).strip()))
         if solo_elegibles:
-            if not self.auto_retrain_enabled:
+            # Auto IA OFF disables unattended scheduled retraining, NOT the
+            # operator's explicit manual "Reentrenar pendientes" action.
+            if not self.auto_retrain_enabled and not manual_request:
                 return False
             lista = self.retraining.eligible_tickers(lista)
         elif not self.activo and not self.shadow_enabled:
