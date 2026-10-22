@@ -442,6 +442,7 @@ class RetrainingLifecycle:
                             key, record.get(key, 0)
                         )) for key in (
                             "eligible_closed_real", "eligible_closed_paper",
+                            "quarantined_closed_real", "quarantined_closed_paper",
                             "eligible_closed_legacy", "duplicate_closed_rows",
                         )
                     },
@@ -669,6 +670,7 @@ class RetrainingLifecycle:
         )
         for key in (
             "eligible_closed_real", "eligible_closed_paper",
+            "quarantined_closed_real", "quarantined_closed_paper",
             "eligible_closed_legacy", "duplicate_closed_rows",
         ):
             record[key] = int(self._feedback_cache_sources.get(ticker, {}).get(
