@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -27,6 +28,7 @@ EVENTS = {
     "PENDING_ENTRY_CANCEL_FAILED", "REVERSAL_REQUESTED", "REVERSAL_ABORTED",
     "REVERSAL_ENTRY_FAILED", "REVERSAL_COMPLETED", "POSITION_CLOSE_FAILED",
     "EXIT_RECOVERED_FLAT", "EXIT_ORDER_ID_UNRESOLVED",
+    "SIGNAL_EXECUTION_SKIPPED", "ENTRY_REQUESTED", "REVERSAL_CLOSE_ONLY",
 }
 
 
@@ -38,7 +40,7 @@ def signal_date(row):
     return timestamp[:10]
 
 
-def audit(signals_path, orders_path, date, tickers):
+def audit(signals_path, orders_path, date, tickers, learning_path=None):
     targets = set(tickers)
     # Each signal has a unique ID; no limit of 2000 UI signals is applied.
     signals = []
@@ -61,7 +63,26 @@ def audit(signals_path, orders_path, date, tickers):
                     "decision": str(row.get("ai_decision") or "").upper(),
                     "mode": str(row.get("execution_mode") or "").upper(),
                 })
+    # Store only the user-selected signals' non-executed learning reasons.
+    # These are execution-policy diagnoses, not broker-confirmed outcomes.
+    learning_by_id = {}
+    if learning_path is not None and learning_path.exists():
+        signal_ids = {sig["signal_id"] for sig in signals if sig["signal_id"]}
+        with learning_path.open(encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                signal_id = str(row.get("signal_id") or "").strip()
+                if signal_id not in signal_ids:
+                    continue
+                if str(row.get("ticker") or "").upper() not in targets:
+                    continue
+                reason = str(row.get("reason") or "").strip()
+                if reason:
+                    # Arbitrary reason strings may contain sensitive backend
+                    # details. Only structured status codes are exported.
+                    reason = re.sub(r"[^A-Za-z0-9_:-]", "", reason)[:75]
+                    learning_by_id[signal_id] = reason
     linked = defaultdict(Counter)
+    linked_skip_reason = {}
     unlinked = Counter()
     if orders_path.exists():
         with orders_path.open(encoding="utf-8-sig", newline="") as f:
@@ -76,6 +97,11 @@ def audit(signals_path, orders_path, date, tickers):
                 signal_id = str(row.get("signal_id") or "").strip()
                 if signal_id:
                     linked[(ticker, signal_id)][event] += 1
+                    if event == "SIGNAL_EXECUTION_SKIPPED":
+                        reason = str(row.get("motivo") or "").strip()
+                        linked_skip_reason[(ticker, signal_id)] = re.sub(
+                            r"[^A-Za-z0-9_:-]", "", reason
+                        )[:75]
                 else:
                     unlinked[(ticker, event)] += 1
     output = []
@@ -85,6 +111,10 @@ def audit(signals_path, orders_path, date, tickers):
         output.append({
             **signal,
             "broker_events": event_names,
+            "execution_skip_reason": linked_skip_reason.get(
+                (signal["ticker"], signal["signal_id"]), ""
+            ),
+            "learning_skip_reason": learning_by_id.get(signal["signal_id"], ""),
             "has_submission": any(
                 e in event_counts for e in ("ENTRY_SUBMITTED", "ENTRY_ACKNOWLEDGED",
                                           "ENTRY_FILLED", "ENTRY_RECONCILE_REQUIRED")
@@ -116,23 +146,33 @@ def main():
     orders = Path(resolve_runtime_path(
         log_cfg.get("auditoria_ordenes", "data/auditoria_ordenes.csv"),
         project_root=runtime))
+    learning_cfg = ((cfg.get("agents") or {}).get("signal_learning") or {})
+    learning = Path(resolve_runtime_path(
+        learning_cfg.get("path", "data/signal_learning_observations.csv"),
+        project_root=runtime))
     tickers = [str(t).strip().upper() for t in args.tickers]
-    result, unlinked = audit(signals, orders, date, tickers)
+    result, unlinked = audit(signals, orders, date, tickers, learning)
     print("READ ONLY: AI approval != order submitted != filled")
     print("NY date:", date, "| tickers:", ", ".join(tickers))
     live = cfg.get("live_trading") or {}
     print("REAL allow_short policy:", bool(live.get("allow_short", False)),
           "| per_ticker_execution:", bool(live.get("per_ticker_execution", False)))
-    print("Signal archive:", signals.exists(), "| order audit:", orders.exists())
+    print("Signal archive:", signals.exists(), "| order audit:", orders.exists(),
+          "| signal-learning ledger:", learning.exists())
     for ticker in tickers:
         rows = [row for row in result if row["ticker"] == ticker]
         print(f"\n=== {ticker}: {len(rows)} archived signals ===")
         for item in rows[-16:]:
             events = ", ".join(item["broker_events"]) or "no linked broker audit"
             # Do not print IDs or full arbitrary broker messages.
+            reason = (
+                item["execution_skip_reason"]
+                or item["learning_skip_reason"]
+            )
             print(f"  {item['time_ny']} {item['signal']:5s} "
                   f"AI={item['decision'] or 'N/A':18s} mode={item['mode'] or 'N/A':5s} "
-                  f"order={events}")
+                  f"order={events}"
+                  + (f" | reason={reason}" if reason else ""))
         unlinked_count = sum(v for (t, _), v in unlinked.items() if t == ticker)
         print("  Unlinked audit events:", unlinked_count,
               "(cannot automatically attribute to any one signal)")
