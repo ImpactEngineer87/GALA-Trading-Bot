@@ -18,7 +18,6 @@ class ManualAiTrainControlsTests(unittest.TestCase):
         trainer.shadow_enabled = True
         trainer.retraining = MagicMock()
         trainer.retraining.eligible_tickers.return_value = list(eligible)
-        trainer._retrain_eligible_batch = MagicMock()
         trainer.entrenar_todos = MagicMock()
         return trainer
 
