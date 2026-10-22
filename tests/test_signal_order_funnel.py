@@ -88,7 +88,7 @@ class SignalOrderFunnelTests(unittest.TestCase):
             }) + "\n")
         with self.orders.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=[
-                "fecha", "ticker", "evento", "signal_id", "order_id",
+                "fecha", "ticker", "evento", "signal_id", "order_id", "motivo",
             ])
             writer.writeheader()
             writer.writerow({
@@ -99,6 +99,7 @@ class SignalOrderFunnelTests(unittest.TestCase):
                 "fecha": "2026-10-22", "ticker": "NKE",
                 "evento": "ENTRY_TIMEOUT_CANCELED",
                 "signal_id": "", "order_id": "order-A",
+                "motivo": "Entrada no llenada en 180s",
             })
             writer.writerow({
                 "fecha": "2026-10-22", "ticker": "NKE",
@@ -109,6 +110,7 @@ class SignalOrderFunnelTests(unittest.TestCase):
             self.signals, self.orders, "2026-10-22", ["NKE"]
         )
         self.assertIn("ENTRY_TIMEOUT_CANCELED", rows[0]["broker_events"])
+        self.assertEqual(rows[0]["cancel_elapsed_sec"], 180)
         self.assertFalse(rows[0]["has_fill"])
         self.assertEqual(unlinked[("NKE", "ENTRY_TIMEOUT_CANCELED")], 1)
 
