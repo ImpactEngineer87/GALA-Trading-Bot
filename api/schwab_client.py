@@ -11,6 +11,7 @@ DESCRIPCION:
 =============================================================
 """
 
+import math
 import os
 import sys
 import threading
@@ -953,11 +954,24 @@ class SchwabClient:
                 shortq = float(p.get("shortQuantity", 0) or 0)
                 if longq == 0 and shortq == 0:
                     continue
+                # Keep account-reported P/L separate from GALA's strategy P/L.
+                # Schwab may omit currentDayProfitLoss for an individual
+                # security; do not substitute local/synthetic values or zero.
+                raw_day_pnl = p.get("currentDayProfitLoss")
+                day_pnl = None
+                if raw_day_pnl not in (None, ""):
+                    try:
+                        parsed = float(raw_day_pnl)
+                        if math.isfinite(parsed):
+                            day_pnl = round(parsed, 2)
+                    except (TypeError, ValueError, OverflowError):
+                        pass
                 out.append({
                     "symbol": inst.get("symbol", ""),
                     "tipo": "BUY" if longq > 0 else "SELL",
                     "cantidad": int(longq if longq > 0 else shortq),
                     "precio": float(p.get("averagePrice", 0) or 0),
+                    "broker_position_day_pnl": day_pnl,
                 })
             return out
         except Exception as e:
