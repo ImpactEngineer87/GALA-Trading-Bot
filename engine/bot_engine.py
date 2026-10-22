@@ -2876,6 +2876,17 @@ class ChocoletraBot:
             return order_id
         return ""
 
+    @staticmethod
+    def _verified_entry_confirmation(transition_ok, paper_ticker, order_id, context):
+        """Protect all REAL fills; train only when broker execution price is real."""
+        return bool(
+            transition_ok and (
+                paper_ticker or (
+                    bool(order_id) and (context or {}).get("broker_price_verified") is True
+                )
+            )
+        )
+
     def _registrar_posicion_abierta(
         self, ticker: str, orden, decision, entry_order_id: str = "",
         execution_context: Optional[dict] = None,
@@ -3059,13 +3070,8 @@ class ChocoletraBot:
             # A local state-machine transition does NOT independently prove a
             # REAL Schwab entry fill price. Continue tracking/protecting a
             # price-unverified position but quarantine it from AI labels.
-            "entry_confirmed": bool(
-                transition_ok and (
-                    paper_ticker or (
-                        entry_order_id
-                        and (execution_context or {}).get("broker_price_verified") is True
-                    )
-                )
+            "entry_confirmed": self._verified_entry_confirmation(
+                transition_ok, paper_ticker, entry_order_id, execution_context
             ),
             "state_before": PositionState.OUT.value,
             "state_after": target_state.value,
