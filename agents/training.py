@@ -1145,15 +1145,19 @@ class EntrenadorAgentes:
         if not lista:
             return False
         target = self._retrain_eligible_batch if solo_elegibles else self.entrenar_todos
+        # The explicit manual review path is SHADOW-only regardless of any
+        # unattended production-activation configuration.
+        worker_args = (lista, True) if solo_elegibles and manual_request else (lista,)
         threading.Thread(
             target=target,
-            args=(lista,),
-            name="retrain-fin-sesion" if solo_elegibles else "retrain-manual",
+            args=worker_args,
+            name=("retrain-manual-shadow" if manual_request else
+                  "retrain-fin-sesion" if solo_elegibles else "retrain-manual"),
             daemon=not solo_elegibles,
         ).start()
         return True
 
-    def _retrain_eligible_batch(self, tickers) -> dict:
+    def _retrain_eligible_batch(self, tickers, manual_request: bool = False) -> dict:
         results = {}
 
         for ticker in tickers:
@@ -1194,7 +1198,9 @@ class EntrenadorAgentes:
 
                 metrics = self.entrenar_ticker(
                     ticker,
-                    allow_production_activation=self.auto_activate_production,
+                    allow_production_activation=bool(
+                        self.auto_activate_production and not manual_request
+                    ),
                     automatic=True,
                 )
 
