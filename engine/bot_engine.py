@@ -2400,6 +2400,21 @@ class ChocoletraBot:
                 if manager:
                     manager.release(ticker)
 
+    def _audit_approved_signal_skip(self, decision, reason, position_status=""):
+        """Explain approved signals that did not submit a broker order.
+
+        Audit-only, no broker requests and no extra AI-training observations.
+        """
+        self._audit_event(
+            "SIGNAL_EXECUTION_SKIPPED",
+            ticker=str(getattr(decision, "ticker", "") or "").upper(),
+            lado=str(getattr(decision, "tipo", "") or "").upper(),
+            signal_id=str(getattr(decision, "signal_id", "") or ""),
+            estado="NO_ORDER_SENT",
+            motivo=str(reason or "UNKNOWN")[:75],
+            detalle={"local_position_status": str(position_status or "")[:32]},
+        )
+
     def _abrir_o_revertir(self, decision, precio_actual: float, df_micro):
         ticker = decision.ticker
         tipo = decision.tipo
@@ -2419,19 +2434,28 @@ class ChocoletraBot:
         # explícita conserva solo OUT/LONG/SHORT; una orden pendiente sigue OUT.
         with self._lock:
             if not self._activo:
+                self._audit_approved_signal_skip(decision, "ENGINE_STOPPED")
                 return
             pos = self._posiciones.get(ticker)
             reverse = False
             cancelar_pend = False
             if pos is not None:
                 if pos.get("reservado"):
-                    # Otra hebra ya está abriendo este ticker → no duplicar
+                    # Never submit a second order for an in-flight reservation.
+                    self._audit_approved_signal_skip(
+                        decision, "TICKER_ENTRY_RESERVED", "RESERVED"
+                    )
                     return
                 if pos["tipo"] == tipo:
                     self._emit_log("INFO", f"[{ticker}] Señal {tipo} repetida — se mantiene (sin adicionar)")
+                    self._audit_approved_signal_skip(
+                        decision, "ALREADY_SAME_SIDE",
+                        "PENDING" if pos.get("pendiente") else "OPEN"
+                    )
                     return
                 if not self.reversion_activa:
                     self._emit_log("INFO", f"[{ticker}] Reversión desactivada — se ignora giro de señal")
+                    self._audit_approved_signal_skip(decision, "REVERSAL_DISABLED")
                     self._registrar_senal_no_ejecutada(
                         decision, reason="REVERSAL_DISABLED",
                         source_kind="POLICY_BLOCK", training_candidate=False,
@@ -2455,6 +2479,7 @@ class ChocoletraBot:
                 state_after=state_before.state.value, signal_side=tipo,
                 motivo="Estado activo sin posición local",
             )
+            self._audit_approved_signal_skip(decision, "POSITION_STATE_MISMATCH")
             return
 
         if cancelar_pend:
@@ -2465,6 +2490,7 @@ class ChocoletraBot:
                 # normal (con verificación de cierre).
                 self._emit_log("INFO", f"[{ticker}] Giro pospuesto: la entrada pendiente ya estaba "
                                        f"llenada; se cerrará y volteará el próximo ciclo")
+                self._audit_approved_signal_skip(decision, "PENDING_ENTRY_NOT_CLEARED")
                 return
         elif reverse:
             prior_state = state_before.state
@@ -2574,6 +2600,7 @@ class ChocoletraBot:
 
         # Reservar hueco de forma atómica antes de ejecutar la apertura
         if not self._reservar_slot(ticker, tipo):
+            self._audit_approved_signal_skip(decision, "ENTRY_SLOT_NOT_AVAILABLE")
             # Same-side repeats are intentionally not new learning samples. If
             # there was no active position before the attempt, this was a real
             # missed opportunity (capacity/quarantine/risk gate).
@@ -2601,6 +2628,7 @@ class ChocoletraBot:
                 getattr(decision, "execution_skip_reason", "")
                 or "ENTRY_NOT_EXECUTED"
             )
+            self._audit_approved_signal_skip(decision, miss_reason)
             policy_only = miss_reason in {
                 "DAILY_LOSS_BLOCK", "ATR_INVALID", "RISK_ORDER_REJECTED"
             }
