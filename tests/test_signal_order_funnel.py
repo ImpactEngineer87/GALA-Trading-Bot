@@ -79,6 +79,39 @@ class SignalOrderFunnelTests(unittest.TestCase):
         self.assertFalse(rows[0]["has_submission"])
         self.assertFalse(rows[0]["has_fill"])
 
+    def test_cancel_in_legacy_monitor_links_only_by_exact_order_id(self):
+        with self.signals.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "date": "2026-10-22", "timestamp": "12:29:39",
+                "ticker": "NKE", "tipo": "BUY", "ai_decision": "APPROVED",
+                "execution_mode": "REAL", "signal_id": "nke-1229",
+            }) + "\n")
+        with self.orders.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "fecha", "ticker", "evento", "signal_id", "order_id",
+            ])
+            writer.writeheader()
+            writer.writerow({
+                "fecha": "2026-10-22", "ticker": "NKE", "evento": "ENTRY_SUBMITTED",
+                "signal_id": "nke-1229", "order_id": "order-A",
+            })
+            writer.writerow({
+                "fecha": "2026-10-22", "ticker": "NKE",
+                "evento": "ENTRY_TIMEOUT_CANCELED",
+                "signal_id": "", "order_id": "order-A",
+            })
+            writer.writerow({
+                "fecha": "2026-10-22", "ticker": "NKE",
+                "evento": "ENTRY_TIMEOUT_CANCELED",
+                "signal_id": "", "order_id": "unrelated-order",
+            })
+        rows, unlinked = audit(
+            self.signals, self.orders, "2026-10-22", ["NKE"]
+        )
+        self.assertIn("ENTRY_TIMEOUT_CANCELED", rows[0]["broker_events"])
+        self.assertFalse(rows[0]["has_fill"])
+        self.assertEqual(unlinked[("NKE", "ENTRY_TIMEOUT_CANCELED")], 1)
+
     def test_order_submission_and_execution_are_distinct(self):
         with self.signals.open("w", encoding="utf-8") as f:
             f.write(json.dumps({
