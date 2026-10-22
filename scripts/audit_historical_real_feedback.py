@@ -41,28 +41,41 @@ def _positive(value):
 def audit(feedback_path, order_audit_path, tickers=TICKERS):
     wanted = {t.upper() for t in tickers}
     confirmed = defaultdict(list)
+    stats = {t: Counter() for t in tickers}
     # The audit ledger can be sizeable. Retain only minimal metadata for
     # executed REAL exits belonging to our target tickers.
     if order_audit_path.exists():
         with order_audit_path.open(newline="", encoding="utf-8-sig") as f:
             for row in csv.DictReader(f):
-                if (_nonempty(row.get("ticker")).upper() not in wanted
-                        or _nonempty(row.get("evento")).upper() != "EXIT_FILLED"
-                        or _nonempty(row.get("modo")).upper() != "REAL"
-                        or not _positive(row.get("precio"))
-                        or not _positive(row.get("cantidad"))):
+                t = _nonempty(row.get("ticker")).upper()
+                if t not in wanted:
+                    continue
+                event = _nonempty(row.get("evento")).upper()
+                mode = _nonempty(row.get("modo")).upper()
+                if event in {"EXIT_FILLED", "EXIT_RECOVERED_FLAT",
+                             "EXIT_ORDER_ID_UNRESOLVED", "POSITION_CLOSED"}:
+                    stats[t]["audit:" + event + ":" + (mode or "BLANK")] += 1
+                if event != "EXIT_FILLED":
+                    continue
+                stats[t]["audit_exit_filled_all_modes"] += 1
+                if mode != "REAL":
+                    stats[t]["audit_exit_filled_nonreal_mode"] += 1
+                    continue
+                if not _positive(row.get("precio")) or not _positive(row.get("cantidad")):
+                    stats[t]["audit_exit_filled_missing_price_or_quantity"] += 1
                     continue
                 oid = _nonempty(row.get("order_id"))
                 if not oid:
+                    stats[t]["audit_exit_filled_missing_id"] += 1
                     continue
+                stats[t]["audit_exit_filled_qualified"] += 1
                 confirmed[oid].append((
                     _nonempty(row.get("position_id")),
                     _nonempty(row.get("execution_id")),
-                    _nonempty(row.get("ticker")).upper(),
+                    t,
                     _nonempty(row.get("estado")).upper(),
                 ))
 
-    stats = {t: Counter() for t in tickers}
     with feedback_path.open(newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             t = _nonempty(row.get("ticker")).upper()
@@ -71,6 +84,8 @@ def audit(feedback_path, order_audit_path, tickers=TICKERS):
             s = stats[t]
             if _truth(row.get("execution_valid")):
                 s["already_valid"] += 1
+                if _nonempty(row.get("exit_order_id")) in confirmed:
+                    s["valid_exit_id_local_match"] += 1
                 continue
             s["excluded"] += 1
             reasons = [x for x in _nonempty(row.get("exclusion_reason")).split(";") if x]
@@ -128,6 +143,18 @@ def main():
               f"{s['excluded']:>27}")
         print("  Reasons:", {key[7:]: value for key, value in sorted(s.items())
                              if key.startswith("reason:")})
+        print("  Audit EXIT_FILLED:", {
+            "all_modes": s["audit_exit_filled_all_modes"],
+            "valid_REAL_events": s["audit_exit_filled_qualified"],
+            "non_REAL_mode": s["audit_exit_filled_nonreal_mode"],
+            "incomplete_event": (
+                s["audit_exit_filled_missing_price_or_quantity"]
+                + s["audit_exit_filled_missing_id"]
+            ),
+            "valid_feedback_exit_id_matches": s["valid_exit_id_local_match"],
+            "excluded_no_local_match": s["no_local_EXIT_FILLED_match"],
+            "excluded_ambiguous_link": s["ambiguous_or_unlinked_local_fill"],
+        })
     print("A local match is NOT proof of a broker fill. No training counts were changed.")
     print("Never retroactively flip execution_valid without independently confirming")
     print("the exact Schwab fill quantity, side, price, order and position identity.")
