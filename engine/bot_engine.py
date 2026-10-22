@@ -3158,6 +3158,17 @@ class ChocoletraBot:
             pass
         return True
 
+    def _pending_entry_timeout(self, ticker: str, pos: dict) -> float:
+        """Only REAL LIMIT submissions use the short broker-order monitor TTL."""
+        order_type = str((pos.get("execution_context") or {}).get(
+            "submitted_order_type", ""
+        )).upper()
+        if (not self._is_paper_ticker(ticker, pos=pos)
+                and order_type in ("LIMIT", "MARKETABLE_LIMIT")
+                and (self.config.get("execution_engine", {}) or {}).get("enabled", False)):
+            return self.entrada_limit_timeout_seg
+        return self.entrada_timeout_seg
+
     def _gestionar_entrada_pendiente(self, ticker: str, pos: dict, precio_actual: float):
         """
         Modo real: revisa si la ENTRADA pendiente se llenó.
@@ -3216,16 +3227,7 @@ class ChocoletraBot:
 
         # Timeout: cancelar y decidir según el estado FINAL real.
         edad = (datetime.now() - pos["ts_pendiente"]).total_seconds()
-        order_type = str((pos.get("execution_context") or {}).get(
-            "submitted_order_type", ""
-        )).upper()
-        timeout_sec = (
-            self.entrada_limit_timeout_seg
-            if (not self._is_paper_ticker(ticker, pos=pos)
-                and order_type in ("LIMIT", "MARKETABLE_LIMIT")
-                and (self.config.get("execution_engine", {}) or {}).get("enabled", False))
-            else self.entrada_timeout_seg
-        )
+        timeout_sec = self._pending_entry_timeout(ticker, pos)
         if edad > timeout_sec:
             with self._lock:
                 if time.monotonic() < pos.get("next_cancel_retry_monotonic", 0.0):
