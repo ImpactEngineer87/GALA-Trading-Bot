@@ -3446,6 +3446,42 @@ def add_signal():
 # =============================================================
 # TRADES
 # =============================================================
+@app.route('/api/broker/open-position-pnl')
+def broker_open_position_pnl():
+    """Explicit read-only Schwab P/L lookup; never route orders or simulate data.
+
+    This is not the account-wide P/L Day: closed positions and manual holdings
+    may have different accounting. The operator initiates the API call from
+    Trades; it is not repeated on each dashboard polling cycle.
+    """
+    from core.broker_pnl import open_position_pnl_snapshot
+    bot = globals().get("_ENGINE")
+    if bot is None or not getattr(bot, "account_number", ""):
+        return jsonify({
+            "status": "unavailable", "source": "SCHWAB_OPEN_POSITIONS",
+            "message": "Motor sin cuenta Schwab verificada; P/L de broker no disponible",
+        }), 503
+    try:
+        positions = bot.schwab.obtener_posiciones(bot.account_number)
+    except Exception:
+        positions = None
+    summary = open_position_pnl_snapshot(positions)
+    if not summary["available"]:
+        return jsonify({
+            "status": "unavailable", **summary,
+            "message": "Schwab no confirmó las posiciones; no se calcula P/L",
+        }), 503
+    return jsonify({
+        "status": "ok",
+        **summary,
+        "as_of_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "note": (
+            "P/L Day informado por Schwab para posiciones ABIERTAS disponibles; "
+            "no incluye todos los cierres de hoy y NO equivale al P/L de la estrategia GALA"
+        ),
+    })
+
+
 @app.route('/api/trades')
 def get_trades():
     positions = _engine_positions_snapshot()
