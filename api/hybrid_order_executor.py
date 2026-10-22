@@ -105,8 +105,11 @@ def _err_detalle(e) -> str:
 # 'tipo'/'tipo_entrada' del bot: "BUY" = largo, "SELL" = corto.
 
 def _instruccion_apertura(tipo: str) -> str:
-    """Instrucción Schwab para ABRIR una posición."""
-    return "BUY" if tipo == "BUY" else "SELL_SHORT"
+    """Never confuse a short entry with a long close (SELL)."""
+    side = str(tipo or "").upper().strip()
+    if side not in {"BUY", "SELL"}:
+        raise ValueError("Opening signal must be BUY or SELL")
+    return "BUY" if side == "BUY" else "SELL_SHORT"
 
 
 def _instruccion_cierre(tipo_entrada: str) -> str:
@@ -712,7 +715,23 @@ class EjecutorHibridoDeOrdenes:
         """Return the actual LIMIT sent to Schwab, including the buffer cap."""
 
         if tipo_orden == "LIMIT":
-            return round(float(orden.precio_limite), 4)
+            # Opt-in bounded tolerance for fast markets. A SELL_SHORT LIMIT
+            # may improve fill likelihood by crossing *down* up to 10 cents;
+            # BUY moves *up*. This is a cap, not a guaranteed execution price.
+            # No unbounded MARKET fallback and no change to PAPER orders.
+            price = float(orden.precio_limite)
+            if self.paper_trading or not self.execution_v2_config.get("enabled", False):
+                return round(price, 4)
+            tolerance = float(self.execution_v2_config.get(
+                "entry_limit_tolerance_usd", 0.0
+            ) or 0.0)
+            if not math.isfinite(tolerance) or not (0.0 <= tolerance <= 0.10):
+                raise ValueError("entry_limit_tolerance_usd must be 0.00–0.10")
+            if tolerance > 0:
+                price = price + tolerance if orden.tipo == "BUY" else price - tolerance
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError("Invalid broker entry LIMIT after tolerance")
+            return round(price, 2) if tolerance else round(price, 4)
         if self.max_slippage_pct > 0:
             cap = orden.precio_limite * (self.max_slippage_pct / 100.0)
             price = (
