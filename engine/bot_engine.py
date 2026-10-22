@@ -267,6 +267,15 @@ class ChocoletraBot:
         self.reversion_activa = rev.get("activo", True)
         self.breakeven_offset_pct = self.config.get("salida_parcial", {}).get("breakeven_offset_pct", 0.0)
         self.entrada_timeout_seg = self.config.get("ejecucion", {}).get("entrada_timeout_seg", 180)
+        # REAL LIMIT entries have their own timeout: the order monitor already
+        # polls independently of one-minute strategy candles. Keep the broker
+        # slot reserved until cancellation and exposure checks confirm it safe.
+        # Existing MARKET/PAPER entry handling keeps its previous timeout.
+        self.entrada_limit_timeout_seg = max(1.0, min(300.0, float(
+            (self.config.get("execution_engine", {}) or {}).get(
+                "entry_limit_timeout_sec", 20
+            )
+        )))
         ks = self.config.get("kill_switch", {})
         self.ks_liquidar_apagar = ks.get("liquidar_al_apagar", True)
         self.ks_liquidar_cierre = ks.get("liquidar_al_cierre_mercado", True)
@@ -3207,7 +3216,17 @@ class ChocoletraBot:
 
         # Timeout: cancelar y decidir según el estado FINAL real.
         edad = (datetime.now() - pos["ts_pendiente"]).total_seconds()
-        if edad > self.entrada_timeout_seg:
+        order_type = str((pos.get("execution_context") or {}).get(
+            "submitted_order_type", ""
+        )).upper()
+        timeout_sec = (
+            self.entrada_limit_timeout_seg
+            if (not self._is_paper_ticker(ticker, pos=pos)
+                and order_type in ("LIMIT", "MARKETABLE_LIMIT")
+                and (self.config.get("execution_engine", {}) or {}).get("enabled", False))
+            else self.entrada_timeout_seg
+        )
+        if edad > timeout_sec:
             with self._lock:
                 if time.monotonic() < pos.get("next_cancel_retry_monotonic", 0.0):
                     return
