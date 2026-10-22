@@ -120,6 +120,9 @@ def main():
     result, unlinked = audit(signals, orders, date, tickers)
     print("READ ONLY: AI approval != order submitted != filled")
     print("NY date:", date, "| tickers:", ", ".join(tickers))
+    live = cfg.get("live_trading") or {}
+    print("REAL allow_short policy:", bool(live.get("allow_short", False)),
+          "| per_ticker_execution:", bool(live.get("per_ticker_execution", False)))
     print("Signal archive:", signals.exists(), "| order audit:", orders.exists())
     for ticker in tickers:
         rows = [row for row in result if row["ticker"] == ticker]
