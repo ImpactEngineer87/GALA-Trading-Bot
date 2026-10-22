@@ -120,3 +120,58 @@ risk settings while real positions are active.
 - Price-tolerance and P/L fixes, while committed, **have not been tested on
   the user's VPS or deployed**. The code may need additional fixes based on
   actual broker replies. Do not promise fills or profitability.
+
+
+## Follow-up: actual broker-order funnel evidence, 2026-10-22 (NY)
+
+Operator ran the read-only audit from the **live runtime files**:
+- `TSLA 10:51:11 SELL APPROVED`: no linked order event or learning skip
+  reason. Cause not established. Check whether GALA had a same-side
+  position, reserved entry, failed preflight, or only incomplete audit
+  linkage; do **not** retry historical order.
+- `BA 14:26:05 SELL APPROVED`: likewise no linked order event or reason.
+  A previous `BA 13:35:34 SELL` had a linked `ENTRY_FILLED` event, so
+  duplicate same-side suppression is **plausible but unproven** without
+  timestamped position state.
+- `NKE 12:29:39 BUY APPROVED`: a real LIMIT was submitted/acknowledged
+  and then `ENTRY_TIMEOUT_CANCELED` without a linked verified fill.
+  Another `NKE 12:12:07 SELL` was likewise canceled. Existing historical
+  timeouts can be inspected from recorded event reason; the new 20s
+  default was not active in that session.
+- `META 14:02:04 SELL APPROVED`: broker entry submitted/acknowledged
+  then `ENTRY_TIMEOUT_CANCELED`; this reversal also has
+  `EXIT_RECOVERED_FLAT` and requires strict broker evidence before
+  any learning label. Other META exits had unresolvable order IDs.
+- `NVDA 11:35:05 SELL APPROVED`: `POSITION_CLOSE_FAILED` and
+  `REVERSAL_ABORTED`, so sending a new SELL_SHORT would be unsafe.
+  `NVDA 13:17:03 BUY` was independently submitted then timed out.
+- Live config showed `live_trading.allow_short=True`, so short trading
+  wasn't disabled. No evidence of a dropped webhook or wrong
+  Schwab `SELL_SHORT` field in this incident.
+
+### Additional traceability / AI integrity
+
+- Future approved signals skipped without broker submission now create
+  `SIGNAL_EXECUTION_SKIPPED` with exact signal_id and structured reason
+  including same-side, reserved slot, entry-slot capacity and pending
+  reconciliation. Future entry timeout/cancel events carry the same ID.
+- Read-only incident audit additionally joins saved supplemental learning
+  reasons and **only exact** previously linked broker order IDs for old
+  cancellations. If the old event recorded its elapsed age (e.g., `180s`),
+  it is displayed; no elapsed duration is invented.
+- When broker order detail reports a filled quantity but no actual average
+  execution price, GALA still tracks the REAL position and attempts normal
+  protection. It may use a conservative reference/cost-basis price to
+  manage exposure, but **must not mark the entry confirmed for training**.
+  Entry `entry_confirmed` now also requires an order identity and a
+  positive finite price sourced from the actual broker order details,
+  not simply a local state transition or fallback LIMIT. PAPER behavior
+  remains unchanged. Legacy history is untouched.
+- Regression tests:
+  `test_signal_order_funnel.py` and
+  `test_real_entry_broker_price_evidence.py`.
+  As of this note, the tests have **not** been executed on the VPS.
+- The dashboard's existing `x/50` means 50 **new verified closed
+  executions**, not approvals, canceled LIMITs, or signal observations.
+  No automatic model retraining, risk-guard override, manual promotion
+  or broker order replays are introduced.
