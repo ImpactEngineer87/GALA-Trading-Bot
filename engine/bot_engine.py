@@ -4349,9 +4349,17 @@ class ChocoletraBot:
                         self.account_number, motivo,
                     )
                     if res.get("status") not in ("OK", "SIMULADA"):
+                        # RECONCILIAR is a fail-closed state, not a broken
+                        # trading signal. Show the actual broker reconciliation
+                        # blocker in the operator log instead of only its status.
+                        # SmartExit uses fixed, non-secret diagnostic messages;
+                        # still strip line breaks and bound the display.
+                        exit_reason = str(res.get("mensaje", "") or "")
+                        exit_reason = " ".join(exit_reason.split())[:220]
                         self._emit_log(
                             "ERROR",
                             f"[{ticker}] Liquidación FALLÓ ({res.get('status')}) — "
+                            f"{exit_reason or 'sin detalle'}; "
                             "se mantiene la posición para reintentar",
                         )
                         self._audit_event(

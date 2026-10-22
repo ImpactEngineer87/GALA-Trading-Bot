@@ -1535,7 +1535,8 @@ class EjecutorHibridoDeOrdenes:
             context = getattr(self._lifecycle_local, 'fields', None) or {}
             try:
                 return self._smart_exit.close(ticker, tipo_entrada, cantidad, account_number, motivo,
-                                              context.get('exit_signal_price'))
+                                              context.get('exit_signal_price'),
+                                              position_id=context.get('position_id'))
             except Exception as exc:
                 return {'status': 'RECONCILIAR', 'posicion_plana': False,
                         'mensaje': f'Execution recovery required: {type(exc).__name__}'}
@@ -1678,20 +1679,29 @@ class EjecutorHibridoDeOrdenes:
                 avg_price = float(detalle_fill.get("avg_price", 0.0) or 0.0)
                 _ps(f"[LIQUIDAR] {ticker} confirmado PLANO en "
                     f"{llenado['latency_ms'] + plano['latency_ms']}ms | ID {order_id} | {motivo}")
+                price_verified = bool(
+                    avg_price > 0 and str(llenado.get("broker_status", "")).upper() == "FILLED"
+                )
                 result = {
                     "status": "OK", "order_id": order_id, "cantidad": broker_qty,
                     "broker_status": llenado["broker_status"],
                     "latency_ms": llenado["latency_ms"] + plano["latency_ms"],
                     "posicion_plana": True, "avg_price": avg_price,
                     "broker_side": broker_tipo,
+                    "fill_price_verified": price_verified,
                 }
                 self._audit(
-                    "EXIT_FILLED", ticker=ticker, lado=broker_tipo,
-                    estado=llenado.get("broker_status", "FILLED"),
+                    "EXIT_FILLED" if price_verified else "EXIT_FLAT_PRICE_UNVERIFIED",
+                    ticker=ticker, lado=broker_tipo,
+                    estado=llenado.get("broker_status", "DESCONOCIDO"),
                     order_id=order_id, cantidad=broker_qty,
                     latency_ms=result["latency_ms"], motivo=motivo,
-                    precio=avg_price,
-                    detalle={"posicion_plana": True, "avg_price": avg_price},
+                    precio=avg_price if price_verified else "",
+                    detalle={
+                        "posicion_plana": True,
+                        "avg_price": avg_price if price_verified else None,
+                        "fill_price_verified": price_verified,
+                    },
                 )
                 return result
             status = "ERROR" if (

@@ -904,7 +904,7 @@
           <tbody id="aiLifecycleRows"><tr><td colspan="20">Cargando estado IA…</td></tr></tbody>
         </table>
       </div>
-      <details class="section-note" style="margin-top:8px"><summary>Cómo se cuentan las señales y qué requiere REAL</summary><p>x/50 cuenta cierres REAL/PAPER ejecutados y verificados y sobrevive reinicios. Las señales no ejecutadas con TP/SL inequívoco pueden aportar ejemplos FIT de menor peso; no cuentan como cierres ni pasan a VALIDACIÓN/TEST. Un candidato REJECTED no reemplaza el modelo SHADOW aceptado. REAL exige producción compatible, validación y pruebas del broker; ninguna rentabilidad está garantizada.</p></details>
+      <details class="section-note" style="margin-top:8px"><summary>Cómo se cuentan las señales y qué requiere REAL</summary><p>x/50 cuenta cierres REAL/PAPER ejecutados y verificados y sobrevive reinicios. El número x/50 representa cierres NUEVOS desde el último intento, no todos los cierres históricos. Las operaciones REAL excluidas (excl.) no suman a x/50 hasta que exista evidencia verificada de Schwab; las cifras históricas no se recuperan automáticamente. Las señales no ejecutadas con TP/SL inequívoco pueden aportar ejemplos FIT de menor peso; no cuentan como cierres ni pasan a VALIDACIÓN/TEST. Un candidato REJECTED no reemplaza el modelo SHADOW aceptado. REAL exige producción compatible, validación y pruebas del broker; ninguna rentabilidad está garantizada.</p></details>
     </div>
     <div class="card signal-chart-card" id="signalChartCard">
       <div class="signal-chart-head">
@@ -2966,7 +2966,9 @@ function renderAILearningSummary(data){
   const verified=real == null || paper == null ? null : real+paper;
   const legacy=summary.eligible_closed_legacy ?? sumField('eligible_closed_legacy');
   setText('aiVerifiedClosed',aiCountText(verified));
-  setText('aiClosedSources',`REAL ${aiCountText(real)} · PAPER ${aiCountText(paper)} · excluidas ${aiCountText(summary.quarantined_observations ?? sumField('quarantined_observations'))}${legacy>0 ? ` · ${aiCountText(legacy)} históricos sin verificación` : ''}`);
+  const excludedReal=summary.quarantined_closed_real ?? completeSum('quarantined_closed_real');
+  const excludedPaper=summary.quarantined_closed_paper ?? completeSum('quarantined_closed_paper');
+  setText('aiClosedSources',`REAL ${aiCountText(real)} válidas / ${aiCountText(excludedReal)} excluidas · PAPER ${aiCountText(paper)} válidas / ${aiCountText(excludedPaper)} excluidas${legacy>0 ? ` · ${aiCountText(legacy)} históricos sin verificación` : ''}`);
   const trainable=summary.learning_trainable ?? sumField('learning_trainable');
   const resolved=summary.learning_resolved ?? sumField('learning_resolved');
   const open=summary.learning_open ?? sumField('learning_open');
@@ -3005,7 +3007,7 @@ async function fetchAIStatus(){
       const readiness = row.training_readiness || {};
       const readinessText = readiness.reason || (readiness.ready === true ? 'Datos listos para entrenar' : 'Comprobando datos de entrenamiento');
       const readinessDetail = [readinessText,readiness.min_samples != null ? `${aiCountText(readiness.eligible_samples)} / ${aiCountText(readiness.min_samples)} cierres necesarios para FIT + VALIDACIÓN + TEST` : ''].filter(Boolean).join(' · ');
-      const closedSources = `REAL ${aiCountText(row.eligible_closed_real)} / PAPER ${aiCountText(row.eligible_closed_paper)}`;
+      const closedSources = `REAL ${aiCountText(row.eligible_closed_real)} (excl. ${aiCountText(row.quarantined_closed_real)}) / PAPER ${aiCountText(row.eligible_closed_paper)}`;
       const evaluation = aiEvaluation(row);
       const fitActual = row.muestras_fit_reales ?? evaluation.muestras_fit_reales ?? row.last_fit_samples ?? evaluation.muestras_fit;
       const fitSignals = row.muestras_fit_suplementarias ?? evaluation.muestras_fit_suplementarias;

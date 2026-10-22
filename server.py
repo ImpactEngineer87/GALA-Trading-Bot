@@ -4515,6 +4515,8 @@ def ai_retraining_status():
         summary = {
             "eligible_closed_real": sum(int(r.get("eligible_closed_real", 0) or 0) for r in rows),
             "eligible_closed_paper": sum(int(r.get("eligible_closed_paper", 0) or 0) for r in rows),
+            "quarantined_closed_real": sum(int(r.get("quarantined_closed_real", 0) or 0) for r in rows),
+            "quarantined_closed_paper": sum(int(r.get("quarantined_closed_paper", 0) or 0) for r in rows),
             "eligible_closed_legacy": sum(int(r.get("eligible_closed_legacy", 0) or 0) for r in rows),
             "training_ready": sum(bool((r.get("training_readiness") or {}).get("ready")) for r in rows),
             "collecting": sum(r.get("status") == "COLLECTING" for r in rows),
