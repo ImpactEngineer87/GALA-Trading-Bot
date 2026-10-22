@@ -87,3 +87,70 @@ without supervised maintenance and broker order/position reconciliation.**
 Schwab order-status and META P&L-sign discrepancies remain independent
 safety concerns. Do not approve new REAL orders because the AI training
 counter increased.
+
+
+## Oct 22: REAL reversal `RECONCILIAR` and AI source visibility
+
+Dashboard screenshots show failed NVDA/NKE/TSLA reversal closes and
+`REVERSAL_PRIOR_CLOSE_FAILED` supplemental observations. Such signals
+**must not advance x/50** because they were not executed as new,
+broker-verified completed trades. They may contribute only to bounded
+FIT evidence after a separately resolved virtual TP/SL outcome.
+The current automatic training configuration is independent of this fix
+(PR #14 is a separate, not yet deployed operator-control feature).
+
+The guarded SmartExit improvement additionally handles two cases that
+previously could leave local exit intent stuck in `RECONCILIAR`:
+
+- Schwab definitively reports FLAT but recorded execution quantities
+  disagree with the broker snapshot.
+- Schwab reports FLAT and the journal has terminal orders whose actual
+  fill prices cannot be recovered.
+
+Only if the broker also confirms **zero WORKING orders** does the engine
+release local intent via the existing `EXIT_RECOVERED_FLAT` quarantine
+path. It does **not** submit another order, fake a price or count
+the questionable trade for AI learning. If the broker position or
+WORKING snapshot is unavailable, the close remains blocked. If
+position exposure remains, existing fail-closed recovery applies.
+
+The bot error log now includes the exact internal reconciliation reason.
+The dashboard adds a breakdown of `quarantined_closed_real` and
+`quarantined_closed_paper`. No historical rows or last-attempt
+counters are changed.
+
+### Safe isolated test on a VPS with an ACTIVE REAL bot
+
+Do **not** run `git pull` or restart the currently running service merely
+to test; an unexpected systemd restart can load new code, and shutdown
+can liquidate live positions. Instead, create a separate Git worktree
+for code-only tests:
+
+```bash
+cd /opt/gala/GALA-Trading-Bot
+git fetch origin
+git worktree add --detach /opt/gala/GALA-Trading-Bot-review-20261022 \
+  origin/fix/smartexit-real-fill-evidence-20261021
+cd /opt/gala/GALA-Trading-Bot-review-20261022
+../GALA-Trading-Bot/.venv/bin/python -m unittest discover \
+  -s tests -p 'test_smartexit_flat_reconciliation.py' -v
+../GALA-Trading-Bot/.venv/bin/python -m unittest discover \
+  -s tests -p 'test_ai_real_exclusion_counters.py' -v
+../GALA-Trading-Bot/.venv/bin/python -m unittest discover \
+  -s tests -p 'test_smartexit_verified_flat.py' -v
+../GALA-Trading-Bot/.venv/bin/python scripts/audit_live_real_blockers.py \
+  --runtime-root /opt/gala/GALA-Trading-Bot
+```
+
+The last command reads local persisted audit, exit journal, training
+state and config only. It does not query Schwab; it does not verify
+that the live broker account is flat or that a restart is safe.
+Test changes are not loaded into the already-running Python process.
+Even passing unit tests are not a substitute for broker preflight,
+a supervised deployment plan, and reconciliation of every outstanding
+REAL position and WORKING order.
+
+All new tests are committed but remain **unexecuted on the user's VPS**
+until the operator supplies results. Do not enable production model
+promotion, bypass normal AI validation gates, or repair historical
+`execution_valid` flags solely to increase x/50.
