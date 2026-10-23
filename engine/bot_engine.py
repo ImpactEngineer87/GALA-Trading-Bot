@@ -477,7 +477,8 @@ class ChocoletraBot:
     # ==========================================================
 
     def set_hooks(self, on_signal: Callable = None, on_trade: Callable = None,
-                  on_log: Callable = None, on_candles: Callable = None):
+                  on_log: Callable = None, on_candles: Callable = None,
+                  on_trade_event: Callable = None):
         """server.py inyecta callbacks para reflejar el estado en el Dashboard."""
         if on_signal:
             self._hooks["signal"] = on_signal
@@ -487,6 +488,8 @@ class ChocoletraBot:
             self._hooks["log"] = on_log
         if on_candles:
             self._hooks["candles"] = on_candles
+        if on_trade_event:
+            self._hooks["trade_event"] = on_trade_event
 
     def _emit_log(self, nivel: str, mensaje: str):
         if nivel in ("ERROR",):
@@ -544,7 +547,20 @@ class ChocoletraBot:
                 pass
 
     def _emit_trade(self, tipo: str, ticker: str, precio: float, cantidad: int,
-                    estado: str = "OPEN", pnl: float = 0.0):
+                    estado: str = "OPEN", pnl: float = 0.0, *,
+                    execution_mode: str = "UNKNOWN", price_verified: bool = False,
+                    accounting_verified: bool = False):
+        event_cb = self._hooks.get("trade_event")
+        if event_cb:
+            try:
+                event_cb({"tipo": tipo, "ticker": ticker, "precio": precio,
+                          "cantidad": cantidad, "estado": estado, "pnl": pnl,
+                          "mode": execution_mode, "price_verified": price_verified,
+                          "accounting_verified": accounting_verified})
+            except Exception:
+                pass
+            return
+        # Existing integrations may continue to consume the six-argument hook.
         cb = self._hooks.get("trade")
         if cb:
             try:
@@ -3249,7 +3265,9 @@ class ChocoletraBot:
                 order_action=entry_action_for_state(target_state),
                 **lifecycle,
             )
-        self._emit_trade(orden.tipo, ticker, entrada, orden.cantidad, "OPEN", 0.0)
+        self._emit_trade(orden.tipo, ticker, entrada, orden.cantidad, "OPEN", 0.0,
+                         execution_mode=execution_mode,
+                         price_verified=entry_context["entry_confirmed"])
         self._emit_log("INFO", f"[ENTRADA] {orden}")
         try:
             self.telegram.enviar_alerta_temporal(
@@ -4184,7 +4202,8 @@ class ChocoletraBot:
                 if str(fill.get('status', '')).upper() != 'FILLED':
                     return
                 actual_tp1_price = (float(fill.get('avg_price', 0) or 0)
-                                    if fill.get('fill_price_verified') is True else 0.0)
+                                    if fill.get('fill_price_verified') is True
+                                    and float(fill.get('filled', 0) or 0) == cant_parcial else 0.0)
                 if self._positive_broker_fill_price(actual_tp1_price):
                     tp1 = actual_tp1_price
             # El TP1 (LIMIT) ya cerró el 70% en el broker. Reemplazar el STOP del
@@ -4243,7 +4262,9 @@ class ChocoletraBot:
         self._registrar_pnl_realizado_diario(
             pnl_parcial, ticker=ticker, motivo="TP1 70%"
         )
-        self._emit_trade(pos["tipo"], ticker, tp1, cant_parcial, "PARTIAL", pnl_parcial)
+        self._emit_trade(pos["tipo"], ticker, tp1, cant_parcial, "PARTIAL", pnl_parcial,
+                         execution_mode="PAPER" if paper_ticker else "REAL",
+                         price_verified=True, accounting_verified=True)
         self._audit_event(
             "TP1_FILLED_70_PERCENT",
             ticker=ticker, lado=pos["tipo"],
@@ -4254,6 +4275,7 @@ class ChocoletraBot:
                 "cantidad_resto": pos["cantidad_resto"],
                 "target_price": tp1_target,
                 "fill_price": tp1,
+                "fill_price_verified": True,
                 "nuevo_stop": nuevo_sl_price,
                 "nuevo_sl_order_id": nuevo_sl_id if reproteccion_ok else "",
                 "reprotegido": reproteccion_ok,
@@ -4739,6 +4761,7 @@ class ChocoletraBot:
                 "entrada": entrada,
                 "salida_solicitada": precio_salida,
                 "salida_real": actual_exit_price,
+                "final_quantity": cant_rest,
                 "tp1_ejecutado": bool(pos.get("tp1_hit")),
                 "broker_confirmed": bool(exit_confirmed),
                 "fill_price_verified": bool(exit_price_verified),
@@ -4770,7 +4793,9 @@ class ChocoletraBot:
         except Exception as e:
             self._emit_log("WARN", f"[{ticker}] Aprendizaje: {e}")
 
-        self._emit_trade(tipo, ticker, actual_exit_price, cant_rest, "CLOSED", pnl_total)
+        self._emit_trade(tipo, ticker, actual_exit_price, cant_rest, "CLOSED", pnl_total,
+                         execution_mode=execution_mode, price_verified=exit_price_verified,
+                         accounting_verified=accounting_verified)
         exit_text = f"${actual_exit_price:.6f}" if actual_exit_price is not None else "N/D"
         pnl_text = f"${pnl_total:.6f}" if pnl_total is not None else "N/D (reconciliación pendiente)"
         self._emit_log(

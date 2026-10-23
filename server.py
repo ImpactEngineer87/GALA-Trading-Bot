@@ -631,7 +631,7 @@ def _position_pnl_summary(positions):
         key = mode.lower()
         summary[f"{key}_open_count"] += 1
         value = number(row.get("floating_pnl"))
-        if value is None or row.get("valuation_available") is False:
+        if mode == "REAL" or value is None or row.get("valuation_available") is False:
             incomplete.add(key)
         else:
             summary[f"{key}_unrealized_pnl"] += value
@@ -649,13 +649,25 @@ def _pnl_sum(*values):
 
 def _engine_positions_snapshot():
     """Current positions from the trading engine, never inferred from history."""
+    from core.dashboard_evidence import mode_of, number
     bot = globals().get("_ENGINE")
+    rows = None
     if bot is not None and hasattr(bot, "dashboard_snapshot"):
         try:
-            return bot.dashboard_snapshot()
+            rows = bot.dashboard_snapshot()
         except Exception as exc:
             _log("WARN", f"[Dashboard] No se pudo leer posiciones del motor: {exc}")
-    return list((BOT_STATE.get("active_positions") or {}).values())
+    if rows is None:
+        rows = list((BOT_STATE.get("active_positions") or {}).values())
+    result = []
+    for original in rows:
+        row = dict(original)
+        if mode_of(row) == "REAL":
+            row["local_estimated_floating_pnl"] = number(row.get("floating_pnl"))
+            row["floating_pnl"] = None
+            row["floating_pnl_source"] = "SCHWAB_PNL_NOT_QUERIED"
+        result.append(row)
+    return result
 
 
 def _broker_reconciliation_state_path(cfg: dict = None) -> str:
@@ -1740,7 +1752,7 @@ def _register_signal(
 
 _restore_signal_history()
 
-def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
+def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0, evidence=None):
     """Register an execution event without confusing it with a live position.
 
     ``OPEN`` is an ENTRY event, not a permanent dashboard status. The current
@@ -1749,6 +1761,13 @@ def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
     """
     estado = str(estado or "OPEN").upper()
     ticker = str(ticker or "").upper()
+    from core.dashboard_evidence import mode_of, number
+    evidence = evidence if isinstance(evidence, dict) else {}
+    mode = mode_of(evidence)
+    price_verified = mode == "PAPER" or evidence.get("price_verified") is True
+    pnl_verified = mode == "PAPER" or (mode == "REAL" and evidence.get("accounting_verified") is True)
+    precio = number(precio) if price_verified else None
+    pnl = number(pnl) if pnl_verified else None
     event_label = {
         "OPEN": "ENTRY",
         "PARTIAL": "TP1_70_PERCENT",
@@ -1764,6 +1783,11 @@ def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
         "pnl": round(float(pnl), 6) if pnl is not None else None,
         "timestamp": _hora_ny(),
         "date": _hora_ny("%Y-%m-%d"),
+        "mode": mode,
+        "pnl_verified": pnl_verified and pnl is not None,
+        "pnl_source": ("PAPER_SIMULATION" if mode == "PAPER" else
+                       "LOCAL_RECORDED_FILLS_GROSS" if pnl_verified else "UNVERIFIED"),
+        "is_broker_reported": False,
     }
     BOT_STATE["trades"].append(trade)
     if len(BOT_STATE["trades"]) > 500:
@@ -1780,7 +1804,7 @@ def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
             "partial_quantity_executed": 0,
             "planned_partial_quantity": 0,
             "planned_remaining_quantity": int(cantidad),
-            "entry_price": round(float(precio), 4),
+            "entry_price": round(float(precio), 6) if precio is not None else None,
             "stop_initial": 0.0,
             "stop_current": 0.0,
             "tp1_price": 0.0,
@@ -1790,7 +1814,7 @@ def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
             "protection_mode": "",
             "realized_pnl": 0.0,
             "opened_at": f"{_hora_ny('%Y-%m-%d')}T{_hora_ny()}",
-            "mode": str(BOT_STATE.get("mode", "paper")).upper(),
+            "mode": mode,
         }
     elif estado == "PARTIAL":
         pos = active.get(ticker)
@@ -2669,6 +2693,10 @@ def _hook_candles(ticker, frame):
 def _hook_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
     _register_trade(tipo, ticker, precio, cantidad, estado, pnl)
 
+def _hook_trade_event(event):
+    _register_trade(event["tipo"], event["ticker"], event["precio"],
+                    event["cantidad"], event["estado"], event["pnl"], evidence=event)
+
 def _hook_log(nivel, mensaje):
     _log(nivel, mensaje)
 
@@ -2692,7 +2720,7 @@ def _start_engine(mode: str, capital: float):
     # Reflejar el estado en el Dashboard
     bot.set_hooks(
         on_signal=_hook_signal,
-        on_trade=_hook_trade,
+        on_trade_event=_hook_trade_event,
         on_log=_hook_log,
         on_candles=_hook_candles,
     )
@@ -3203,6 +3231,7 @@ def _chart_trade_events(ticker: str, start_ny: datetime, end_ny: datetime):
     """Persistent ENTRY/70%/final markers for a ticker and chart interval."""
 
     from core.order_audit import read_order_audit
+    from core.dashboard_evidence import number
 
     event_map = {
         "ENTRY_FILLED": "ENTRY",
@@ -3242,7 +3271,9 @@ def _chart_trade_events(ticker: str, start_ny: datetime, end_ny: datetime):
         if str(row.get("modo", "")).upper() == "REAL":
             if kind == "ENTRY" and detail.get("broker_price_verified") is not True:
                 continue
-            if kind == "PARTIAL_70" and str(row.get("estado", "")).upper() != "FILLED":
+            if kind == "PARTIAL_70" and not (
+                    str(row.get("estado", "")).upper() == "FILLED"
+                    and detail.get("fill_price_verified") is True):
                 continue
         price = row.get("precio", 0)
         if kind == "FINAL_EXIT":
@@ -3252,11 +3283,8 @@ def _chart_trade_events(ticker: str, start_ny: datetime, end_ny: datetime):
             ):
                 continue
             price = detail.get("salida_real")
-        try:
-            price = float(price or 0.0)
-        except (TypeError, ValueError):
-            price = 0.0
-        if price <= 0:
+        price = number(price)
+        if price is None or price <= 0:
             continue
         rows.append({
             "event_id": row.get("event_id", ""),
@@ -3265,8 +3293,8 @@ def _chart_trade_events(ticker: str, start_ny: datetime, end_ny: datetime):
             "timestamp_iso": event_dt.isoformat(),
             "price": price,
             "side": str(row.get("lado", "")).upper(),
-            "quantity": int(float(row.get("cantidad", 0) or 0)),
-            "pnl_usd": float(row.get("pnl_usd", 0) or 0),
+            "quantity": number(detail.get("final_quantity", row.get("cantidad"))) if kind == "FINAL_EXIT" else number(row.get("cantidad")),
+            "pnl_usd": number(row.get("pnl_usd")),
             "label": {
                 "ENTRY": "ENTRADA",
                 "PARTIAL_70": "SALIDA 70%",

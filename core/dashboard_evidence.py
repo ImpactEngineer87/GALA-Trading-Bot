@@ -149,6 +149,7 @@ def _real_close_reason(row, events):
         part = partials[0]
         pq, pp = number(part.get("cantidad")), number(part.get("precio"))
         if (str(part.get("estado") or "").upper() != "FILLED"
+                or _detail(part).get("fill_price_verified") is not True
                 or not part.get("order_id") or pq is None or not 0 < pq < qty
                 or pp is None or pp <= 0):
             return "Fill parcial no verificable"

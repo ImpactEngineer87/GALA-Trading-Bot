@@ -30,6 +30,9 @@ vm.runInContext(html.slice(a,b),context);
 a=html.indexOf('function updateDailyRisk(risk){');
 b=html.indexOf('function updateBrokerReconciliation(',a);
 vm.runInContext(html.slice(a,b),context);
+a=html.indexOf('function renderTradeEvents(');
+b=html.indexOf('async function fetchTickerAnalysis(){',a);
+vm.runInContext(html.slice(a,b),context);
 (async()=>{
   assert.equal(context.money(null),'N/D');
   assert.equal(context.money(undefined),'N/D');
@@ -48,16 +51,27 @@ vm.runInContext(html.slice(a,b),context);
     }}]};
   await context.fetchTickerPerformance();
   assert.match(elements.tickerPerfSummary.textContent,/PAPER simulado \$500.00/);
-  assert.match(elements.tickerPerfSummary.textContent,/REAL bruto local N\/D/);
+  assert.match(elements.tickerPerfSummary.textContent,/REAL cierres con fills \(bruto\) N\/D/);
   assert.match(elements.tickerPerformanceGrid.innerHTML,/Simulación PAPER/);
   assert.match(elements.tickerPerformanceGrid.innerHTML,/no P\/L Schwab/);
   assert.match(elements.tickerPerformanceGrid.innerHTML,/Sin verificar \/ excluidos <b>1/);
   context.renderPositions('positions',[{ticker:'META',mode:'REAL',status:'OPEN',
     entry_price:null,last_price:0,floating_pnl:null,valuation_available:false,
     initial_quantity:5,remaining_quantity:5}],false);
-  assert.match(elements.positions.innerHTML,/Flotante estimado local/);
+  assert.match(elements.positions.innerHTML,/P\/L Schwab: consulta separada/);
   assert.match(elements.positions.innerHTML,/valoración no disponible/);
   assert.doesNotMatch(elements.positions.innerHTML,/\$0\.00/);
+  context.renderPositions('positions',[{ticker:'TSLA',mode:'REAL',status:'OPEN',
+    entry_price:100,last_price:120,floating_pnl:999,valuation_available:true,
+    initial_quantity:3,remaining_quantity:3}],false);
+  assert.doesNotMatch(elements.positions.innerHTML,/999\.00/);
+  context.renderTradeEvents('events',[{ticker:'TSLA',mode:'REAL',evento:'CLOSE',
+    pnl:null,pnl_verified:false,precio:null,acciones:3}]);
+  assert.match(elements.events.innerHTML,/N\/D/);
+  assert.doesNotMatch(elements.events.innerHTML,/\+?\$0\.00/);
+  context.renderTradeEvents('events',[{ticker:'TSLA',mode:'REAL',evento:'CLOSE',
+    pnl:-3,pnl_verified:true,precio:98,acciones:2}]);
+  assert.match(elements.events.innerHTML,/(?:-\$|\$-)3\.00/);
 
   context.el('tickerAnalysisMode').value='REAL';
   payload={status:'ok',evidence_mode:'REAL',summary:{},rows:[{

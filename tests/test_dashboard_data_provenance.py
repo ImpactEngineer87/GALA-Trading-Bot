@@ -74,7 +74,7 @@ class DashboardEvidenceTests(unittest.TestCase):
         audit[-1].update(cantidad=10, precio=97.7, pnl_usd=23)
         audit[-1]["detalle"].update(tp1_ejecutado=True, salida_real=97)
         partial = dict(audit[0], evento="TP1_FILLED_70_PERCENT", order_id="tp-1",
-                       cantidad=7, precio=98, detalle={})
+                       cantidad=7, precio=98, detalle={"fill_price_verified": True})
         self.assertFalse(annotate_history([row], audit)[0]["performance_verified"])
         self.assertTrue(annotate_history([row], audit + [partial])[0]["performance_verified"])
         partial["cantidad"] = 8

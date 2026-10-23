@@ -66,7 +66,9 @@ def build_ticker_performance(tickers, *, signal_rows=(), history_rows=(),
         s = stats[t, mode]
         s["open_positions"] += 1
         pnl = number(row.get("floating_pnl"))
-        if pnl is None or row.get("valuation_available") is False:
+        # REAL headlines never combine confirmed closes with a candle estimate.
+        # Schwab position-day P/L has its own explicitly scoped broker query.
+        if mode == "REAL" or pnl is None or row.get("valuation_available") is False:
             s["unknown_open_pnl"] += 1
         else:
             s["unrealized_pnl"] += pnl

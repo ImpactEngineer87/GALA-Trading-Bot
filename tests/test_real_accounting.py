@@ -85,7 +85,8 @@ class RealCloseAccountingTests(unittest.TestCase):
         row = self.last_close()
         self.assertEqual(row["salida"], "")
         self.assertEqual(row["pnl_usd"], "")
-        bot._emit_trade.assert_called_once_with("BUY", "NKE", None, 10, "CLOSED", None)
+        bot._emit_trade.assert_called_once_with("BUY", "NKE", None, 10, "CLOSED", None,
+            execution_mode="REAL", price_verified=False, accounting_verified=False)
         self.assertIsNone(bot.orquestador.al_cerrar.call_args.args[1])
         self.assertFalse(bot.orquestador.al_cerrar.call_args.kwargs["lifecycle"]["exit_confirmed"])
         decision = SimpleNamespace(propuesta=SimpleNamespace(ticker="NKE", tipo="SELL"))
@@ -126,6 +127,20 @@ class RealCloseAccountingTests(unittest.TestCase):
         self.assertAlmostEqual(float(self.last_close()["pnl_usd"]), 0.4)
         self.assertAlmostEqual(float(self.last_close()["salida"]), 37.7)
         self.assertAlmostEqual(bot.daily_loss_guard.realized_pnl(False), -0.3)
+
+    def test_tsla_partial_win_and_larger_final_loss_are_recorded_as_a_trade_loss(self):
+        bot = self.engine(partial=True, response={"status": "OK", "posicion_plana": True,
+            "order_id": "exit-1", "cantidad": 2, "avg_price": 98, "fill_price_verified": True})
+        pos = bot._posiciones.pop("NKE")
+        pos.update(entrada=100, orden=SimpleNamespace(cantidad=3), cantidad_resto=2,
+                   pnl_realizado=1)
+        bot._posiciones["TSLA"] = pos
+        bot.daily_loss_guard.add_realized(False, 1)
+        bot._cerrar_posicion_impl("TSLA", 105, "test requested exit must not determine P/L")
+        self.assertEqual(float(self.last_close()["pnl_usd"]), -3)
+        self.assertEqual(float(self.last_close()["salida"]), 99)
+        self.assertEqual(bot.daily_loss_guard.realized_pnl(False), -3)
+        self.assertEqual(bot._emit_trade.call_args.args[-1], -3)
 
     def test_unknown_partial_price_keeps_remainder_protected_and_pnl_unknown(self):
         bot = self.engine()

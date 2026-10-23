@@ -1,4 +1,4 @@
-# Dashboard data provenance — v3.3.10
+# Dashboard data provenance — v3.3.11
 
 ## Corrected behavior
 
@@ -138,3 +138,32 @@ and SHADOW evaluation does not manufacture a win/loss. Existing models, valid
 observation counts, validation requirements and promotion permissions remain
 unchanged. This does not retroactively reconcile the 17 historical closes or
 make them eligible for training.
+
+## Strict REAL presentation in v3.3.11
+
+REAL headline/session totals no longer include candle-derived floating profit.
+The engine keeps those estimates for internal risk calculations; the public
+snapshot retains a clearly named diagnostic estimate separately. Active REAL
+position cards show broker P/L as unavailable until the separate Schwab query,
+and never substitute a local estimate for it. Ticker headlines explicitly show
+verified closed-fill gross P/L, not a mixture of closed fills and estimates.
+Broker-reported open-position P/L remains separately scoped: it is not the
+account-wide TOS P/L Day, especially after all positions have closed.
+
+Structured engine events now carry their actual execution mode and accounting
+evidence instead of inheriting the dashboard's current global mode. A manually
+posted/unproven event cannot become a REAL fill or profit. Unknown event P/L
+renders N/D rather than $0.00. Legacy six-argument event hooks remain available.
+
+REAL partial-close evidence requires an explicit verified execution price as
+well as the linked order identity and full quantity arithmetic. Old partial
+FILLED flags/target prices alone do not establish profitability. Chart markers
+follow the same requirement and do not substitute zero for missing P/L. Tests
+cover a toy three-share position with +$1 partial and -$4 final outcome, correctly
+recording -$3 overall; this is not a reconstruction of historical TSLA fills.
+
+The historical Oct-22 TSLA trade with three entry shares and only a two-share
+final close remains unresolved without the exact additional exit evidence.
+This release does not invent missing order IDs, rewrite ledgers, alter AI
+eligibility/counters, promote models, or change broker order/risk execution.
+It adds stricter display provenance on top of v3.3.10 accounting protection.
