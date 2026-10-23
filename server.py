@@ -500,6 +500,48 @@ def _read_history_rows(*, newest_first: bool = True):
     )
 
 
+_DASHBOARD_HISTORY_CACHE = {}
+_DASHBOARD_HISTORY_LOCK = threading.RLock()
+
+
+def _dashboard_history_rows(*, newest_first=True):
+    """Read-only provenance view, cached until either source ledger changes."""
+    import csv
+    from core.dashboard_evidence import annotate_history
+    from core.trade_history import LEGACY_HISTORY_FIELDS, HISTORY_FIELDS
+
+    history_path, audit_path = _history_path(), _order_audit_path()
+    def signature(path):
+        try:
+            st = os.stat(path)
+            return (path, st.st_mtime_ns, st.st_size, st.st_ino)
+        except FileNotFoundError:
+            return (path, None)
+
+    key = (signature(history_path), signature(audit_path))
+    with _DASHBOARD_HISTORY_LOCK:
+        if _DASHBOARD_HISTORY_CACHE.get("key") != key:
+            rows = []
+            if os.path.exists(history_path):
+                with open(history_path, encoding="utf-8-sig", newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    fields = list(reader.fieldnames or [])
+                    if fields and fields not in (LEGACY_HISTORY_FIELDS, HISTORY_FIELDS):
+                        raise ValueError("Esquema histórico no reconocido; no se calculan resultados")
+                    rows = list(reader)
+                    if fields == LEGACY_HISTORY_FIELDS:
+                        rows = [{**r, "evento": "POSITION_CLOSE"} for r in rows]
+            try:
+                with open(audit_path, encoding="utf-8-sig", newline="") as handle:
+                    annotated = annotate_history(rows, csv.DictReader(handle))
+            except (OSError, csv.Error):
+                annotated = annotate_history(rows)
+            _DASHBOARD_HISTORY_CACHE.clear()
+            _DASHBOARD_HISTORY_CACHE.update(key=key, rows=annotated)
+        rows = _DASHBOARD_HISTORY_CACHE["rows"]
+        return [dict(row) for row in (reversed(rows) if newest_first else rows)]
+
+
 def _closed_history_rows(rows):
     """Only closes affect PnL/counts; v2.9 also stores transparent open rows."""
 
@@ -512,19 +554,23 @@ def _closed_history_rows(rows):
 
 def _history_summary():
     """Persistent closed count/PnL, so dashboard stats survive restarts."""
+    from core.dashboard_evidence import mode_of, session_date
     try:
-        rows = _read_history_rows(newest_first=False)
+        rows = _dashboard_history_rows(newest_first=False)
     except Exception:
         return {
-            "closed_count": int(BOT_STATE["stats"].get("trades_closed", 0) or 0),
-            "pnl_total": round(float(BOT_STATE["stats"].get("pnl_total", 0.0) or 0.0), 2),
-            "paper_pnl": 0.0, "real_pnl": 0.0,
+            "available": False, "excluded_closed_count": 0,
+            "is_broker_reported": False,
+            "pnl_source": "UNAVAILABLE",
+            "closed_count": 0, "pnl_total": None,
+            "paper_pnl": None, "real_pnl": None,
             "paper_closed_count": 0, "real_closed_count": 0,
-            "paper_realized_today": 0.0, "real_realized_today": 0.0,
+            "paper_realized_today": None, "real_realized_today": None,
             "paper_closed_today": 0, "real_closed_today": 0,
         }
-    closed = _closed_history_rows(rows)
-    pnl = 0.0
+    all_closed = _closed_history_rows(rows)
+    excluded = sum(not r.get("performance_verified", False) for r in all_closed)
+    closed = [r for r in all_closed if r.get("performance_verified")]
     by_mode = {"PAPER": 0.0, "REAL": 0.0}
     counts = {"PAPER": 0, "REAL": 0}
     today_pnl = {"PAPER": 0.0, "REAL": 0.0}
@@ -536,22 +582,30 @@ def _history_summary():
             mode = str(row.get("modo", "PAPER") or "PAPER").upper()
             if mode not in by_mode:
                 mode = "PAPER"
-            pnl += value
             by_mode[mode] += value
             counts[mode] += 1
-            if str(row.get("fecha", "") or "") == today_ny:
+            if session_date(row) == today_ny:
                 today_pnl[mode] += value
                 today_counts[mode] += 1
         except (TypeError, ValueError):
             pass
+    incomplete = {mode: any(not r.get("performance_verified") and mode_of(r) == mode
+                            for r in all_closed) for mode in ("PAPER", "REAL")}
+    incomplete_today = {mode: any(not r.get("performance_verified") and mode_of(r) == mode
+                                  and session_date(r) == today_ny for r in all_closed)
+                        for mode in ("PAPER", "REAL")}
     return {
-        "closed_count": len(closed), "pnl_total": round(pnl, 2),
-        "paper_pnl": round(by_mode["PAPER"], 2),
-        "real_pnl": round(by_mode["REAL"], 2),
+        "available": True,
+        "excluded_closed_count": excluded,
+        "pnl_source": "LOCAL_RECORDED_FILLS_AND_PAPER_SIMULATION",
+        "is_broker_reported": False,
+        "closed_count": len(closed), "pnl_total": None,
+        "paper_pnl": None if incomplete["PAPER"] else round(by_mode["PAPER"], 2),
+        "real_pnl": None if incomplete["REAL"] else round(by_mode["REAL"], 2),
         "paper_closed_count": counts["PAPER"],
         "real_closed_count": counts["REAL"],
-        "paper_realized_today": round(today_pnl["PAPER"], 2),
-        "real_realized_today": round(today_pnl["REAL"], 2),
+        "paper_realized_today": None if incomplete_today["PAPER"] else round(today_pnl["PAPER"], 2),
+        "real_realized_today": None if incomplete_today["REAL"] else round(today_pnl["REAL"], 2),
         "paper_closed_today": today_counts["PAPER"],
         "real_closed_today": today_counts["REAL"],
     }
@@ -563,26 +617,34 @@ def _position_pnl_summary(positions):
         "paper_open_count": 0, "real_open_count": 0,
         "paper_unrealized_pnl": 0.0, "real_unrealized_pnl": 0.0,
     }
+    from core.dashboard_evidence import mode_of, number
+    incomplete = set()
     for row in positions or []:
         if not isinstance(row, dict):
             continue
         status = str(row.get("status", "OPEN") or "OPEN").upper()
         if status not in {"OPEN", "PARTIAL"}:
             continue
-        mode = str(row.get("mode", "PAPER") or "PAPER").upper()
+        mode = mode_of(row)
         if mode not in {"PAPER", "REAL"}:
-            mode = "PAPER"
+            continue
         key = mode.lower()
         summary[f"{key}_open_count"] += 1
-        try:
-            summary[f"{key}_unrealized_pnl"] += float(
-                row.get("floating_pnl", 0.0) or 0.0
-            )
-        except (TypeError, ValueError):
-            pass
-    for key in ("paper_unrealized_pnl", "real_unrealized_pnl"):
-        summary[key] = round(summary[key], 2)
+        value = number(row.get("floating_pnl"))
+        if value is None or row.get("valuation_available") is False:
+            incomplete.add(key)
+        else:
+            summary[f"{key}_unrealized_pnl"] += value
+    for mode in ("paper", "real"):
+        key = f"{mode}_unrealized_pnl"
+        summary[key] = None if mode in incomplete else round(summary[key], 2)
     return summary
+
+
+def _pnl_sum(*values):
+    from core.dashboard_evidence import number
+    parsed = [number(v) for v in values]
+    return round(sum(parsed), 2) if all(v is not None for v in parsed) else None
 
 
 def _engine_positions_snapshot():
@@ -743,6 +805,9 @@ def _dashboard_stats():
     live = _position_pnl_summary(positions)
     stats["trades_open"] = len(positions) if positions else len(broker_positions)
     stats["broker_positions_open"] = len(broker_positions)
+    stats["pnl_source"] = history["pnl_source"]
+    stats["is_broker_reported"] = False
+    stats["excluded_closed_count"] = history["excluded_closed_count"]
     stats["trades_closed"] = history["closed_count"]
     stats["pnl_total"] = history["pnl_total"]
     stats["paper_pnl"] = history["paper_pnl"]
@@ -754,11 +819,11 @@ def _dashboard_stats():
     stats["real_realized_today"] = history["real_realized_today"]
     stats["paper_closed_today"] = history["paper_closed_today"]
     stats["real_closed_today"] = history["real_closed_today"]
-    stats["paper_session_pnl"] = round(
-        history["paper_realized_today"] + live["paper_unrealized_pnl"], 2
+    stats["paper_session_pnl"] = _pnl_sum(
+        history["paper_realized_today"], live["paper_unrealized_pnl"]
     )
-    stats["real_session_pnl"] = round(
-        history["real_realized_today"] + live["real_unrealized_pnl"], 2
+    stats["real_session_pnl"] = _pnl_sum(
+        history["real_realized_today"], live["real_unrealized_pnl"]
     )
     return stats
 
@@ -1432,11 +1497,11 @@ def _verify_schwab_connection(*, force: bool = False) -> dict:
         return _schwab_auth_snapshot()
 
 def schwab_get_candles(ticker: str, cantidad: int = 200):
-    """Obtiene velas reales de Schwab. Fallback sintetico si mercado cerrado."""
+    """Only Schwab candles. Missing data never becomes fabricated market data."""
     schwab_ensure_token()
     hdrs = schwab_headers()
     if not hdrs:
-        return _synthetic_candles(ticker, cantidad)
+        return None
     try:
         r = guarded_market_get(
             f"{SCHWAB_MKT_URL}/pricehistory",
@@ -1453,7 +1518,7 @@ def schwab_get_candles(ticker: str, cantidad: int = 200):
                 schwab_refresh(refresh)
             hdrs = schwab_headers()
             if not hdrs:
-                return _synthetic_candles(ticker, cantidad)
+                return None
             r = guarded_market_get(
                 f"{SCHWAB_MKT_URL}/pricehistory",
                 params={"symbol": ticker, "periodType": "day", "period": 5,
@@ -1464,39 +1529,17 @@ def schwab_get_candles(ticker: str, cantidad: int = 200):
         r.raise_for_status()
         datos = r.json()
         if "candles" not in datos or not datos["candles"]:
-            return _synthetic_candles(ticker, cantidad)
+            return None
         import pandas as pd
         df = pd.DataFrame(datos["candles"])
-        df["datetime"] = pd.to_datetime(df["datetime"], unit="ms")
+        df["datetime"] = pd.to_datetime(df["datetime"], unit="ms", utc=True)
         df.set_index("datetime", inplace=True)
         df = df[["open", "high", "low", "close", "volume"]].astype(float)
         df.sort_index(inplace=True)
         return df.tail(cantidad)
     except Exception as e:
-        _log("WARN", f"[Schwab] Error velas {ticker}: {e} - usando sinteticos")
-        return _synthetic_candles(ticker, cantidad)
-
-def _synthetic_candles(ticker: str, cantidad: int = 200):
-    """Datos sinteticos realistas para cuando el mercado esta cerrado."""
-    import numpy as np
-    import pandas as pd
-    np.random.seed(hash(ticker) % 9999)
-    fechas = pd.date_range(end=datetime.now(), periods=cantidad, freq="1min")
-    bases  = {"BA":225,"AAPL":313,"TSLA":394,"NVDA":118,"AMD":162,
-              "AMZN":197,"META":523,"RCL":230,"UNH":540}
-    base   = bases.get(ticker, 200.0)
-    pasos  = np.random.choice([-1,1], size=cantidad, p=[0.45,0.55])
-    cambios= pasos*(abs(np.random.randn(cantidad))*0.003+0.001)*base
-    precios= np.maximum(base+np.cumsum(cambios), base*0.8)
-    ruido  = abs(np.random.randn(cantidad))*base*0.001
-    return pd.DataFrame({
-        "open":   precios-ruido*0.5,
-        "high":   precios+ruido*1.5,
-        "low":    precios-ruido*1.5,
-        "close":  precios,
-        "volume": np.random.randint(80000,600000,cantidad).astype(float),
-    }, index=fechas)
-
+        _log("WARN", f"[Schwab] Velas no disponibles para {ticker}: {type(e).__name__}; sin datos de sustitución")
+        return None
 
 def _signal_datetime(signal: dict):
     """Parse new and legacy signal timestamps as timezone-aware NY datetimes."""
@@ -3193,9 +3236,19 @@ def _chart_trade_events(ticker: str, start_ny: datetime, end_ny: datetime):
                 detail = {}
         except (TypeError, ValueError):
             detail = {}
+        if str(row.get("modo", "")).upper() == "REAL":
+            if kind == "ENTRY" and detail.get("broker_price_verified") is not True:
+                continue
+            if kind == "PARTIAL_70" and str(row.get("estado", "")).upper() != "FILLED":
+                continue
         price = row.get("precio", 0)
         if kind == "FINAL_EXIT":
-            price = detail.get("salida_solicitada", price)
+            if str(row.get("modo", "")).upper() == "REAL" and not (
+                detail.get("broker_confirmed") is True
+                and detail.get("fill_price_verified") is True
+            ):
+                continue
+            price = detail.get("salida_real")
         try:
             price = float(price or 0.0)
         except (TypeError, ValueError):
@@ -3396,16 +3449,6 @@ def get_signal_chart():
         if str(position.get("ticker", "")).upper() == ticker
         and str(position.get("status", "")).upper() in ("OPEN", "PARTIAL")
     ), None)
-    if active_position and candles:
-        last_price = float(candles[-1].get("close", 0.0) or 0.0)
-        entry_price = float(active_position.get("entry_price", 0.0) or 0.0)
-        remaining = int(active_position.get("remaining_quantity", 0) or 0)
-        if str(active_position.get("side", "")).upper() == "BUY":
-            floating = (last_price - entry_price) * remaining
-        else:
-            floating = (entry_price - last_price) * remaining
-        active_position["last_price"] = round(last_price, 4)
-        active_position["floating_pnl"] = round(floating, 2)
     trade_events = _chart_trade_events(ticker, start_ny, end_ny)
     return jsonify({
         "status": "ok",
@@ -3456,13 +3499,19 @@ def broker_open_position_pnl():
     """
     from core.broker_pnl import open_position_pnl_snapshot
     bot = globals().get("_ENGINE")
-    if bot is None or not getattr(bot, "account_number", ""):
-        return jsonify({
-            "status": "unavailable", "source": "SCHWAB_OPEN_POSITIONS",
-            "message": "Motor sin cuenta Schwab verificada; P/L de broker no disponible",
-        }), 503
+    account = str(getattr(bot, "account_number", "") or
+                  BOT_STATE.get("account_number", "") or
+                  get_env("SCHWAB_ACCOUNT_NUMBER", "")).strip()
     try:
-        positions = bot.schwab.obtener_posiciones(bot.account_number)
+        if not account:
+            raise RuntimeError("Cuenta Schwab no configurada")
+        if bot is not None and getattr(bot, "schwab", None) is not None:
+            positions = bot.schwab.obtener_posiciones(account)
+        else:
+            from api.schwab_client import SchwabClient
+            client = SchwabClient(_read_config_runtime())
+            account_hash = client.obtener_account_hash(account)
+            positions = client.obtener_posiciones(account_hash) if account_hash else None
     except Exception:
         positions = None
     summary = open_position_pnl_snapshot(positions)
@@ -3490,7 +3539,10 @@ def get_trades():
     events = BOT_STATE["trades"][-100:]
     return jsonify({
         "status": "ok",
-        "display_version": 2,
+        "display_version": 3,
+        "pnl_source": history["pnl_source"],
+        "is_broker_reported": False,
+        "excluded_closed_count": history["excluded_closed_count"],
         "positions": positions,
         "events": events,
         # Compatibility for older dashboard builds.
@@ -3505,11 +3557,11 @@ def get_trades():
         "paper_realized_today": history["paper_realized_today"],
         "real_realized_today": history["real_realized_today"],
         **live,
-        "paper_session_pnl": round(
-            history["paper_realized_today"] + live["paper_unrealized_pnl"], 2
+        "paper_session_pnl": _pnl_sum(
+            history["paper_realized_today"], live["paper_unrealized_pnl"]
         ),
-        "real_session_pnl": round(
-            history["real_realized_today"] + live["real_unrealized_pnl"], 2
+        "real_session_pnl": _pnl_sum(
+            history["real_realized_today"], live["real_unrealized_pnl"]
         ),
         "daily_risk": _engine_daily_risk_snapshot(),
     })
@@ -3547,10 +3599,10 @@ def get_ticker_performance():
         signal_rows = [dict(row) for row in BOT_STATE.get("signals", [])]
 
     try:
-        history_rows = _read_history_rows(newest_first=False)
+        history_rows = _dashboard_history_rows(newest_first=False)
     except Exception as exc:
         _log("WARN", f"[Dashboard] Rendimiento por ticker sin historial: {exc}")
-        history_rows = []
+        return jsonify({"status": "unavailable", "message": "Historial no verificable", "rows": []}), 503
 
     positions = _engine_positions_snapshot()
     execution_rows = _ticker_execution_rows(cfg, persist_missing=False)
@@ -3569,11 +3621,21 @@ def get_ticker_performance():
         "date": selected_date,
         "rows": rows,
         "summary": {
-            "signals": sum(int(row.get("signals", 0) or 0) for row in rows),
-            "closed_trades": sum(int(row.get("closed_trades", 0) or 0) for row in rows),
-            "realized_pnl": round(sum(float(row.get("realized_pnl", 0) or 0) for row in rows), 2),
-            "unrealized_pnl": round(sum(float(row.get("unrealized_pnl", 0) or 0) for row in rows), 2),
-            "total_pnl": round(sum(float(row.get("total_pnl", 0) or 0) for row in rows), 2),
+            "signals": sum(int(row.get("signals", 0)) for row in rows),
+            "by_mode": {
+                mode: {
+                    "closed_trades": sum(row["mode_breakdown"][mode]["closed_trades"] for row in rows),
+                    "excluded_closed_trades": sum(row["mode_breakdown"][mode]["excluded_closed_trades"] for row in rows),
+                    **{
+                        field: (
+                            round(sum(row["mode_breakdown"][mode][field] for row in rows), 2)
+                            if all(row["mode_breakdown"][mode][field] is not None for row in rows)
+                            else None
+                        ) for field in ("realized_pnl", "unrealized_pnl", "total_pnl")
+                    },
+                } for mode in ("PAPER", "REAL", "UNKNOWN")
+            },
+            "is_broker_reported": False,
         },
     })
 
@@ -3604,6 +3666,10 @@ def get_ticker_analysis():
         min_closed = 10
     min_closed = max(1, min(10000, min_closed))
 
+    evidence_mode = str(request.args.get("mode", "REAL")).strip().upper()
+    if evidence_mode not in {"PAPER", "REAL"}:
+        return jsonify({"status": "error", "message": "mode debe ser PAPER o REAL"}), 400
+
     as_of = str(
         request.args.get("date")
         or _ahora_ny_datetime().strftime("%Y-%m-%d")
@@ -3613,10 +3679,10 @@ def get_ticker_analysis():
         tickers = list((cfg.get("market", {}) or {}).get("tickers") or [])
 
     try:
-        history_rows = _read_history_rows(newest_first=False)
+        history_rows = _dashboard_history_rows(newest_first=False)
     except Exception as exc:
         _log("WARN", f"[Dashboard] Análisis automático sin historial: {exc}")
-        history_rows = []
+        return jsonify({"status": "unavailable", "message": "Historial no verificable", "rows": []}), 503
 
     execution_rows = _ticker_execution_rows(cfg, persist_missing=False)
     ai_rows = []
@@ -3639,6 +3705,7 @@ def get_ticker_analysis():
         as_of_date=as_of,
         lookback_days=lookback_days,
         min_closed_trades=min_closed,
+        evidence_mode=evidence_mode,
     )
     eligible = [row for row in rows if row.get("sample_eligible")]
     review = [row for row in eligible if row.get("review_candidate")]
@@ -3647,8 +3714,10 @@ def get_ticker_analysis():
         "as_of_date": as_of,
         "lookback_days": lookback_days,
         "min_closed_trades": min_closed,
+        "evidence_mode": evidence_mode,
+        "is_broker_reported": False,
         "ranking_basis": (
-            "cierres ejecutados: Wilson win-rate + retorno normalizado; "
+            "resultados separados por modo: Wilson win-rate + retorno normalizado; "
             "BA del modelo solo contexto"
         ),
         "auto_switch_real": False,
@@ -3682,13 +3751,14 @@ def add_log_api():
 def get_historial():
     """Persistent position lifecycle, newest first; stats count closes only."""
     try:
-        filas = _read_history_rows(newest_first=True)
+        filas = _dashboard_history_rows(newest_first=True)
     except Exception as e:
         return jsonify({"status": "error", "mensaje": str(e), "operaciones": []})
     closed = _closed_history_rows(filas)
     return jsonify({
         "status": "ok",
         "total": len(closed),
+        "excluded_closed_count": sum(not r.get("performance_verified") for r in closed),
         "total_eventos": len(filas),
         "operaciones": filas,
     })
@@ -4656,3 +4726,4 @@ if __name__ == '__main__':
 
     app.run(host=dashboard_host, port=dashboard_port, debug=False, use_reloader=False,
             threaded=True)
+

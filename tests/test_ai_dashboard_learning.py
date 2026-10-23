@@ -36,7 +36,7 @@ async function render(data){response={status:'ok',...data};await context.fetchAI
     summary:{pending:0,training:0},
     tickers:[{
       ticker:'AAPL',eligible_observations:50,eligible_closed_real:12,eligible_closed_paper:38,
-      new_observations:50,retrain_samples:60,quarantined_observations:3,
+      new_observations:50,retrain_samples:60,quarantined_observations:3,quarantined_closed_real:1,quarantined_closed_paper:2,
       training_readiness:{ready:false,reason:'Se requieren <60> cierres',min_samples:60,eligible_samples:50},
       learning_total:8,learning_resolved:6,learning_trainable:4,learning_open:2,
       last_evaluation:{muestras_fit_reales:30,muestras_fit_suplementarias:4,
@@ -46,7 +46,7 @@ async function render(data){response={status:'ok',...data};await context.fetchAI
     }],
   });
   assert.equal(elements.aiVerifiedClosed.textContent,'50');
-  assert.match(elements.aiClosedSources.textContent,/REAL 12 · PAPER 38 · excluidas 3/);
+  assert.match(elements.aiClosedSources.textContent,/REAL 12 válidas \/ 1 excluidas · PAPER 38 válidas \/ 2 excluidas/);
   assert.equal(elements.aiResolvedSignals.textContent,'4');
   assert.match(elements.aiSignalSources.textContent,/6 resueltas · 2 pendientes · 2 excluidas/);
   assert.equal(elements.aiTrainingReady.textContent,'0/1');
@@ -64,7 +64,7 @@ async function render(data){response={status:'ok',...data};await context.fetchAI
   await render({retrain_samples:75,tickers:[{
     ticker:'OLD',new_observations:3,eligible_observations:9,last_fit_samples:5,
   }]});
-  assert.match(elements.aiClosedSources.textContent,/REAL — · PAPER —/);
+  assert.match(elements.aiClosedSources.textContent,/REAL — válidas \/ — excluidas · PAPER — válidas \/ — excluidas/);
   assert.equal(elements.aiTrainingReady.textContent,'—');
   assert.equal(elements.aiEconomicEvidence.textContent,'Sin evaluar');
   assert.equal(elements.aiVerifiedClosed.textContent,'—');
@@ -109,3 +109,4 @@ async function render(data){response={status:'ok',...data};await context.fetchAI
 
 if __name__ == "__main__":
     unittest.main()
+

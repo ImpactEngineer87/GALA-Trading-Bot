@@ -1535,6 +1535,9 @@ class ChocoletraBot:
         with self._lock:
             self._last_prices[ticker] = precio_actual
             self._last_price_times[ticker] = time.time()
+            if not hasattr(self, "_last_bar_times"):
+                self._last_bar_times = {}
+            self._last_bar_times[ticker] = str(df_micro.index[-1])
         self._recover_ticker_quarantine(ticker, 'market_data')
         paper_ticker = self._is_paper_ticker(ticker)
 
@@ -5646,6 +5649,7 @@ class ChocoletraBot:
         with self._lock:
             items = list(self._posiciones.items())
             last_prices = dict(getattr(self, "_last_prices", {}))
+            bar_times = dict(getattr(self, "_last_bar_times", {}))
 
         for ticker, pos in items:
             if not isinstance(pos, dict) or pos.get("reservado"):
@@ -5709,12 +5713,25 @@ class ChocoletraBot:
                     partial_exit_at = str(partial_at)
 
             last_price = float(last_prices.get(ticker, 0.0) or 0.0)
-            if pending or entry <= 0 or last_price <= 0:
-                floating_pnl = 0.0
-            elif str(pos.get("tipo") or getattr(order, "tipo", "")) == "BUY":
-                floating_pnl = (last_price - entry) * remaining_qty
-            else:
-                floating_pnl = (entry - last_price) * remaining_qty
+            paper = self._is_paper_ticker(ticker, pos=pos)
+            entry_verified = paper or (pos.get("entry_integrity") or {}).get("entry_confirmed") is True
+            bar_at = str(bar_times.get(ticker, ""))
+            age = None
+            try:
+                bar = pd.Timestamp(bar_at)
+                if bar.tzinfo is not None:
+                    age = time.time() - bar.timestamp()
+            except (TypeError, ValueError):
+                pass
+            valuation_available = bool(
+                not pending and entry_verified and entry > 0
+                and math.isfinite(last_price) and last_price > 0
+                and age is not None and 0 <= age <= 120
+            )
+            floating_pnl = None
+            if valuation_available:
+                direction = 1 if str(pos.get("tipo") or getattr(order, "tipo", "")) == "BUY" else -1
+                floating_pnl = round((last_price - entry) * remaining_qty * direction, 2)
 
             rows.append({
                 "ticker": str(ticker),
@@ -5736,7 +5753,13 @@ class ChocoletraBot:
                 "partial_quantity_executed": executed_partial,
                 "planned_partial_quantity": planned_partial,
                 "planned_remaining_quantity": planned_remaining,
-                "entry_price": round(entry, 4),
+                "entry_price": round(entry, 4) if (entry_verified or pending) and math.isfinite(entry) and entry > 0 else None,
+                "entry_price_source": "ORDER_LIMIT" if pending else "PAPER_SIMULATION" if paper else "RECORDED_BROKER_FILL" if entry_verified else "UNVERIFIED",
+                "valuation_available": valuation_available,
+                "floating_pnl_source": "LOCAL_CANDLE_ESTIMATE",
+                "is_broker_reported": False,
+                "market_bar_at": bar_at,
+                "price_age_sec": round(age, 1) if age is not None else None,
                 "stop_initial": round(stop_initial, 4),
                 "stop_current": round(stop_current, 4),
                 "tp1_price": round(tp1, 4),
@@ -5747,8 +5770,8 @@ class ChocoletraBot:
                 ),
                 "protection_mode": str(pos.get("modo_resto", "")),
                 "realized_pnl": round(float(pos.get("pnl_realizado", 0.0) or 0.0), 2),
-                "floating_pnl": round(floating_pnl, 2),
-                "last_price": round(last_price, 4),
+                "floating_pnl": floating_pnl,
+                "last_price": round(last_price, 4) if math.isfinite(last_price) and last_price > 0 else None,
                 "last_price_at": datetime.fromtimestamp(
                     float(getattr(self, "_last_price_times", {}).get(ticker, 0.0) or 0.0)
                 ).isoformat(timespec="seconds") if float(
@@ -5844,3 +5867,4 @@ class ChocoletraBot:
         for tipo, cantidad in conteo.items():
             log_info(f"  {tipo}: {cantidad}")
         return df_resultado
+

@@ -11,25 +11,33 @@ import math
 
 
 def open_position_pnl_snapshot(positions):
-    if positions is None:
+    if not isinstance(positions, (list, tuple)):
         return {
             "available": False, "source": "SCHWAB_OPEN_POSITIONS",
+            "is_broker_reported": True,
             "positions": [], "known_count": 0, "unknown_count": 0,
             "position_day_pnl": None,
         }
     result = []
     known = 0
+    invalid = 0
     partial_sum = 0.0
     for position in positions:
         if not isinstance(position, dict):
+            invalid += 1
             continue
         symbol = str(position.get("symbol") or "").strip().upper()
         side = str(position.get("tipo") or "").upper()
         if not symbol or side not in {"BUY", "SELL"}:
+            invalid += 1
             continue
         try:
-            quantity = int(position.get("cantidad", 0) or 0)
+            raw_quantity = position.get("broker_quantity", position.get("cantidad"))
+            quantity = float(raw_quantity)
+            if not math.isfinite(quantity):
+                raise ValueError("Invalid broker quantity")
         except (TypeError, ValueError, OverflowError):
+            invalid += 1
             continue
         if quantity <= 0:
             continue
@@ -50,11 +58,13 @@ def open_position_pnl_snapshot(positions):
             "quantity": quantity,
             "broker_position_day_pnl": pnl,
         })
-    unknown = len(result) - known
+    unknown = len(result) - known + invalid
     return {
         "available": True, "source": "SCHWAB_OPEN_POSITIONS",
+        "is_broker_reported": True, "invalid_count": invalid,
         "positions": result,
         "known_count": known, "unknown_count": unknown,
         "position_day_pnl": round(partial_sum, 2) if not unknown else None,
         "partial_known_pnl": round(partial_sum, 2) if known else None,
     }
+

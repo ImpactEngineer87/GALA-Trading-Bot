@@ -1,170 +1,106 @@
-"""Per-ticker dashboard performance aggregation for GALA10 v2.9.8.
-
-The helper is intentionally pure so it can be tested without Flask or broker access.
-It combines:
-- today's persisted signals,
-- today's verified position closes from trade history,
-- the engine's active-position snapshot, and
-- the persistent per-ticker PAPER/REAL registry.
-
-It does not mutate trading state or training data.
-"""
+"""Mode-separated dashboard results. Local strategy P/L is never broker account P/L."""
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Iterable, Mapping, Sequence
+from core.dashboard_evidence import mode_of, number, session_date as row_date
 
 
-def _ticker(value) -> str:
-    return str(value or "").strip().upper()
+def _bucket():
+    return dict(closed_trades=0, wins=0, losses=0, realized_pnl=0.0,
+                unrealized_pnl=0.0, open_positions=0, excluded_closed_trades=0,
+                unknown_open_pnl=0)
 
 
-def _date_text(row: Mapping) -> str:
-    value = str(row.get("date") or row.get("fecha") or "").strip()
-    if value:
-        return value[:10]
-    value = str(row.get("timestamp_iso") or row.get("timestamp_utc") or "").strip()
-    return value[:10] if len(value) >= 10 else ""
-
-
-def _number(value, default=0.0) -> float:
-    try:
-        return float(value or 0.0)
-    except (TypeError, ValueError):
-        return float(default)
-
-
-def _integer(value, default=0) -> int:
-    try:
-        return int(float(value or 0))
-    except (TypeError, ValueError):
-        return int(default)
-
-
-def build_ticker_performance(
-    tickers: Iterable[str],
-    *,
-    signal_rows: Sequence[Mapping] = (),
-    history_rows: Sequence[Mapping] = (),
-    positions: Sequence[Mapping] = (),
-    execution_rows: Sequence[Mapping] = (),
-    session_date: str = "",
-):
-    """Return deterministic per-ticker session metrics.
-
-    ``session_date`` must be ``YYYY-MM-DD`` in New York time.  History PnL is
-    counted only from POSITION_CLOSE rows, so historical ENTRY rows cannot inflate
-    either trade counts or PnL.
-    """
-    session_date = str(session_date or "")[:10]
-    ordered = []
-    seen = set()
-    for value in tickers or []:
-        t = _ticker(value)
-        if t and t not in seen:
-            seen.add(t)
-            ordered.append(t)
-
-    mode_by_ticker = {}
-    shares_by_ticker = {}
-    for row in execution_rows or []:
-        t = _ticker(row.get("ticker"))
+def build_ticker_performance(tickers, *, signal_rows=(), history_rows=(),
+                             positions=(), execution_rows=(), session_date=""):
+    modes, shares = {}, {}
+    ordered = list(dict.fromkeys(str(t).strip().upper() for t in tickers if str(t).strip()))
+    signals = defaultdict(lambda: dict(signals=0, buy_signals=0, sell_signals=0,
+                                      approved_signals=0, vetoed_signals=0))
+    stats = defaultdict(_bucket)
+    for row in execution_rows:
+        t = str(row.get("ticker") or "").strip().upper()
         if not t:
             continue
-        mode_by_ticker[t] = str(
-            row.get("effective_mode") or row.get("mode") or "PAPER"
-        ).upper()
-        shares_by_ticker[t] = _integer(row.get("shares"), 1)
-
-    stats = defaultdict(lambda: {
-        "signals": 0,
-        "buy_signals": 0,
-        "sell_signals": 0,
-        "vetoed_signals": 0,
-        "approved_signals": 0,
-        "closed_trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "realized_pnl": 0.0,
-        "unrealized_pnl": 0.0,
-        "open_positions": 0,
-    })
-
-    for row in signal_rows or []:
-        if session_date and _date_text(row) != session_date:
+        modes[t] = str(row.get("effective_mode") or row.get("mode") or "UNKNOWN").upper()
+        shares[t] = row.get("shares", 1)
+    for row in signal_rows:
+        if session_date and row_date(row) != session_date:
             continue
-        t = _ticker(row.get("ticker"))
+        t = str(row.get("ticker") or "").strip().upper()
         if not t:
             continue
+        s = signals[t]
+        s["signals"] += 1
         kind = str(row.get("tipo") or "").upper()
+        if kind in {"BUY", "SELL"}:
+            s[kind.lower() + "_signals"] += 1
         decision = str(row.get("ai_decision") or "").upper()
-        stats[t]["signals"] += 1
-        if kind == "BUY":
-            stats[t]["buy_signals"] += 1
-        elif kind == "SELL":
-            stats[t]["sell_signals"] += 1
-        if "VETO" in decision:
-            stats[t]["vetoed_signals"] += 1
-        if decision == "APPROVED":
-            stats[t]["approved_signals"] += 1
-
-    for row in history_rows or []:
-        if session_date and _date_text(row) != session_date:
+        s["approved_signals"] += int(decision == "APPROVED")
+        s["vetoed_signals"] += int("VETO" in decision)
+    for row in history_rows:
+        if str(row.get("evento") or "").upper() != "POSITION_CLOSE":
             continue
-        if str(row.get("evento") or "POSITION_CLOSE").upper() != "POSITION_CLOSE":
+        if session_date and row_date(row) != session_date:
             continue
-        t = _ticker(row.get("ticker"))
+        t, mode = str(row.get("ticker") or "").strip().upper(), mode_of(row)
         if not t:
             continue
-        pnl = _number(row.get("pnl_usd"))
-        stats[t]["closed_trades"] += 1
-        stats[t]["realized_pnl"] += pnl
-        if pnl > 0:
-            stats[t]["wins"] += 1
-        elif pnl < 0:
-            stats[t]["losses"] += 1
-
-    for row in positions or []:
-        t = _ticker(row.get("ticker"))
+        s = stats[t, mode]
+        pnl = number(row.get("pnl_usd"))
+        valid = row.get("performance_verified", mode == "PAPER") is True
+        if not valid or pnl is None:
+            s["excluded_closed_trades"] += 1
+            continue
+        s["closed_trades"] += 1
+        s["realized_pnl"] += pnl
+        s["wins"] += int(pnl > 0)
+        s["losses"] += int(pnl < 0)
+    for row in positions:
+        # A submitted order is not a filled/open position.
+        if str(row.get("status") or "").upper() not in {"OPEN", "PARTIAL"}:
+            continue
+        t, mode = str(row.get("ticker") or "").strip().upper(), mode_of(row)
         if not t:
             continue
-        status = str(row.get("status") or "OPEN").upper()
-        if status not in ("OPEN", "PARTIAL", "PENDING"):
-            continue
-        stats[t]["open_positions"] += 1
-        stats[t]["unrealized_pnl"] += _number(
-            row.get("floating_pnl", row.get("unrealized_pnl", 0.0))
-        )
-
-    # Include tickers that appear in live state/history even if they are not in
-    # the configured ordering. This avoids hiding an adopted/reconciled broker
-    # position from the summary.
-    discovered = set(stats) | set(mode_by_ticker)
-    for t in sorted(discovered):
-        if t not in seen:
-            seen.add(t)
-            ordered.append(t)
-
+        s = stats[t, mode]
+        s["open_positions"] += 1
+        pnl = number(row.get("floating_pnl"))
+        if pnl is None or row.get("valuation_available") is False:
+            s["unknown_open_pnl"] += 1
+        else:
+            s["unrealized_pnl"] += pnl
+    discovered = set(signals) | set(modes) | {t for t, _ in stats}
+    ordered += sorted(discovered - set(ordered))
     result = []
     for t in ordered:
-        row = stats[t]
-        realized = round(row["realized_pnl"], 2)
-        unrealized = round(row["unrealized_pnl"], 2)
-        result.append({
-            "ticker": t,
-            "mode": mode_by_ticker.get(t, "PAPER"),
-            "configured_shares": shares_by_ticker.get(t, 1),
-            "signals": int(row["signals"]),
-            "buy_signals": int(row["buy_signals"]),
-            "sell_signals": int(row["sell_signals"]),
-            "approved_signals": int(row["approved_signals"]),
-            "vetoed_signals": int(row["vetoed_signals"]),
-            "closed_trades": int(row["closed_trades"]),
-            "wins": int(row["wins"]),
-            "losses": int(row["losses"]),
-            "open_positions": int(row["open_positions"]),
-            "realized_pnl": realized,
-            "unrealized_pnl": unrealized,
-            "total_pnl": round(realized + unrealized, 2),
-        })
+        breakdown = {}
+        for mode in ("PAPER", "REAL", "UNKNOWN"):
+            s = dict(stats[t, mode])
+            s["known_realized_pnl"] = round(s["realized_pnl"], 2)
+            s["known_unrealized_pnl"] = round(s["unrealized_pnl"], 2)
+            s["realized_pnl"] = None if s["excluded_closed_trades"] else s["known_realized_pnl"]
+            s["unrealized_pnl"] = None if s["unknown_open_pnl"] else s["known_unrealized_pnl"]
+            s["total_pnl"] = (
+                round(s["realized_pnl"] + s["unrealized_pnl"], 2)
+                if s["realized_pnl"] is not None and s["unrealized_pnl"] is not None else None
+            )
+            s["pnl_source"] = (
+                "PAPER_SIMULATION" if mode == "PAPER" else
+                "LOCAL_RECORDED_FILLS_GROSS" if mode == "REAL" else "UNVERIFIED"
+            )
+            if mode == "REAL" and not s["closed_trades"] and not s["open_positions"]:
+                s["realized_pnl"] = None
+                s["unrealized_pnl"] = None
+                s["total_pnl"] = None
+            s["is_broker_reported"] = False
+            breakdown[mode] = s
+        mode = modes.get(t, "UNKNOWN")
+        if mode not in breakdown:
+            mode = "UNKNOWN"
+        result.append(dict(
+            ticker=t, mode=mode, configured_shares=shares.get(t, 1),
+            **signals[t], **breakdown[mode], mode_breakdown=breakdown,
+        ))
     return result
+

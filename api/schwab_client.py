@@ -487,11 +487,11 @@ class SchwabClient:
                       cantidad: int = 200) -> Optional[pd.DataFrame]:
         """
         Obtiene velas historicas reales desde Schwab.
-        Requiere OAuth de usuario. En demo retorna datos sinteticos si no hay
-        autorizacion; nunca envia una solicitud con token vacio.
+        Requiere OAuth de usuario. Sin datos devuelve None; no genera precios.
+        La simulación exige invocar explícitamente obtener_velas_demo.
         """
         if not self._asegurar_token():
-            return self._velas_fallback(ticker, cantidad)
+            return None
 
         freq_map = {"1m": 1, "5m": 5, "15m": 15, "30m": 30}
         frequency = freq_map.get(intervalo, 1)
@@ -509,17 +509,17 @@ class SchwabClient:
             url = f"{BASE_URL}/pricehistory"
             r = self._get_autorizado(url, params=params, timeout=15)
             if r is None:
-                return self._velas_fallback(ticker, cantidad)
+                return None
 
             r.raise_for_status()
             datos = r.json()
 
             if "candles" not in datos or not datos["candles"]:
                 _log(f"[WARN] Sin velas para {ticker} - mercado cerrado o sin datos")
-                return self._velas_fallback(ticker, cantidad)
+                return None
 
             df = pd.DataFrame(datos["candles"])
-            df["datetime"] = pd.to_datetime(df["datetime"], unit="ms")
+            df["datetime"] = pd.to_datetime(df["datetime"], unit="ms", utc=True)
             df.set_index("datetime", inplace=True)
             df = df[["open", "high", "low", "close", "volume"]].astype(float)
             df.sort_index(inplace=True)
@@ -528,12 +528,12 @@ class SchwabClient:
 
         except Exception as e:
             _log(f"[ERROR] Error obteniendo velas para {ticker}: {e}")
-            return self._velas_fallback(ticker, cantidad)
+            return None
 
     def _velas_fallback(self, ticker: str, cantidad: int = 200) -> pd.DataFrame:
         """
-        Fallback: velas sinteticas realistas cuando el mercado esta cerrado
-        o cuando no hay conexion. Se usa solo como ultimo recurso.
+        Generador exclusivo para una petición explícita de demo.
+        Nunca se usa como reemplazo automático de datos de Schwab.
         """
         import numpy as np
         _log(f"[WARN] [{ticker}] Usando datos sinteticos (mercado cerrado o sin conexion)")
@@ -548,13 +548,15 @@ class SchwabClient:
         cambios = pasos * (abs(np.random.randn(cantidad)) * 0.003 + 0.001) * base
         precios = np.maximum(base + np.cumsum(cambios), base * 0.8)
         ruido   = abs(np.random.randn(cantidad)) * base * 0.001
-        return pd.DataFrame({
+        frame = pd.DataFrame({
             "open":   precios - ruido * 0.5,
             "high":   precios + ruido * 1.5,
             "low":    precios - ruido * 1.5,
             "close":  precios,
             "volume": np.random.randint(80000, 600000, cantidad).astype(float),
         }, index=fechas)
+        frame.attrs.update(source="EXPLICIT_DEMO_SYNTHETIC", synthetic=True)
+        return frame
 
     # ----------------------------------------------------------
     # COTIZACION EN TIEMPO REAL
@@ -677,7 +679,7 @@ class SchwabClient:
             if "candles" not in datos or not datos["candles"]:
                 return None
             df = pd.DataFrame(datos["candles"])
-            df["datetime"] = pd.to_datetime(df["datetime"], unit="ms")
+            df["datetime"] = pd.to_datetime(df["datetime"], unit="ms", utc=True)
             df.set_index("datetime", inplace=True)
             df = df[["open", "high", "low", "close", "volume"]].astype(float)
             df.sort_index(inplace=True)
@@ -812,11 +814,9 @@ class SchwabClient:
         cfg = config or {}
         dias_dia = cfg.get("ai", {}).get("dias_historia_schwab", 365)
 
-        # Evita seis solicitudes 401 por ticker cuando el OAuth no esta conectado.
-        # El objeto queda marcado como sintetico y el motor bloquea su uso en real.
+        # No automatic synthetic data, including PAPER: broker outages stay unavailable.
         if not self._asegurar_token():
-            _log(f"[WARN] {ticker}: Schwab sin OAuth — usando fallback sintetico (demo)")
-            return self._multitemporal_fallback(ticker)
+            raise SchwabAuthorizationRequired("Schwab sin OAuth; no hay datos de mercado verificables")
 
         velas = {}
         # Semanal y diario (nativos, 1 año+)
@@ -836,13 +836,9 @@ class SchwabClient:
         # Filtrar temporalidades sin datos
         velas = {k: v for k, v in velas.items() if v is not None and len(v) > 0}
 
-        # Fallback demo: si el mercado esta cerrado / sin token y faltan
-        # temporalidades clave, generar datos sinteticos coherentes para
-        # poder demostrar el pipeline (NUNCA se usan para operar en real:
-        # el modo real exige token valido y datos reales).
+        # Incomplete broker data must not manufacture replacement candles.
         if len(velas) < 3:
-            _log(f"[WARN] {ticker}: datos multi-temporal insuficientes — usando fallback sintetico (demo)")
-            return self._multitemporal_fallback(ticker)
+            raise RuntimeError(f"{ticker}: datos multi-temporal insuficientes; sin precios de sustitución")
 
         return DatosMultiTemporal(ticker=ticker, velas=velas)
 
@@ -970,6 +966,7 @@ class SchwabClient:
                     "symbol": inst.get("symbol", ""),
                     "tipo": "BUY" if longq > 0 else "SELL",
                     "cantidad": int(longq if longq > 0 else shortq),
+                    "broker_quantity": longq if longq > 0 else shortq,
                     "precio": float(p.get("averagePrice", 0) or 0),
                     "broker_position_day_pnl": day_pnl,
                 })
@@ -1038,3 +1035,4 @@ class SchwabClient:
         """Alias para compatibilidad -- ahora intenta datos reales primero."""
         result = self.obtener_velas(ticker, cantidad=cantidad)
         return result if result is not None else self._velas_fallback(ticker, cantidad)
+
