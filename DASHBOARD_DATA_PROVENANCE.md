@@ -80,3 +80,29 @@ After the dashboard starts, keep the trading engine off and scheduler manual.
 Verify mode-separated ticker results, the ranking source selector, excluded
 record reasons, and the manual Schwab P/L lookup. Compare exact broker fills
 before relying on REAL results. This patch is not approval to start REAL trading.
+
+## Fresh historical execution-price audit
+
+Use `python scripts/audit_schwab_execution_prices.py --date 2026-10-22`
+with the engine OFF to compare REAL ledger rows with fresh Schwab order reads.
+The audit uses the exact configured account, reads the order list (including
+nested child orders), and falls back to individual GETs for recorded IDs not
+found in that bounded list. It reports list truncation and unavailable reads;
+neither proves the absence of an execution. No trading executor is initialized.
+OAuth may refresh/persist authentication tokens through the existing client.
+
+Each price requires a single matching equity leg, exact order ID, symbol and
+instruction, finite positive execution prices/quantities, and complete quantity
+coverage in a terminal order. The LIMIT price and a local FILLED/flat flag are
+never substitutes. Missing exit IDs remain unresolved; the audit does not guess
+an exit from ticker, time or price. A partial/multiple-order exit cannot produce
+a whole-trade P/L from only the final order. When full quantities match, gross
+P/L is calculated separately from the stored ledger value; it remains a local
+calculation, not Schwab/TOS account P/L or net of every fee.
+
+The command does not modify history, counters, feedback, models or promotion
+state. Its results do not make historical observations eligible for AI training.
+It is a diagnostic, not an accounting repair: the current engine can still
+record a requested exit price when broker-flat recovery lacks execution-price
+evidence. The dashboard excludes those rows, but the underlying accounting and
+daily-loss treatment must be resolved before enabling REAL trading.
