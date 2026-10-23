@@ -45,6 +45,30 @@ class SchwabExecutionPriceAuditTests(unittest.TestCase):
         self.assertFalse(evidence["verified"])
         self.assertIsNone(evidence["average_price"])
 
+    def test_actual_broker_order_type_and_closing_instruction_are_reported(self):
+        for broker_type in ("MARKET", "LIMIT", "STOP", "STOP_LIMIT"):
+            with self.subTest(order_type=broker_type):
+                orders = {"entry": {**order("entry", "SELL_SHORT"), "orderType": "LIMIT"},
+                          "exit": {**order("exit", "BUY_TO_COVER"), "orderType": broker_type}}
+                result = compare_row(row(position_side="SHORT", lado="SELL", orderType="LIMIT"),
+                                     lambda oid: (orders[oid], ""))
+                self.assertTrue(result["full_quantity_pair_verified"])
+                self.assertEqual(result["broker_final_close"]["order_type"], broker_type)
+                self.assertEqual(result["broker_final_close"]["instruction"], "BUY_TO_COVER")
+
+    def test_missing_or_invalid_type_is_not_inferred_from_limit_price(self):
+        for value in (None, "", "UNKNOWN", "PRIVATE-UNTRUSTED", {"bad": "value"}, []):
+            with self.subTest(order_type=value):
+                evidence = fill_evidence({**order(), "orderType": value}, "entry", "META", "BUY")
+                self.assertTrue(evidence["verified"])
+                self.assertIsNone(evidence["order_type"])
+
+    def test_wrong_order_identity_cannot_supply_type_or_instruction(self):
+        evidence = fill_evidence({**order(), "orderType": "MARKET"}, "other-id", "META", "BUY")
+        self.assertFalse(evidence["verified"])
+        self.assertIsNone(evidence["order_type"])
+        self.assertIsNone(evidence["instruction"])
+
     def test_partial_price_coverage_cannot_price_the_whole_filled_quantity(self):
         evidence = fill_evidence(order(prices=((2, 100),)), "entry", "META", "BUY")
         self.assertFalse(evidence["verified"])
@@ -131,12 +155,14 @@ class SchwabExecutionPriceAuditTests(unittest.TestCase):
                 writer = csv.DictWriter(handle, fieldnames=list(row()))
                 writer.writeheader()
                 writer.writerow(row())
-            (root / "config.yaml").write_text(json.dumps({"logging": {"historial_operaciones": str(history)}}))
+            (root / "config.yaml").write_text(json.dumps({"logging": {"historial_operaciones": str(history)},
+                "execution_engine": {"enabled": True, "market_fallback": False, "limit_wait_sec": 3}}))
             before = {p.name: p.read_bytes() for p in root.iterdir()}
             client = Mock(spec=["obtener_account_hash", "_get_autorizado"])
             client.obtener_account_hash.return_value = "PRIVATE-HASH"
             response = Mock(status_code=200)
-            response.json.return_value = [order(), order("exit", "SELL", ((5, 110),))]
+            response.json.return_value = [{**order(), "orderType": "LIMIT"},
+                                         {**order("exit", "SELL", ((5, 110),)), "orderType": "MARKET"}]
             client._get_autorizado.return_value = response
             output = io.StringIO()
             with patch("scripts.audit_schwab_execution_prices.ROOT", root), \
@@ -145,6 +171,10 @@ class SchwabExecutionPriceAuditTests(unittest.TestCase):
                 self.assertEqual(main(["--date", "2026-10-22"]), 0)
             report = json.loads(output.getvalue())
             self.assertEqual(report["counts"]["full_quantity_pairs_verified"], 1)
+            self.assertEqual(report["trades"][0]["broker_final_close"]["order_type"], "MARKET")
+            self.assertTrue(report["current_exit_settings"]["v2_enabled"])
+            self.assertFalse(report["current_exit_settings"]["market_fallback"])
+            self.assertEqual(report["current_exit_settings"]["limit_wait_sec"], 3)
             self.assertFalse(report["history_models_training_modified"])
             self.assertEqual(client._get_autorizado.call_count, 1)
             client.obtener_account_hash.assert_called_once_with("PRIVATE-ACCOUNT")

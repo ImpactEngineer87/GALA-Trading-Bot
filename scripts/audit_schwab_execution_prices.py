@@ -29,7 +29,8 @@ from core.project_paths import resolve_runtime_path
 
 def fill_evidence(order, order_id, ticker, instruction):
     """Verify one equity order's complete execution-price coverage, not its limit."""
-    result = {"verified": False, "status": None, "quantity": None,
+    result = {"verified": False, "status": None, "order_type": None,
+              "instruction": None, "quantity": None,
               "average_price": None, "reason": "Order data unavailable"}
 
     def reject(reason):
@@ -52,6 +53,13 @@ def fill_evidence(order, order_id, ticker, instruction):
             or str(instrument.get("symbol") or "").upper() != ticker.upper()
             or leg.get("instruction") != instruction):
         return reject("Symbol, asset type or instruction mismatch")
+    # Read the exact broker order's fields, never a local LIMIT/price assumption.
+    # A filled protective STOP stays STOP; do not relabel it MARKET or LIMIT.
+    broker_type = order.get("orderType")
+    if isinstance(broker_type, str) and broker_type in {"MARKET", "LIMIT", "STOP", "STOP_LIMIT", "TRAILING_STOP",
+                       "TRAILING_STOP_LIMIT", "MARKET_ON_CLOSE", "LIMIT_ON_CLOSE"}:
+        result["order_type"] = broker_type
+    result["instruction"] = leg["instruction"]
     ordered = number(order.get("quantity"))
     if ordered is None or ordered <= 0:
         return reject("Ordered quantity unavailable")
@@ -139,7 +147,8 @@ def compare_row(row, lookup):
     for key, action in zip(("parent_order_id", "order_id"), instructions):
         oid = str(row.get(key) or "").strip()
         if not oid:
-            item = {"verified": False, "reason": "Missing local order ID; no inferred match"}
+            item = {"verified": False, "order_type": None, "instruction": None,
+                    "reason": "Missing local order ID; no inferred match"}
         else:
             order, error = lookup(oid)
             item = fill_evidence(order, oid, ticker, action)
@@ -172,6 +181,15 @@ def main(argv=None):
     parser.add_argument("--date", required=True, type=date.fromisoformat, help="New York session YYYY-MM-DD")
     args = parser.parse_args(argv)
     cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8")) or {}
+    execution = cfg.get("execution_engine") or {}
+    current_exit_settings = {
+        "v2_enabled": bool(execution.get("enabled", False)),
+        "market_fallback": bool(execution.get("market_fallback", True)),
+        "limit_wait_sec": number(execution.get("limit_wait_sec", 1.5)),
+        "max_quote_age_sec": number(execution.get("max_quote_age_sec", 5)),
+        "exit_buffer_bps": number(execution.get("exit_buffer_bps", 5)),
+        "scope": "Current configuration; not proof of policy at historical submission",
+    }
     history = Path(resolve_runtime_path((cfg.get("logging") or {}).get(
         "historial_operaciones", "data/historial_operaciones.csv")))
     with history.open(encoding="utf-8-sig", newline="") as handle:
@@ -239,6 +257,7 @@ def main(argv=None):
         "broker_operations": "GET_ONLY", "history_models_training_modified": False,
         "as_of_utc": datetime.now(timezone.utc).isoformat(), "session_ny": args.date.isoformat(),
         "is_broker_reported_account_pnl": False,
+        "current_exit_settings": current_exit_settings,
         "order_list_available": valid_list, "order_list_error": list_error,
         "order_list_may_be_truncated": bool(valid_list and len(orders) >= 500),
         "counts": dict(counts), "trades": results,
