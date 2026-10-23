@@ -67,12 +67,47 @@ class SmartExit:
                 'posicion_plana': False, 'mensaje': reason,
                 'cantidad': state.get('quantity', 0), 'broker_side': state.get('side', '')}
 
+    def _defer_limit(self, key, state, account, reason):
+        """Only terminal orders + fresh exposure permit a replacement STOP.
+
+        A timed-out DELETE or an unreadable order never grants this permission.
+        The durable legs remain available for a later LIMIT or emergency close.
+        """
+        result = self._pending_result(state, reason)
+        if any(not x.get('order_id') or x.get('status') not in TERMINAL
+               for x in state.get('legs', [])):
+            return result
+        working = self._working_orders_for_ticker(account, state['ticker'])
+        snap, side, remaining = self._snapshot_exposure(account, state['ticker'])
+        filled = sum(float(x.get('filled', 0)) for x in state.get('legs', []))
+        if (working != [] or snap is None or side != state['side']
+                or remaining <= 0 or not math.isfinite(filled) or filled < 0
+                or any(float(x.get('filled', 0)) < 0 for x in state.get('legs', []))
+                or filled + remaining != state['quantity']):
+            return result
+        partial = self._verified_fill_legs({**state, 'quantity': filled}) if filled else None
+        state['deferred'] = True
+        self.pending.put(key, state)
+        result.update(status='LIMIT_DEFERRED', safe_to_reprotect=True,
+                      remaining_quantity=remaining, filled_quantity=filled,
+                      partial_avg_price=partial[0] if partial else None,
+                      partial_price_verified=bool(partial) if filled else True,
+                      execution_details=dict(state))
+        self.executor._audit('EXIT_LIMIT_DEFERRED', ticker=state['ticker'],
+            lado=state['side'], cantidad=remaining, estado='LIMIT_DEFERRED',
+            motivo=reason, detalle={'execution_id': state['execution_id'],
+                'normal_exit_policy': 'LIMIT_ONLY', 'filled_quantity': filled,
+                'order_ids': [x['order_id'] for x in state.get('legs', [])]})
+        return result
+
     def _refresh(self, account, leg):
         if not leg.get('order_id'):
             return False
         d = self.executor.detalle_orden(account, leg['order_id'])
         leg.update(status=str(d.get('status', '')).upper(), filled=float(d.get('filled', 0) or 0),
                    avg_price=float(d.get('avg_price', 0) or 0))
+        if d.get('fill_price_verified') is False:
+            leg['avg_price'] = 0
         return leg['status'] in TERMINAL
 
     def _snapshot_exposure(self, account, ticker):
@@ -393,6 +428,18 @@ class SmartExit:
             )
             self.pending.put(key, state)
 
+        if (not emergency and position_id and state.get('position_id')
+                and str(position_id) != str(state['position_id'])):
+            snap, broker_side, broker_qty = self._snapshot_exposure(account, ticker)
+            if (snap is not None and broker_qty == 0
+                    and self._working_orders_for_ticker(account, ticker) == []):
+                return self._recover_flat(key, state,
+                    'Flat broker; stale exit belongs to another local position',
+                    account=account, requested_side=side, requested_quantity=quantity,
+                    requested_position_id=position_id)
+            return self._pending_result(state,
+                'Pending exit belongs to another position; no ordinary replacement submitted')
+
         # Resume accepted orders on retries/restarts.  v3.3.2 recovery rule:
         # an old journal row may block a replacement only while its broker order
         # is actually WORKING (or broker state cannot be read).  If it is no longer
@@ -412,9 +459,12 @@ class SmartExit:
                 )
                 hinted = str((cancel_result or {}).get('broker_status', '') or '').upper()
                 if hinted in TERMINAL:
-                    leg['status'] = hinted
-                    leg['filled'] = float((cancel_result or {}).get('filled', 0) or 0)
-                    terminal = True
+                    terminal = self._refresh(account, leg)
+                    if not terminal:
+                        leg['status'] = hinted
+                        leg['filled'] = float((cancel_result or {}).get('filled', 0) or 0)
+                        leg['avg_price'] = 0
+                        terminal = True
                 else:
                     terminal = self._refresh(account, leg)
                 self.pending.put(key, state)
@@ -491,7 +541,9 @@ class SmartExit:
                     position_id=position_id,
                 )
 
-        # At most one LIMIT attempt and one MARKET remainder per operation.
+        # One ordinary LIMIT per invocation, including retries. A fresh quote
+        # is required each time. Legacy market_fallback never changes this rule.
+        submitted_this_call = False
         while True:
             snap = self.executor._position_snapshot(account, ticker)
             if snap is None:
@@ -558,6 +610,14 @@ class SmartExit:
                     continue
                 return self._pending_result(state, 'Position and confirmed fills disagree; reconcile before retry')
             if actual == 0:
+                if (position_id and state.get('position_id')
+                        and str(position_id) != str(state['position_id'])):
+                    if self._working_orders_for_ticker(account, ticker) != []:
+                        return self._pending_result(state, 'Flat position but WORKING orders not cleared')
+                    return self._recover_flat(key, state,
+                        'Emergency flat; prior fills belong to another local position',
+                        account=account, requested_side=side, requested_quantity=quantity,
+                        requested_position_id=position_id)
                 if self._verified_fill_legs(state) is not None:
                     return self._complete(key, state)
                 # Some terminal broker orders expose FILLED and quantity but
@@ -581,17 +641,34 @@ class SmartExit:
                     account=account, requested_side=side,
                     requested_quantity=quantity, requested_position_id=position_id,
                 )
-            if len(state['legs']) >= (2 if state['limit'] is not None else 1):
-                return self._pending_result(state, 'Exit ended with residual exposure; operator reconciliation required')
-            is_limit = not state['legs'] and state['limit'] is not None
-            if state['legs'] and not self.config.get('market_fallback', True):
-                return self._pending_result(state, 'Limit canceled; market fallback disabled')
+            if not emergency:
+                if submitted_this_call:
+                    return self._defer_limit(key, state, account,
+                        'LIMIT terminal with residual exposure; no MARKET fallback')
+                if self._working_orders_for_ticker(account, ticker) != []:
+                    return self._pending_result(state,
+                        'Ordinary exit requires a verified empty WORKING-order snapshot')
+                quote = self._quote(ticker)
+                if not quote:
+                    return self._defer_limit(key, state, account,
+                        'Fresh bid/ask unavailable; ordinary MARKET exit prohibited')
+                state['quote'] = quote
+                state['limit'] = marketable_price(state['side'], quote['bid'], quote['ask'],
+                                                 self.config.get('exit_buffer_bps', 5))
+                state['route_reason'] = 'NORMAL_LIMIT_ONLY'
+            elif submitted_this_call:
+                return self._pending_result(state,
+                    'Emergency exit ended with residual exposure; reconcile before retry')
+            else:
+                state['route_reason'] = 'EMERGENCY'
+            is_limit = not emergency
             leg = {'order_id': '', 'type': 'LIMIT' if is_limit else 'MARKET',
                    'quantity': actual, 'limit_price': state['limit'] if is_limit else None,
                    'filled': 0, 'avg_price': 0, 'status': 'SUBMITTING'}
             state['legs'].append(leg)
             # Durable intent BEFORE POST. Timeout or missing Location is ambiguous.
             self.pending.put(key, state)
+            submitted_this_call = True
             body = {'session': 'NORMAL', 'duration': 'DAY', 'orderStrategyType': 'SINGLE',
                     'orderType': leg['type'], 'orderLegCollection': [{
                         'orderLegType': 'EQUITY', 'legId': 1, 'positionEffect': 'CLOSING',
@@ -612,21 +689,28 @@ class SmartExit:
                     motivo=reason, estado='SUBMITTED', detalle={'tipo_orden': leg['type'],
                     'signal_price': state['reference_price'], 'limit_price': leg['limit_price'],
                     'bid': state['quote'].get('bid'), 'ask': state['quote'].get('ask'),
-                    'recovered_stale_exit': bool(state.get('recovery_from'))})
+                    'recovered_stale_exit': bool(state.get('recovery_from')),
+                    'route_reason': state['route_reason'],
+                    'normal_exit_policy': 'LIMIT_ONLY'})
             except Exception as exc:
                 return self._pending_result(state, f'Exit submission uncertain: {type(exc).__name__}')
             if not leg['order_id']:
                 return self._pending_result(state, 'Accepted exit has no order ID; manual reconciliation required')
             self.executor.esperar_estado_orden(account, leg['order_id'], deseados={'FILLED'},
-                fallos=TERMINAL - {'FILLED'}, timeout_s=float(self.config.get('limit_wait_sec', 1.5)) if is_limit else self.executor.fill_timeout_s)
+                fallos=TERMINAL - {'FILLED'}, timeout_s=float(self.config.get('normal_limit_wait_sec', 10)) if is_limit else self.executor.fill_timeout_s)
             terminal = self._refresh(account, leg)
             if not terminal and is_limit:
                 cancel_result = self.executor.cancelar_orden_confirmada(account, leg['order_id'], ticker=ticker)
                 hinted = str((cancel_result or {}).get('broker_status', '') or '').upper()
                 if hinted in TERMINAL:
-                    leg['status'] = hinted
-                    leg['filled'] = float((cancel_result or {}).get('filled', 0) or 0)
-                    terminal = True
+                    # Re-read actual execution prices after cancellation. A
+                    # cancellation acknowledgement alone supplies no fill price.
+                    terminal = self._refresh(account, leg)
+                    if not terminal:
+                        leg['status'] = hinted
+                        leg['filled'] = float((cancel_result or {}).get('filled', 0) or 0)
+                        leg['avg_price'] = 0
+                        terminal = True
                 else:
                     terminal = self._refresh(account, leg)
             self.pending.put(key, state)
@@ -666,3 +750,4 @@ class SmartExit:
                 'avg_price': avg, 'broker_status': 'FILLED', 'posicion_plana': True,
                 'broker_side': state['side'], 'fill_price_verified': True,
                 'execution_details': event}
+

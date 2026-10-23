@@ -474,8 +474,6 @@ class EjecutorHibridoDeOrdenes:
         No broker request that can mutate the account is sent here.  The caller
         is responsible for proving there is no position and no WORKING order.
         """
-        if not self.execution_v2_config.get('enabled', False):
-            return False
         from core.execution_v2 import SmartExit
         with self.secuencia_simbolo(str(ticker).upper()):
             if self._smart_exit is None:
@@ -485,8 +483,6 @@ class EjecutorHibridoDeOrdenes:
             )
 
     def has_pending_exit(self, account, ticker):
-        if not self.execution_v2_config.get('enabled', False):
-            return False
         import hashlib
         from core.runtime_store import JsonState
         key = hashlib.sha256(str(account).encode()).hexdigest()[:16] + ':' + ticker
@@ -1577,11 +1573,23 @@ class EjecutorHibridoDeOrdenes:
     # LIQUIDACIÓN (REVERSIÓN + KILL SWITCH)
     # =========================================================
 
+    def preparar_cierre(self, ticker: str, motivo: str = "") -> dict:
+        """Read-only preflight BEFORE the engine cancels protective orders."""
+        from core.execution_v2 import SmartExit
+        if self.paper_trading or SmartExit._is_emergency(motivo):
+            return {'ready': True}
+        if self._smart_exit is None:
+            self._smart_exit = SmartExit(self, self.execution_v2_config)
+        return {'ready': bool(self._smart_exit._quote(ticker)),
+                'policy': 'LIMIT_ONLY',
+                'reason': 'Se requiere bid/ask reciente para cierre LIMIT; protecciones conservadas'}
+
     def liquidar_posicion(self, ticker: str, tipo_entrada: str, cantidad: int,
                           account_number: str, motivo: str = "") -> dict:
-        if self.paper_trading or not self.execution_v2_config.get('enabled', False):
-            return self._liquidar_market_legacy(ticker, tipo_entrada, cantidad, account_number, motivo)
         from core.execution_v2 import SmartExit
+        if self.paper_trading or (not self.execution_v2_config.get('enabled', False)
+                                 and SmartExit._is_emergency(motivo)):
+            return self._liquidar_market_legacy(ticker, tipo_entrada, cantidad, account_number, motivo)
         with self.secuencia_simbolo(ticker):
             if self._smart_exit is None:
                 self._smart_exit = SmartExit(self, self.execution_v2_config)

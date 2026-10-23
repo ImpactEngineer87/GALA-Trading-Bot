@@ -183,12 +183,16 @@ def main(argv=None):
     cfg = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8")) or {}
     execution = cfg.get("execution_engine") or {}
     current_exit_settings = {
+        "normal_exit_policy_in_this_revision": "LIMIT_ONLY",
+        "normal_limit_wait_sec": number(execution.get("normal_limit_wait_sec", 10)),
+        "normal_market_fallback_in_this_revision": False,
+        "emergency_market_exit_available": True,
         "v2_enabled": bool(execution.get("enabled", False)),
         "market_fallback": bool(execution.get("market_fallback", True)),
         "limit_wait_sec": number(execution.get("limit_wait_sec", 1.5)),
         "max_quote_age_sec": number(execution.get("max_quote_age_sec", 5)),
         "exit_buffer_bps": number(execution.get("exit_buffer_bps", 5)),
-        "scope": "Current configuration; not proof of policy at historical submission",
+        "scope": "Configuration snapshot and audit-revision policy; not proof of running or historical submission policy",
     }
     history = Path(resolve_runtime_path((cfg.get("logging") or {}).get(
         "historial_operaciones", "data/historial_operaciones.csv")))

@@ -62,6 +62,47 @@ class RealAccountingGuard:
         except Exception:
             self._failure = "Current-session REAL accounting could not be checked"
 
+    def complete_exit_progress(self, key, *, position_id, execution):
+        """Resolve only our own partial-exit intent, with complete exact fills.
+
+        This is deliberately NOT an operator reset. Historical/quarantined
+        accounting records, different positions, or incomplete legs stay blocked.
+        The engine calls this only after recording the final verified P/L.
+        """
+        from core.execution_v2 import SmartExit
+        with self._lock:
+            try:
+                rows = self.store.get('unresolved') or {}
+                row = rows.get(str(key))
+                if row is None:
+                    return False
+                if (row.get('kind') != 'NORMAL_EXIT_PROGRESS'
+                        or not position_id or row.get('position_id') != position_id
+                        or execution.get('position_id') != position_id
+                        or not row.get('exit_execution_id')
+                        or str(key) != 'pending_exit:' + str(row.get('exit_execution_id'))
+                        or row.get('exit_execution_id') != execution.get('execution_id')
+                        or row.get('quantity') != execution.get('quantity')
+                        or SmartExit._verified_fill_legs(execution) is None):
+                    return False
+                final = {leg['order_id']: leg for leg in execution['legs']}
+                for old in row.get('legs', []):
+                    leg = final.get(old.get('order_id'))
+                    if (leg is None or leg.get('filled') != old.get('filled')
+                            or leg.get('avg_price') != old.get('avg_price')):
+                        return False
+                # Preserve the proof before removing this single transient key.
+                resolved = self.store.get('resolved_exit_progress') or {}
+                resolved[str(key)] = {**row, 'completed_utc': utc_now(),
+                                     'complete_execution': execution}
+                self.store.put('resolved_exit_progress', resolved)
+                del rows[str(key)]
+                self.store.put('unresolved', rows)
+                return True
+            except Exception:
+                self._failure = 'Partial-exit reconciliation could not be persisted'
+                return False
+
     def snapshot(self):
         with self._lock:
             try:
