@@ -48,6 +48,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
 
 from core.daily_loss_guard import DailyLossGuard
+from core.auto_ai import AutoAIService, policy as auto_ai_policy, update_enabled as update_auto_ai_enabled, training_busy
+from core.runtime_store import path_lock
 from core.ticker_execution import TickerExecutionRegistry
 from core.live_capacity import max_real_tickers as real_ticker_limit
 from core.runtime_reliability import (
@@ -2411,6 +2413,10 @@ def get_config():
 
 @app.route('/api/config', methods=['POST'])
 def save_config():
+    with _ENGINE_CONTROL_LOCK, path_lock(CONFIG_PATH):
+        return _save_config_locked()
+
+def _save_config_locked():
     try:
         nueva = request.get_json() or {}
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
@@ -2671,6 +2677,7 @@ _SCHEDULER = None
 _AI_STATUS_TRAINER = None
 _AI_STATUS_SIGNATURE = None
 _AI_STATUS_LOCK = threading.RLock()
+_AUTO_AI_SERVICE = None
 _VETO_STATUS_STORE = None
 _LEARNING_STATUS_STORE = None
 
@@ -2706,6 +2713,7 @@ def _start_engine(mode: str, capital: float):
     from engine.bot_engine import ChocoletraBot
 
     bot = ChocoletraBot(CONFIG_PATH)
+    bot.orquestador.entrenador.automatic_training_allowed = _get_auto_ai_service().allowed_now
     bot._ticker_quarantine.update(_STARTUP_QUARANTINE)
 
     # v2.9.2: the persistent per-ticker registry is the execution authority when
@@ -2931,6 +2939,8 @@ def _start_engine_controlled(source: str, capital: float = None):
         _log("INFO", f"[Motor] SOLICITUD DE ARRANQUE desde {origen_req}")
         if BOT_STATE["running"] and _ENGINE is not None:
             return True, "El motor ya está en ejecución"
+        if _ai_training_busy():
+            return False, "Espere a que termine la evaluación IA antes de iniciar el motor"
 
         # v3.3.2: a previous stop may have retained a stopped engine because
         # Schwab still showed managed REAL exposure.  Retry that emergency
@@ -4436,13 +4446,17 @@ def market_quote():
 # =============================================================
 @app.route('/api/ai/train', methods=['POST'])
 def trigger_training():
+    with _ENGINE_CONTROL_LOCK:
+        return _trigger_training_locked()
+
+def _trigger_training_locked():
     """Manual fallback: retrain only tickers already eligible for x/50.
 
     Heavy XGBoost work is never started while the trading engine is active.
     The manual path consumes the same lifecycle/state as the automatic
     post-session worker; it never resets counters or model history.
     """
-    if BOT_STATE.get("running"):
+    if _ai_engine_busy():
         return jsonify({
             "status": "error",
             "message": (
@@ -4451,6 +4465,8 @@ def trigger_training():
             ),
         }), 409
 
+    if _ai_training_busy():
+        return jsonify({"status": "error", "message": "Ya existe una evaluación IA en curso; no se duplica"}), 409
     trainer = None
     if _ENGINE is not None:
         try:
@@ -4497,6 +4513,78 @@ def trigger_training():
 
 
 
+def _known_ai_trainers():
+    trainers = [globals().get("_AI_STATUS_TRAINER")]
+    try:
+        trainers.append(_ENGINE.orquestador.entrenador)
+    except (AttributeError, TypeError):
+        pass
+    return [t for t in trainers if t is not None]
+
+
+def _ai_training_busy():
+    return any(training_busy(t) for t in _known_ai_trainers())
+
+
+def _ai_engine_busy():
+    if BOT_STATE.get("running"):
+        return True
+    thread = globals().get("_engine_thread")
+    if thread is not None and thread.is_alive():
+        return True
+    bot = globals().get("_ENGINE")
+    return bool(getattr(bot, "_activo", False) or getattr(bot, "_posiciones", {}))
+
+
+def _auto_ai_read_config():
+    # Automatic work must not treat an unreadable configuration as enabled.
+    with open(CONFIG_PATH, encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle)
+    if not isinstance(cfg, dict):
+        raise ValueError("config.yaml inválido")
+    return cfg
+
+
+def _get_auto_ai_service():
+    global _AUTO_AI_SERVICE
+    with _AI_STATUS_LOCK:
+        if _AUTO_AI_SERVICE is None:
+            _AUTO_AI_SERVICE = AutoAIService(
+                _auto_ai_read_config, _ai_trainer_for_status, _ai_engine_busy,
+                lambda cfg: list((cfg.get("market") or {}).get("tickers") or BOT_STATE.get("tickers") or []),
+                admission_lock=_ENGINE_CONTROL_LOCK, log=lambda message: _log("INFO", message))
+        return _AUTO_AI_SERVICE
+
+
+@app.route('/api/ai/automatic', methods=['GET', 'POST'])
+def automatic_ai_control():
+    try:
+        if request.method == "POST":
+            body = request.get_json(silent=True)
+            if not isinstance(body, dict) or set(body) != {"enabled"} or type(body["enabled"]) is not bool:
+                return jsonify({"status": "error", "message": "Envíe sólo enabled: true o false"}), 400
+            with _ENGINE_CONTROL_LOCK:
+                settings = update_auto_ai_enabled(CONFIG_PATH, body["enabled"])
+                for trainer in _known_ai_trainers():
+                    trainer.auto_retrain_enabled = body["enabled"]
+                    trainer.auto_retrain_only_after_session = True
+                    trainer.auto_activate_production = False
+                    trainer.automatic_training_allowed = _get_auto_ai_service().allowed_now
+                service = _get_auto_ai_service()
+                service.start()
+                service.wake()
+            _log("INFO", "[IA AUTO] Configuración guardada: " + ("ON" if body["enabled"] else "OFF"))
+        else:
+            settings = auto_ai_policy(_auto_ai_read_config())
+        return jsonify({"status": "ok", "policy": settings,
+                        "service": _get_auto_ai_service().snapshot(), "preserves_x50": True,
+                        "message": "Auto IA guardado; sólo evaluación SHADOW. Producción requiere aprobación manual."})
+    except (ValueError, TypeError) as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    except Exception:
+        return jsonify({"status": "error", "message": "No se pudo guardar/verificar Auto IA"}), 503
+
+
 def _ai_trainer_for_status():
     """Use the running model, or refresh the stopped dashboard on artifact changes."""
     # Concurrent dashboard polling must share one initialized trainer. Its
@@ -4507,6 +4595,9 @@ def _ai_trainer_for_status():
 
 def _ai_trainer_for_status_locked():
     global _AI_STATUS_TRAINER
+    for trainer in _known_ai_trainers():
+        if training_busy(trainer):
+            return trainer
     if _ENGINE is not None and BOT_STATE.get('running'):
         return _ENGINE.orquestador.entrenador
     from pathlib import Path
@@ -4521,11 +4612,13 @@ def _ai_trainer_for_status_locked():
             if path.is_file() and path.suffix in ('.pkl', '.json'):
                 stat = path.stat()
                 signature.append((str(path), stat.st_mtime_ns, stat.st_size))
-    signature = (str(CONFIG_PATH), tuple(signature))
+    signature = (str(CONFIG_PATH), json.dumps(ent, sort_keys=True, default=str), tuple(signature))
     if _AI_STATUS_TRAINER is None or globals().get('_AI_STATUS_SIGNATURE') != signature:
         from agents.training import EntrenadorAgentes
         _AI_STATUS_TRAINER = EntrenadorAgentes(cfg)
         globals()['_AI_STATUS_SIGNATURE'] = signature
+    if hasattr(_AI_STATUS_TRAINER, "auto_retrain_enabled"):
+        _AI_STATUS_TRAINER.automatic_training_allowed = _get_auto_ai_service().allowed_now
     return _AI_STATUS_TRAINER
 
 
@@ -4567,6 +4660,7 @@ def _learning_summary_rows(tickers):
 def ai_retraining_status():
     """Per-ticker model availability and 30/50 retraining progress."""
     try:
+        auto_policy = auto_ai_policy(_auto_ai_read_config())
         trainer = _ai_trainer_for_status()
         tickers = list(BOT_STATE.get("tickers") or [])
         rows = trainer.retraining_status(tickers)
@@ -4687,9 +4781,11 @@ def ai_retraining_status():
         }
         return jsonify({
             "status": "ok",
-            "automatic_retraining": bool(trainer.auto_retrain_enabled),
-            "only_after_session": bool(trainer.auto_retrain_only_after_session),
-            "auto_activate_production": bool(trainer.auto_activate_production),
+            "automatic_retraining": auto_policy["enabled"],
+            "only_after_session": True,
+            "auto_activate_production": False,
+            "auto_ai_policy": auto_policy,
+            "auto_ai_service": _get_auto_ai_service().snapshot(),
             "warning_samples": int(trainer.retrain_warning_samples),
             "retrain_samples": int(trainer.retrain_trigger_samples),
             "learning_policy": {
@@ -4733,6 +4829,8 @@ if __name__ == '__main__':
     # "automatico", this background service starts/stops PAPER at the configured
     # New York times. Automatic REAL is blocked inside _start_engine_controlled.
     _configure_scheduler_service()
+
+    _get_auto_ai_service().start()
 
     user = get_dashboard_user()
     pwd  = get_dashboard_password()

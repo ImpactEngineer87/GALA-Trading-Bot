@@ -14,6 +14,8 @@ class ManualAiTrainControlsTests(unittest.TestCase):
     def trainer(auto_enabled=False, eligible=("RCL", "MSFT", "ADBE")):
         trainer = EntrenadorAgentes.__new__(EntrenadorAgentes)
         trainer.auto_retrain_enabled = auto_enabled
+        trainer._lock = threading.RLock()
+        trainer._entrenando = set()
         trainer.activo = False
         trainer.shadow_enabled = True
         trainer.retraining = MagicMock()
@@ -92,7 +94,7 @@ class ManualAiTrainControlsTests(unittest.TestCase):
             "total_observations": 511
         }
         trainer.entrenar_ticker = MagicMock(return_value=None)
-        trainer._retrain_eligible_batch(["RCL"])
+        trainer._retrain_eligible_batch(["RCL"], manual_request=True)
         kwargs = trainer.retraining.mark_result.call_args.kwargs
         self.assertFalse(kwargs["consume_batch"])
         self.assertTrue(kwargs["deferred"])
@@ -112,3 +114,4 @@ class ManualAiTrainControlsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

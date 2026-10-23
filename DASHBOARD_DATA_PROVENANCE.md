@@ -59,7 +59,7 @@ grep -E '^Ran |^OK|^FAILED|^ERROR:|^FAIL:' /tmp/gala_data_provenance_tests.log
 printf 'Test exit code: %s\n' "$test_result"
 ```
 
-Node.js enables two additional browser-rendering regressions; unittest reports
+Node.js enables additional browser-rendering regressions; unittest reports
 those as skipped if Node is unavailable. Do not interpret a skipped rendering
 test as a verified browser check.
 

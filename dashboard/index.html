@@ -895,9 +895,11 @@
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <button class="btn btn-ghost btn-sm" onclick="triggerTraining()">🧠 Reentrenar pendientes</button>
+          <button class="btn btn-ghost btn-sm" id="autoAIButton" onclick="toggleAutoAI()" disabled>Cargando Auto IA…</button>
           <span class="pill paper" id="aiLifecycleSummary">Cargando…</span>
         </div>
       </div>
+      <div class="section-note" id="autoAIState" role="status" style="margin-bottom:10px">Comprobando Auto IA…</div>
       <div class="ai-life-wrap">
         <table class="ai-life-table">
           <thead><tr><th>Ticker</th><th>Modelo</th><th>Cierres nuevos / objetivo</th><th>Cierres REAL / PAPER</th><th>Vetadas IA</th><th>Aprendizaje señales</th><th>Dataset válido / afectado</th><th>Último FIT: cierres + señales</th><th>Estado</th><th>Último candidato</th><th>BA aceptada SHADOW</th><th>Candidate BA</th><th>Shadow Inc. BA</th><th>Δ Shadow</th><th>Gate PROD</th><th>TEST económico</th><th>Prod Inc. BA</th><th>Umbral decisión</th><th>Evaluación</th><th>Razón / gate</th></tr></thead>
@@ -3053,11 +3055,28 @@ function renderAILearningSummary(data){
   setText('aiLearningPolicy',`Fuentes: cierres REAL + PAPER verificados y señales resueltas de menor peso. Revisión: ${aiCountText(data.warning_samples)} cierres nuevos; reentrenamiento: ${aiCountText(data.retrain_samples)}. ${data.automatic_retraining ? schedule : 'Inicio manual'}.`);
 }
 
+function renderAutoAIControl(data){
+  const enabled=data && typeof data.automatic_retraining === 'boolean' ? data.automatic_retraining : null;
+  S.autoAIEnabled=enabled;
+  const button=el('autoAIButton'), detail=el('autoAIState');
+  if(button){
+    button.disabled=enabled == null || !!S.autoAISaving;
+    button.textContent=enabled == null ? 'Auto IA: estado desconocido' : (enabled ? 'Desactivar Auto IA' : 'Activar Auto IA');
+  }
+  if(detail){
+    if(enabled == null){detail.textContent='No se pudo verificar Auto IA; vuelve a consultar el estado.';return;}
+    const policy=data.auto_ai_policy || {}, service=data.auto_ai_service || {};
+    const waiting=service.message || (enabled ? 'Esperando comprobación del worker' : 'Entrenamiento manual disponible');
+    detail.textContent=`Auto IA ${enabled ? 'ON' : 'OFF'} · ${waiting} · L–V desde ${policy.not_before_ny || '16:15'} NY, con motor detenido · Sólo SHADOW; producción requiere aprobación manual.${service.next_window_ny ? ` Próxima ventana: ${service.next_window_ny}.` : ''}`;
+  }
+}
+
 async function fetchAIStatus(){
   try {
     const r = await api('/api/ai/status');
     const d = await r.json();
-    if(d.status !== 'ok') return;
+    if(d.status !== 'ok'){renderAutoAIControl(null);return;}
+    renderAutoAIControl(d);
     S.aiStatus = d.tickers || [];
     renderAILearningSummary(d);
     const sum = d.summary || {};
@@ -3183,12 +3202,35 @@ async function fetchAIStatus(){
       </tr>`;
     }).join('') || '<tr><td colspan="20">Sin estado disponible</td></tr>';
     if(S.tickerExecution.length) renderTickerExecution();
-  } catch(e){}
+  } catch(e){renderAutoAIControl(null);}
 }
 
 // ─────────────────────────────────────────────────────────
 // AI TRAINING
 // ─────────────────────────────────────────────────────────
+async function toggleAutoAI(){
+  if(typeof S.autoAIEnabled !== 'boolean' || S.autoAISaving) return;
+  const enabled=!S.autoAIEnabled;
+  S.autoAISaving=true;
+  const button=el('autoAIButton');
+  if(button) button.disabled=true;
+  try{
+    const r=await api('/api/ai/automatic',{method:'POST',body:JSON.stringify({enabled})});
+    const d=await r.json();
+    if(!r.ok || d.status !== 'ok') throw new Error(d.message || 'No se pudo guardar Auto IA');
+    renderAutoAIControl({automatic_retraining:d.policy.enabled,auto_ai_policy:d.policy,auto_ai_service:d.service});
+    toast('ok',d.policy.enabled ? 'Auto IA activado' : 'Auto IA desactivado',
+      d.policy.enabled ? 'Evaluará pendientes después de la sesión con el motor detenido. Sólo SHADOW.' : 'No se iniciarán nuevos tickers automáticos. El ticker en curso puede terminar.');
+    await fetchAIStatus();
+  }catch(e){
+    renderAutoAIControl(null);
+    toast('err','Auto IA no confirmado',e.message || 'Consulta el estado antes de reintentar');
+  }finally{
+    S.autoAISaving=false;
+    if(button) button.disabled=typeof S.autoAIEnabled !== 'boolean';
+  }
+}
+
 async function triggerTraining(){
   try {
     const r = await api('/api/ai/train',{method:'POST'});
