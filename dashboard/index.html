@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.11</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.13</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -3215,7 +3215,7 @@ async function toggleAutoAI(){
   const button=el('autoAIButton');
   if(button) button.disabled=true;
   try{
-    const r=await api('/api/ai/automatic',{method:'POST',body:JSON.stringify({enabled})});
+    const r=await api('/api/ai/automatic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
     const d=await r.json();
     if(!r.ok || d.status !== 'ok') throw new Error(d.message || 'No se pudo guardar Auto IA');
     renderAutoAIControl({automatic_retraining:d.policy.enabled,auto_ai_policy:d.policy,auto_ai_service:d.service});

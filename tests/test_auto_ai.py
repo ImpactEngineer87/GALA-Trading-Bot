@@ -1,5 +1,6 @@
 """Offline automatic SHADOW scheduling, private settings and admission tests."""
 import copy
+import json
 import shutil
 import stat
 import subprocess
@@ -201,6 +202,53 @@ class AutoAISettingsApiTests(unittest.TestCase):
             self.assertEqual(fresh, expected)
             self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
         self.assertEqual(self.service.wake.call_count, 2)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard checks")
+    def test_actual_dashboard_fetch_requests_are_accepted_by_authenticated_route(self):
+        """Use the real API helper and Fetch Request serialization, then Flask."""
+        dashboard = Path(__file__).resolve().parents[1] / "dashboard" / "index.html"
+        script = r"""
+const fs=require('fs'),vm=require('vm');
+const html=fs.readFileSync(process.argv[1],'utf8'),requests=[];
+const elements={};
+const context=vm.createContext({Headers,csrfToken:'offline-test-token',
+  S:{autoAIEnabled:false},el:id=>elements[id]??={},toast:()=>{},
+  renderAutoAIControl:()=>{},fetchAIStatus:async()=>{},
+  fetch:async(url,opts)=>{
+    const request=new Request('http://127.0.0.1:5000'+url,opts);
+    const body=await request.text();
+    requests.push({url,method:request.method,headers:Object.fromEntries(request.headers),body});
+    return {ok:true,status:200,json:async()=>({status:'ok',
+      policy:{enabled:JSON.parse(body).enabled},service:{state:'NOT_CHECKED'}})};
+  }});
+let a=html.indexOf('async function api('),b=html.indexOf('// LOGIN / LOGOUT',a);
+vm.runInContext(html.slice(a,b),context);
+a=html.indexOf('async function toggleAutoAI(');b=html.indexOf('async function triggerTraining',a);
+vm.runInContext(html.slice(a,b),context);
+(async()=>{
+  for(const enabled of [false,true]){
+    context.S.autoAIEnabled=enabled;
+    await context.toggleAutoAI();
+  }
+  process.stdout.write(JSON.stringify(requests));
+})().catch(e=>{console.error(e);process.exitCode=1});
+"""
+        result = subprocess.run([shutil.which("node"), "-e", script, str(dashboard)],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        captured = json.loads(result.stdout)
+        self.assertEqual(len(captured), 2)
+        self.login()
+        for item, enabled in zip(captured, (True, False)):
+            with self.subTest(enabled=enabled):
+                self.assertEqual(item["url"], "/api/ai/automatic")
+                self.assertEqual(item["method"], "POST")
+                response = self.client.post(item["url"], data=item["body"], headers=item["headers"])
+                self.assertEqual(response.status_code, 200, response.get_json())
+                self.assertEqual(item["headers"].get("content-type"), "application/json")
+                self.assertIs(response.json["policy"]["enabled"], enabled)
+                self.assertFalse(response.json["policy"]["auto_activate_production"])
+                self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
 
     def test_invalid_inputs_never_write(self):
         self.login()

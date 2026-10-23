@@ -1,4 +1,26 @@
-# Auto AI controls — v3.3.12
+# Auto AI controls — v3.3.13
+
+## Dashboard request correction in v3.3.13
+
+The v3.3.12 Auto IA button omitted `Content-Type: application/json` when sending
+its JSON body. The shared API helper adds CSRF but does not add a JSON header.
+The browser therefore sent text/plain, and Flask rejected the request with
+HTTP 400, `Envíe sólo enabled: true o false`, before saving the setting. This
+was a dashboard request defect, not a model fitting or eligibility rejection.
+
+The button now declares JSON explicitly. A regression runs the actual
+dashboard API helper and toggle with standard Fetch Request serialization,
+then replays both ON and OFF requests through the authenticated Flask route.
+The prior mocked-helper test did not cover this boundary. Request validation,
+authentication, CSRF, private permissions and SHADOW-only policy stay enforced.
+The header now displays v3.3.13 to make the loaded dashboard build visible.
+
+This correction changes only the dashboard, version, documentation and tests.
+An installation already at the exact v3.3.12 commit can serve the updated HTML
+after a source update and browser refresh, without a trading-service restart.
+Verify the VPS version and API response before calling activation successful.
+
+## Scheduling and model policy
 
 The Signals page now has a persistent **Activar / Desactivar Auto IA** button.
 An OFF label reports the saved automatic-retraining setting; it does not mean
