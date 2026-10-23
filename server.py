@@ -1757,11 +1757,11 @@ def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
     trade = {
         "tipo": tipo,
         "ticker": ticker,
-        "precio": round(float(precio), 2),
+        "precio": round(float(precio), 6) if precio is not None else None,
         "acciones": int(cantidad),
         "estado": estado,      # backwards compatibility
         "evento": event_label, # unambiguous dashboard label
-        "pnl": round(float(pnl), 2),
+        "pnl": round(float(pnl), 6) if pnl is not None else None,
         "timestamp": _hora_ny(),
         "date": _hora_ny("%Y-%m-%d"),
     }
@@ -1813,7 +1813,10 @@ def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
     elif estado == "CLOSED":
         active.pop(ticker, None)
         BOT_STATE["stats"]["trades_closed"] += 1
-        BOT_STATE["stats"]["pnl_total"] += float(pnl or 0.0)
+        previous_pnl = BOT_STATE["stats"].get("pnl_total")
+        BOT_STATE["stats"]["pnl_total"] = (
+            float(previous_pnl) + float(pnl)
+            if previous_pnl is not None and pnl is not None else None)
 
     BOT_STATE["stats"]["trades_open"] = len(active)
 

@@ -1,4 +1,4 @@
-# Dashboard data provenance — v3.3.9
+# Dashboard data provenance — v3.3.10
 
 ## Corrected behavior
 
@@ -42,9 +42,9 @@ Schwab candle/MTF requests, including PAPER operation. Missing data remains
 unavailable. The explicit `obtener_velas_demo` generator remains an opt-in demo
 and tags generated frames as synthetic. It is not called by production paths.
 
-This change does not alter risk gates, entry cancellation/reconciliation,
-position liquidation rules, AI x/50 state, validation thresholds or SHADOW
-promotion permissions.
+The v3.3.9 display correction preserves broker safety checks, entry cancellation,
+position liquidation rules, AI x/50 state, validation thresholds and SHADOW
+promotion permissions. The v3.3.10 accounting block is described below.
 
 ## Validation and activation
 
@@ -102,7 +102,39 @@ calculation, not Schwab/TOS account P/L or net of every fee.
 
 The command does not modify history, counters, feedback, models or promotion
 state. Its results do not make historical observations eligible for AI training.
-It is a diagnostic, not an accounting repair: the current engine can still
-record a requested exit price when broker-flat recovery lacks execution-price
-evidence. The dashboard excludes those rows, but the underlying accounting and
-daily-loss treatment must be resolved before enabling REAL trading.
+The diagnostic alone does not repair accounting or authorize REAL trading.
+
+## Execution accounting repair in v3.3.10
+
+The Schwab audit confirmed actual broker entries and discrepancies between
+recorded exit prices and execution legs. For example, NKE's 10:24 close recorded
++$0.30 locally, while its exact broker entry/exit fills yield -$0.65 gross.
+The earlier requested-exit-price fallback and entry-price rounding were not a
+reliable source of realized REAL P/L.
+
+New REAL closes use verified broker execution prices and preserve sub-cent
+average entry fills. STOP/LIMIT protection instructions retain tick rounding.
+The live order parser rejects incomplete price coverage instead of applying a
+partial execution's average to a larger filled quantity. A missing execution
+price, order identity, entry confirmation or quantity match produces unavailable
+P/L, never the signal price, a LIMIT approximation or zero. Broker-flat closes
+release exposure tracking only after the existing flat/order safety checks.
+
+Unresolved accounting blocks new REAL entries (including reversal entries) in
+`data/real_accounting_reconciliation.json`. Optional configuration is
+`execution_engine.accounting_state_path`; relative paths resolve under the
+original project. The block survives restarts and has no automatic date reset.
+At startup, incomplete current-session REAL history also blocks entries because
+it cannot establish an accurate daily-risk baseline. No historical records are
+rewritten. Do not delete/edit the block to enable trading: reconciliation must
+independently establish complete broker execution evidence first.
+
+Existing positions continue through normal broker management and protection.
+An unknown partial fill price still updates remainder protection, but cannot
+produce P/L or admit a new REAL entry. The daily loss guard remains enabled and
+can act conservatively on known losses; an incomplete REAL daily total displays
+N/D. Unknown closes persist quarantined feedback with blank exit/R/win labels,
+and SHADOW evaluation does not manufacture a win/loss. Existing models, valid
+observation counts, validation requirements and promotion permissions remain
+unchanged. This does not retroactively reconcile the 17 historical closes or
+make them eligible for training.

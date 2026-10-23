@@ -580,6 +580,11 @@ class FeedbackStore:
         feats = pend["features"]
         opening = dict(pend.get("lifecycle") or {})
         closing = dict(lifecycle or {})
+        try:
+            exit_value = float(precio_salida)
+            exit_price_known = math.isfinite(exit_value) and exit_value > 0
+        except (TypeError, ValueError, OverflowError):
+            exit_value, exit_price_known = None, False
 
         # R múltiple realizado = beneficio / riesgo planificado, con signo.
         # El riesgo se toma de la entrada y el SL REALES de la orden (mismos
@@ -593,12 +598,12 @@ class FeedbackStore:
         else:
             riesgo = float(pend.get("riesgo_planificado") or 0.0)
         r_mult = 0.0
-        if riesgo > 0:
+        if riesgo > 0 and exit_price_known:
             if tipo == "BUY":
-                r_mult = (precio_salida - entrada) / riesgo
+                r_mult = (exit_value - entrada) / riesgo
             else:  # SELL
-                r_mult = (entrada - precio_salida) / riesgo
-        ganadora = 1 if r_mult > 0 else 0
+                r_mult = (entrada - exit_value) / riesgo
+        ganadora = (1 if r_mult > 0 else 0) if exit_price_known else ""
 
         expected_position = "LONG" if tipo == "BUY" else "SHORT"
         expected_entry_action = "BUY" if tipo == "BUY" else "SELL_SHORT"
@@ -628,8 +633,8 @@ class FeedbackStore:
         order_ids_valid = bool(opening.get("entry_order_id")) and (
             mode == "PAPER" or bool(closing.get("exit_order_id"))
         )
-        economic_valid = all(math.isfinite(float(value)) and float(value) > 0
-                             for value in (entrada, precio_salida, riesgo))
+        economic_valid = exit_price_known and all(math.isfinite(float(value)) and float(value) > 0
+                             for value in (entrada, riesgo))
         mode_valid = mode in ("REAL", "PAPER")
         execution_valid = int(
             required_ids and direction_valid and links_valid and broker_valid
@@ -713,9 +718,9 @@ class FeedbackStore:
                 nombre: _csv_num(feats.get(nombre))
                 for nombre in GALA10_FEATURE_NAMES
             },
-            "precio_entrada": round(entrada, 4),
-            "precio_salida": round(float(precio_salida), 4),
-            "r_multiple": round(r_mult, 4),
+            "precio_entrada": round(entrada, 6),
+            "precio_salida": round(exit_value, 6) if exit_price_known else "",
+            "r_multiple": round(r_mult, 4) if exit_price_known else "",
             "ganadora": ganadora,
             "closed_utc": str(closing.get("closed_utc") or datetime.now(timezone.utc).isoformat()),
             "risk_per_share": round(float(riesgo), 8),
@@ -782,3 +787,4 @@ class FeedbackStore:
                 return self._closed_count
         except Exception:
             return 0
+

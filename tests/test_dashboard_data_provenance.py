@@ -251,6 +251,16 @@ class DashboardProvenanceRoutesTests(unittest.TestCase):
         self.assertNotIn("total_pnl", body["summary"])
         self.assertFalse(body["summary"]["is_broker_reported"])
 
+    def test_unknown_close_event_removes_position_without_fabricating_zero_pnl(self):
+        import server
+        with patch.dict(server.BOT_STATE, trades=[], active_positions={"META": {}},
+                        stats={"pnl_total": 5.0, "trades_closed": 0, "trades_open": 1}):
+            server._register_trade("SELL", "META", None, 3, "CLOSED", None)
+            self.assertNotIn("META", server.BOT_STATE["active_positions"])
+            self.assertIsNone(server.BOT_STATE["trades"][-1]["pnl"])
+            self.assertIsNone(server.BOT_STATE["trades"][-1]["precio"])
+            self.assertIsNone(server.BOT_STATE["stats"]["pnl_total"])
+
     def test_malformed_broker_positions_do_not_become_a_zero_balance(self):
         from core.broker_pnl import open_position_pnl_snapshot
         self.assertFalse(open_position_pnl_snapshot({})["available"])

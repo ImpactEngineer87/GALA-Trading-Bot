@@ -1266,22 +1266,55 @@ class EjecutorHibridoDeOrdenes:
         # parcial, pero las patas SÍ registran la ejecución: se toma el MÁXIMO
         # entre ambas fuentes para no ignorar acciones ya adquiridas.
         precios, cantidades = [], []
+        valid_prices = True
+        seen_executions = set()
         for act in (d.get("orderActivityCollection", []) or []):
+            if not isinstance(act, dict):
+                valid_prices = False
+                continue
+            execution_id = act.get("executionId")
+            if execution_id is not None:
+                if str(execution_id) in seen_executions:
+                    valid_prices = False
+                    continue
+                seen_executions.add(str(execution_id))
+            if (act.get("activityType") not in (None, "EXECUTION")
+                    or act.get("executionType") not in (None, "FILL")):
+                valid_prices = False
+                continue
             for leg in (act.get("executionLegs", []) or []):
-                precios.append(float(leg.get("price", 0) or 0))
-                cantidades.append(float(leg.get("quantity", 0) or 0))
-        filled_field = float(d.get("filledQuantity", 0) or 0)
+                try:
+                    price, qty = float(leg.get("price", 0) or 0), float(leg.get("quantity", 0) or 0)
+                    if not math.isfinite(qty) or qty <= 0:
+                        raise ValueError("Invalid fill quantity")
+                    cantidades.append(qty)
+                    precios.append(price)
+                    valid_prices = valid_prices and math.isfinite(price) and price > 0
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    valid_prices = False
+        try:
+            filled_field = float(d.get("filledQuantity", 0) or 0)
+            if not math.isfinite(filled_field) or filled_field < 0:
+                raise ValueError("Invalid broker quantity")
+        except (TypeError, ValueError, OverflowError):
+            filled_field = 0.0
+            valid_prices = False
         filled_legs = sum(cantidades)
         filled = max(filled_field, filled_legs)
-        if filled_legs > 0:
+        valid_prices = bool(valid_prices and filled_legs > 0
+                            and math.isfinite(filled)
+                            and abs(filled - filled_legs) <= 1e-6
+                            and len(d.get("orderLegCollection") or []) <= 1)
+        if valid_prices:
             avg = sum(p * q for p, q in zip(precios, cantidades)) / filled_legs
+            valid_prices = math.isfinite(avg) and avg > 0
+            if not valid_prices:
+                avg = 0.0
         else:
-            # Sin patas pero con llenado (filledQuantity>0): usa el precio de la
-            # orden (límite) como aproximación en vez de 0.0, para no mal-calcular
-            # SL/TP/PnL de una posición realmente llenada.
             # A limit is an instruction, never evidence of an execution price.
             avg = 0.0
-        return {"status": status, "filled": filled, "avg_price": avg}
+        return {"status": status, "filled": filled, "avg_price": avg,
+                "fill_price_verified": bool(valid_prices)}
 
     def esperar_estado_orden(self, account_number: str, order_id: str,
                              deseados, fallos=(), timeout_s: Optional[float] = None) -> dict:
@@ -2118,3 +2151,4 @@ class EjecutorHibridoDeOrdenes:
     def cancelar_orden(self, account_number: str, order_id: str) -> bool:
         """Compatibilidad: True únicamente tras confirmación terminal real."""
         return bool(self.cancelar_orden_confirmada(account_number, order_id).get("confirmado"))
+

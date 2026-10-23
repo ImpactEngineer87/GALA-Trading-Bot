@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.9</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.10</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -1647,22 +1647,27 @@ function updateDailyRisk(risk){
   if(!card) return;
   const enabled = risk.enabled !== false;
   const blocked = !!risk.blocked;
-  const net = Number(risk.net_pnl || 0);
+  const accountingBlocked = !!(risk.real_accounting || {}).blocked;
+  const net = risk.net_pnl == null ? null : Number(risk.net_pnl);
   const limit = Number(risk.limit_usd || 0);
-  const room = Number(risk.remaining_to_limit_usd || 0);
+  const room = risk.remaining_to_limit_usd == null ? null : Number(risk.remaining_to_limit_usd);
   el('dailyRiskNet').textContent = money(net);
-  el('dailyRiskNet').style.color = net >= 0 ? 'var(--green)' : 'var(--red)';
+  el('dailyRiskNet').style.color = net == null ? 'var(--muted)' : net >= 0 ? 'var(--green)' : 'var(--red)';
   el('dailyRiskLimit').textContent = money(limit);
   el('dailyRiskRoom').textContent = money(room);
-  el('dailyRiskState').textContent = blocked
+  el('dailyRiskState').textContent = accountingBlocked
+    ? '⛔ NUEVAS ENTRADAS REAL BLOQUEADAS: CONTABILIDAD PENDIENTE'
+    : blocked
     ? '⛔ BLOQUEADO POR PÉRDIDA DIARIA'
     : (enabled ? '🛡️ Kill Switch diario preparado' : '⚠️ Kill Switch diario desactivado');
-  const realized = Number(risk.realized_pnl || 0);
+  const realized = risk.realized_pnl == null ? null : Number(risk.realized_pnl);
   const unrealized = Number(risk.unrealized_pnl || 0);
-  el('dailyRiskDetail').textContent = blocked
+  el('dailyRiskDetail').textContent = accountingBlocked
+    ? `Reconciliar ejecuciones Schwab · ${(risk.real_accounting.reasons || []).join('; ')} · protecciones existentes siguen activas`
+    : blocked
     ? `${risk.trigger_mode || risk.mode || 'PAPER'} · ${risk.reason || ''} · reinicio ${risk.next_reset_at_ny || 'próxima sesión NY'}`
     : `${risk.mode || 'PAPER'} · Realizado ${money(realized)} · No realizado ${money(unrealized)}${risk.pricing_complete === false ? ' · valoración incompleta' : ''}`;
-  card.classList.toggle('blocked', blocked);
+  card.classList.toggle('blocked', blocked || accountingBlocked);
 }
 
 function updateBrokerReconciliation(state){

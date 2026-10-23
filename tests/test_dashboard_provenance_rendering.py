@@ -17,7 +17,7 @@ for(const m of html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)) {
 }
 const elements={}; let payload, requestUrl;
 const context=vm.createContext({
-  el:id=>elements[id]??={textContent:'',innerHTML:'',style:{},value:''},
+  el:id=>elements[id]??={textContent:'',innerHTML:'',style:{},value:'',classList:{toggle:()=>{}}},
   escHtml:v=>String(v??'').replace(/</g,'&lt;').replace(/>/g,'&gt;'),
   api:async url=>{requestUrl=url;return {ok:true,json:async()=>payload};},
 });
@@ -27,11 +27,20 @@ vm.runInContext(html.slice(a,b),context);
 a=html.indexOf('async function fetchTickerAnalysis(){');
 b=html.indexOf('async function fetchHistorial(){',a);
 vm.runInContext(html.slice(a,b),context);
+a=html.indexOf('function updateDailyRisk(risk){');
+b=html.indexOf('function updateBrokerReconciliation(',a);
+vm.runInContext(html.slice(a,b),context);
 (async()=>{
   assert.equal(context.money(null),'N/D');
   assert.equal(context.money(undefined),'N/D');
   assert.equal(context.money('NaN'),'N/D');
   assert.equal(context.money(0),'$0.00');
+  context.updateDailyRisk({net_pnl:null,realized_pnl:null,remaining_to_limit_usd:null,
+    limit_usd:-200,real_accounting:{blocked:true,reasons:['Fill pendiente']}});
+  assert.equal(elements.dailyRiskNet.textContent,'N/D');
+  assert.equal(elements.dailyRiskRoom.textContent,'N/D');
+  assert.match(elements.dailyRiskState.textContent,/REAL BLOQUEADAS/);
+  assert.match(elements.dailyRiskDetail.textContent,/Fill pendiente/);
   payload={status:'ok',date:'2026-10-22',summary:{by_mode:{PAPER:{total_pnl:500},REAL:{total_pnl:null}}},
     rows:[{ticker:'META',mode:'REAL',mode_breakdown:{
       PAPER:{closed_trades:1,realized_pnl:500,unrealized_pnl:0,total_pnl:500},
