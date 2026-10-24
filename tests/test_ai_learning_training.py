@@ -220,6 +220,19 @@ class LearningTrainingTests(unittest.TestCase):
         self.assertFalse(metrics["production_gate_passed"])
         self.assertEqual(metrics["unknown_close_timestamps"], 120)
 
+    def test_automatic_candidate_cannot_activate_even_with_explicit_legacy_permission(self):
+        self.trades().to_csv(self.trainer.feedback_path, index=False)
+        self.trainer.auto_activate_production = True
+        with patch.dict("sys.modules", {"xgboost": SimpleNamespace(XGBClassifier=FixedClassifier)}):
+            metrics = self.trainer.entrenar_ticker("AAPL", automatic=True,
+                                                  allow_production_activation=True)
+        self.assertTrue(metrics["production_gate_passed"])
+        self.assertFalse(metrics["production_activation_allowed"])
+        self.assertFalse(metrics["activado"])
+        self.assertFalse(Path(self.trainer.modelos_dir).exists())
+        self.assertTrue((Path(metrics["candidate_archive"]) / "model.pkl").is_file())
+        self.assertTrue((Path(metrics["candidate_archive"]) / "model.meta.json").is_file())
+
     def test_small_test_remains_shadow_until_enough_approved_evidence(self):
         metrics = self.train(self.trades(50))
         self.assertIsNotNone(metrics)
@@ -310,6 +323,7 @@ class LearningTrainingTests(unittest.TestCase):
             server, "_ai_trainer_for_status", return_value=self.trainer
         ), patch.object(server, "_veto_summary_rows", return_value=[]), patch.object(
             server, "_learning_summary_rows", return_value=[]
+        ), patch.object(server, "_auto_ai_read_config", return_value=self.config
         ), patch.dict(server.BOT_STATE, {"tickers": ["AAPL"]}):
             response = server.ai_retraining_status()
         self.assertEqual(response.status_code, 200)
@@ -337,3 +351,4 @@ class LearningTrainingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

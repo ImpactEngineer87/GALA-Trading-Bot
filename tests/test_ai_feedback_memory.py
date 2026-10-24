@@ -28,18 +28,22 @@ def reference_summary(rows, fields):
         record = summary.setdefault(ticker, {
             "eligible_observations": 0, "eligible_closed_real": 0,
             "eligible_closed_paper": 0, "eligible_closed_legacy": 0,
-            "quarantined_observations": 0, "duplicate_closed_rows": 0,
+            "quarantined_observations": 0,
+            "quarantined_closed_real": 0, "quarantined_closed_paper": 0,
+            "duplicate_closed_rows": 0,
             "lifetime_observations": 0,
         })
         record["lifetime_observations"] += 1
         if index not in unique:
             record["duplicate_closed_rows"] += 1
             continue
+        mode = str(row.get("modo") or "").strip().lower()
         if not closed_row_is_eligible(row, fieldnames=fields):
             record["quarantined_observations"] += 1
+            if mode in ("real", "paper"):
+                record[f"quarantined_closed_{mode}"] += 1
             continue
         record["eligible_observations"] += 1
-        mode = str(row.get("modo") or "").strip().lower()
         record[f"eligible_closed_{mode if mode in ('real', 'paper') else 'legacy'}"] += 1
     return summary
 

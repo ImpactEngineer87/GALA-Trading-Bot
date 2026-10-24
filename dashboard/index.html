@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.8</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.14</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -884,7 +884,7 @@
     <div class="stats-row ai-learning-cards" aria-live="polite">
       <div class="stat-card green"><div class="stat-value" id="aiVerifiedClosed">—</div><div class="stat-label">Cierres verificados para IA</div><div class="daily-risk-sub" id="aiClosedSources">REAL — · PAPER —</div></div>
       <div class="stat-card purple"><div class="stat-value" id="aiResolvedSignals">—</div><div class="stat-label">Señales resueltas utilizables</div><div class="daily-risk-sub" id="aiSignalSources">Esperando resultados confirmados</div></div>
-      <div class="stat-card orange"><div class="stat-value" id="aiTrainingReady">—</div><div class="stat-label">Tickers listos para entrenar</div><div class="daily-risk-sub" id="aiTrainingSchedule">Cargando programación</div></div>
+      <div class="stat-card orange"><div class="stat-value" id="aiTrainingReady">—</div><div class="stat-label">Datos aptos para evaluación</div><div class="daily-risk-sub" id="aiTrainingSchedule">Cargando programación</div></div>
       <div class="stat-card"><div class="stat-value" id="aiEconomicEvidence">—</div><div class="stat-label">TEST con puerta económica aprobada</div><div class="daily-risk-sub" id="aiEconomicDetail">Resultados de candidatos, con costes estimados</div></div>
     </div>
     <div class="card" style="margin-bottom:16px">
@@ -895,9 +895,11 @@
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           <button class="btn btn-ghost btn-sm" onclick="triggerTraining()">🧠 Reentrenar pendientes</button>
+          <button class="btn btn-ghost btn-sm" id="autoAIButton" onclick="toggleAutoAI()" disabled>Cargando Auto IA…</button>
           <span class="pill paper" id="aiLifecycleSummary">Cargando…</span>
         </div>
       </div>
+      <div class="section-note" id="autoAIState" role="status" style="margin-bottom:10px">Comprobando Auto IA…</div>
       <div class="ai-life-wrap">
         <table class="ai-life-table">
           <thead><tr><th>Ticker</th><th>Modelo</th><th>Cierres nuevos / objetivo</th><th>Cierres REAL / PAPER</th><th>Vetadas IA</th><th>Aprendizaje señales</th><th>Dataset válido / afectado</th><th>Último FIT: cierres + señales</th><th>Estado</th><th>Último candidato</th><th>BA aceptada SHADOW</th><th>Candidate BA</th><th>Shadow Inc. BA</th><th>Δ Shadow</th><th>Gate PROD</th><th>TEST económico</th><th>Prod Inc. BA</th><th>Umbral decisión</th><th>Evaluación</th><th>Razón / gate</th></tr></thead>
@@ -959,6 +961,7 @@
         <div>
           <div class="card-title" style="margin:0">Historial persistente</div>
           <div class="section-note" style="margin:3px 0 0" id="signalHistoryCount">Cargando señales guardadas…</div>
+          <div class="section-note" style="margin-top:4px">APPROVED = decisión de IA, NO confirma envío ni fill en Schwab. La ejecución se comprueba en Trades / Auditoría. GALA utiliza velas cerradas y puede diferir de una señal Thinkorswim en formación.</div>
         </div>
         <button class="btn btn-ghost btn-sm" onclick="fetchSignals()">↻ Actualizar</button>
       </div>
@@ -992,6 +995,14 @@
         <div class="daily-risk-sub" id="tr-pnl-detail">Abierto $0.00 · Cerrado hoy $0.00</div>
       </div>
     </div>
+    <div class="card" style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+        <div class="card-title" style="margin:0">🏦 P/L Schwab · posiciones REAL abiertas</div>
+        <button class="btn btn-ghost btn-sm" onclick="fetchBrokerPositionPnL()">↻ Consultar Schwab</button>
+      </div>
+      <div class="section-note">Consulta manual de solo lectura. El P/L Day de las posiciones abiertas del broker no equivale al P/L de operaciones cerradas del bot ni al P/L Day total de Thinkorswim. Ningún dato desconocido se muestra como $0.</div>
+      <div id="brokerPositionPnL" class="section-note" style="margin-top:10px">Sin consultar · No se ha solicitado el valor de Schwab.</div>
+    </div>
     <div class="card">
       <div class="card-title">Posiciones abiertas — estado real del motor</div>
       <div class="section-note">Esta sección muestra únicamente posiciones actualmente abiertas. La cantidad inicial, el parcial 70/30 y la cantidad restante provienen directamente del motor de trading.</div>
@@ -1007,7 +1018,7 @@
         </div>
         <button class="btn btn-ghost btn-sm" onclick="fetchTickerPerformance()">↻ Actualizar</button>
       </div>
-      <div class="section-note">Realizado = operaciones cerradas hoy. Flotante = posiciones actualmente abiertas. Total = realizado + flotante. Así se ve de un vistazo qué ticker aporta ganancias o pérdidas.</div>
+      <div class="section-note">PAPER = simulación. REAL = cálculo bruto local sobre fills registrados y verificados, no P/L oficial de Schwab. El flotante es una estimación con el último cierre de vela; los datos ausentes o antiguos se muestran N/D. No se mezclan modos. Las señales y aprobaciones no prueban fills.</div>
       <div class="ticker-perf-grid" id="tickerPerformanceGrid" style="margin-top:12px">
         <div class="empty-state"><div class="es-icon">📊</div><div>Cargando rendimiento por ticker…</div></div>
       </div>
@@ -1016,10 +1027,14 @@
     <div class="card" style="margin-top:16px">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;margin-bottom:10px">
         <div>
-          <div class="card-title" style="margin:0">🧭 Análisis automático de precisión por ticker</div>
+          <div class="card-title" style="margin:0">🧭 Análisis de resultados por ticker</div>
           <div class="ticker-perf-summary" id="tickerAnalysisSummary">Comparando resultados ejecutados y cerrados con penalización por muestra pequeña.</div>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          <select class="exec-mode-select" id="tickerAnalysisMode" aria-label="Fuente del análisis" onchange="fetchTickerAnalysis()">
+            <option value="REAL" selected>REAL · fills registrados</option>
+            <option value="PAPER">PAPER · simulación</option>
+          </select>
           <select class="exec-mode-select" id="tickerAnalysisDays" onchange="fetchTickerAnalysis()">
             <option value="15">15 días</option>
             <option value="30" selected>30 días</option>
@@ -1029,7 +1044,7 @@
           <button class="btn btn-ghost btn-sm" onclick="fetchTickerAnalysis()">↻ Analizar</button>
         </div>
       </div>
-      <div class="section-note">El ranking usa operaciones realmente ejecutadas y cerradas: win rate con límite inferior Wilson, retorno normalizado y profit factor. La BA del modelo se muestra solo como contexto. No cambia PAPER/REAL ni acciones automáticamente.</div>
+      <div class="section-note">El análisis separa REAL (fills registrados verificados) y PAPER (simulación). No es P/L oficial de Schwab ni precisión futura. Registros REAL sin evidencia quedan excluidos; un ticker con evidencia incompleta no entra al ranking. La BA del modelo es contexto. No cambia modos ni modelos.</div>
       <div class="accuracy-analysis-grid" id="tickerAnalysisGrid" style="margin-top:12px">
         <div class="empty-state"><div class="es-icon">🧭</div><div>Preparando análisis automático…</div></div>
       </div>
@@ -1081,12 +1096,12 @@
   </style>
   <div class="page" id="page-historial">
     <div class="page-title">📒 Historial de Operaciones</div>
-    <div class="page-sub">Resumen de PnL y auditoría completa del ciclo de órdenes. Ambos registros sobreviven al reinicio.</div>
+    <div class="page-sub">Registro local y auditoría de órdenes. PAPER es simulado; REAL requiere evidencia de fills. Los registros sin verificar se conservan y no se cuentan como resultados confirmados.</div>
     <div class="stats-row" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px">
       <div class="stat-card"><div class="stat-icon">📊</div><div class="stat-value" id="h-total">0</div><div class="stat-label">Operaciones</div></div>
       <div class="stat-card green"><div class="stat-icon">✅</div><div class="stat-value" id="h-win">0</div><div class="stat-label">Ganadas</div></div>
       <div class="stat-card red"><div class="stat-icon">❌</div><div class="stat-value" id="h-loss">0</div><div class="stat-label">Perdidas</div></div>
-      <div class="stat-card blue"><div class="stat-icon">💰</div><div class="stat-value" id="h-pnl">$0.00</div><div class="stat-label">PnL Total</div></div>
+      <div class="stat-card blue"><div class="stat-icon">💰</div><div class="stat-value" id="h-pnl">$0.00</div><div class="stat-label">Bruto local PAPER / REAL</div></div>
     </div>
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px;flex-wrap:wrap">
@@ -1618,10 +1633,10 @@ async function fetchStatus(){
       el('stTradesMode').textContent = (paperOpen + realOpen === 0 && brokerPositions.length)
         ? `PAPER 0 · REAL/BROKER ${brokerPositions.length}`
         : `PAPER ${paperOpen} · REAL ${realOpen}`;
-      const pnl = Number(stats.paper_session_pnl || 0);
-      el('stPnl').textContent   = '$' + pnl.toFixed(2);
+      const pnl = financialNumber(stats.paper_session_pnl);
+      el('stPnl').textContent   = money(pnl);
       el('stPnl').style.color   = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-      el('stPnlPaper').textContent = `Abierto ${money(Number(stats.paper_unrealized_pnl || 0))} · Cerrado hoy ${money(Number(stats.paper_realized_today || 0))}`;
+      el('stPnlPaper').textContent = `Abierto ${money(stats.paper_unrealized_pnl)} · Cerrado hoy ${money(stats.paper_realized_today)}`;
       updateDailyRisk(d.daily_risk || {});
       updateSchedulerStatus(d.scheduler || {});
       updateBrokerReconciliation(d.broker_reconciliation || {});
@@ -1634,22 +1649,27 @@ function updateDailyRisk(risk){
   if(!card) return;
   const enabled = risk.enabled !== false;
   const blocked = !!risk.blocked;
-  const net = Number(risk.net_pnl || 0);
+  const accountingBlocked = !!(risk.real_accounting || {}).blocked;
+  const net = risk.net_pnl == null ? null : Number(risk.net_pnl);
   const limit = Number(risk.limit_usd || 0);
-  const room = Number(risk.remaining_to_limit_usd || 0);
+  const room = risk.remaining_to_limit_usd == null ? null : Number(risk.remaining_to_limit_usd);
   el('dailyRiskNet').textContent = money(net);
-  el('dailyRiskNet').style.color = net >= 0 ? 'var(--green)' : 'var(--red)';
+  el('dailyRiskNet').style.color = net == null ? 'var(--muted)' : net >= 0 ? 'var(--green)' : 'var(--red)';
   el('dailyRiskLimit').textContent = money(limit);
   el('dailyRiskRoom').textContent = money(room);
-  el('dailyRiskState').textContent = blocked
+  el('dailyRiskState').textContent = accountingBlocked
+    ? '⛔ NUEVAS ENTRADAS REAL BLOQUEADAS: CONTABILIDAD PENDIENTE'
+    : blocked
     ? '⛔ BLOQUEADO POR PÉRDIDA DIARIA'
     : (enabled ? '🛡️ Kill Switch diario preparado' : '⚠️ Kill Switch diario desactivado');
-  const realized = Number(risk.realized_pnl || 0);
+  const realized = risk.realized_pnl == null ? null : Number(risk.realized_pnl);
   const unrealized = Number(risk.unrealized_pnl || 0);
-  el('dailyRiskDetail').textContent = blocked
+  el('dailyRiskDetail').textContent = accountingBlocked
+    ? `Reconciliar ejecuciones Schwab · ${(risk.real_accounting.reasons || []).join('; ')} · protecciones existentes siguen activas`
+    : blocked
     ? `${risk.trigger_mode || risk.mode || 'PAPER'} · ${risk.reason || ''} · reinicio ${risk.next_reset_at_ny || 'próxima sesión NY'}`
     : `${risk.mode || 'PAPER'} · Realizado ${money(realized)} · No realizado ${money(unrealized)}${risk.pricing_complete === false ? ' · valoración incompleta' : ''}`;
-  card.classList.toggle('blocked', blocked);
+  card.classList.toggle('blocked', blocked || accountingBlocked);
 }
 
 function updateBrokerReconciliation(state){
@@ -2187,7 +2207,7 @@ function drawSignalChart(){
     allTradeEvents.push({
       kind:'PARTIAL_70',label:'SALIDA 70%',price:Number(active.partial_exit_price),
       epoch_ms:Date.parse(active.partial_exit_at),quantity:Number(active.partial_quantity_executed||0),
-      pnl_usd:Number(active.realized_pnl||0)
+      pnl_usd:financialNumber(active.realized_pnl)
     });
   }
   const selected=data.selected_signal||null;
@@ -2276,7 +2296,7 @@ function drawSignalChart(){
     let shape=`<circle cx="${ex}" cy="${ey}" r="6" fill="${color}" stroke="var(--bg2)" stroke-width="2"/>`;
     if(kind==='PARTIAL_70') shape=`<polygon points="${ex},${ey-8} ${ex+8},${ey} ${ex},${ey+8} ${ex-8},${ey}" fill="${color}" stroke="var(--bg2)" stroke-width="2"/>`;
     if(kind==='ENTRY') shape=`<rect x="${ex-5}" y="${ey-5}" width="10" height="10" rx="2" fill="${color}" stroke="var(--bg2)" stroke-width="2"/>`;
-    const detail=`${event.label||kind} · ${Number(event.quantity||0)} acc · $${Number(event.price||0).toFixed(2)} · P&L $${Number(event.pnl_usd||0).toFixed(2)}`;
+    const detail=`${event.label||kind} · ${event.quantity==null?'N/D':Number(event.quantity)} acc · ${money(event.price)} · P&L bruto ${money(event.pnl_usd)}`;
     return `<g><title>${escHtml(detail)}</title>${shape}<text x="${ex}" y="${ey-13}" fill="${color}" text-anchor="middle" font-size="9" font-weight="800">${escHtml(event.label||kind)}</text></g>`;
   }).join('');
   const positionLine=(price,color,label,dash='6 4')=>{
@@ -2295,14 +2315,14 @@ function drawSignalChart(){
     active.tp1_hit?'':positionLine(active.tp1_price,'#22d3ee','TP1 · 70%','3 4'),
     positionLine(active.final_target,'#a78bfa','TP FINAL')
   ].join(''):'';
-  const floating=Number(active?.floating_pnl||0);
-  const pnlColor=floating>=0?'var(--green)':'var(--red)';
+  const floating=financialNumber(active?.floating_pnl);
+  const pnlColor=floating==null?'var(--txt3)':floating>=0?'var(--green)':'var(--red)';
   const pnlSign=floating>0?'+':'';
   const pnlBoxWidth=Math.min(238,Math.max(190,W-L-R-18));
   const pnlBoxX=W-R-pnlBoxWidth-8;
   const positionPnlSvg=active?`<g>
     <rect x="${pnlBoxX}" y="${T+7}" width="${pnlBoxWidth}" height="29" rx="7" fill="var(--bg3)" stroke="${pnlColor}" stroke-width="1" opacity=".96"/>
-    <text x="${pnlBoxX+pnlBoxWidth/2}" y="${T+26}" fill="${pnlColor}" text-anchor="middle" font-size="${mobileChart?11:12}" font-weight="800">P&amp;L flotante ${pnlSign}$${floating.toFixed(2)} · ${Number(active.remaining_quantity||0)}/${Number(active.initial_quantity||0)} acc</text>
+    <text x="${pnlBoxX+pnlBoxWidth/2}" y="${T+26}" fill="${pnlColor}" text-anchor="middle" font-size="${mobileChart?11:12}" font-weight="800">Est. local ${pnlSign}${money(floating)} · ${Number(active.remaining_quantity||0)}/${Number(active.initial_quantity||0)} acc</text>
   </g>`:'';
   const selectedTime=selected?[selected.date,selected.timestamp].filter(Boolean).join(' '):`${data.selected_date||S.selectedDate} · sesión 09:15–15:45`;
   const sourceLabels={local_archive:'LOCAL ARCHIVADO',historico_csv:'CSV LOCAL',schwab:'SCHWAB',schwab_live:'SCHWAB EN VIVO',local:'LOCAL'};
@@ -2310,7 +2330,7 @@ function drawSignalChart(){
   const fromLabel=new Date(minT).toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});
   const toLabel=new Date(maxT).toLocaleTimeString('es-ES',{hour:'2-digit',minute:'2-digit',hour12:false,timeZone:'America/New_York'});
   el('signalChartTitle').textContent=`${data.ticker} · ${selected?selected.tipo+' @ $'+Number(selected.precio||0).toFixed(2):active?'posición '+String(active.side||'')+' activa':S.chartMode==='live'?'precio en vivo':'precio histórico'}`;
-  const positionMeta=active?` · Entrada $${Number(active.entry_price||0).toFixed(2)} · P&L flotante ${pnlSign}$${floating.toFixed(2)}`:'';
+  const positionMeta=active?` · Entrada $${Number(active.entry_price||0).toFixed(2)} · Estimación local ${pnlSign}${money(floating)}`:'';
   el('signalChartMeta').textContent=`${selectedTime} NY · ${fromLabel}–${toLabel} · ${candles.length}/${allCandles.length} velas japonesas 1m · fuente ${sourceLabel}${positionMeta}`;
   const liveBadge=el('signalChartLiveStatus');
   if(liveBadge){
@@ -2334,6 +2354,37 @@ function drawSignalChart(){
 }
 
 // ─────────────────────────────────────────────────────────
+// BROKER-NATIVE OPEN POSITION P/L (MANUAL FETCH)
+// ─────────────────────────────────────────────────────────
+async function fetchBrokerPositionPnL(){
+  const box=el('brokerPositionPnL');
+  if(!box)return;
+  box.textContent='Consultando posiciones abiertas en Schwab…';
+  try{
+    const response=await api('/api/broker/open-position-pnl');
+    const payload=await response.json();
+    if(!response.ok||payload.status!=='ok'){
+      box.textContent='No disponible: '+String(payload.message||'Schwab no confirmó posiciones');
+      return;
+    }
+    const positions=Array.isArray(payload.positions)?payload.positions:[];
+    const known=Number(payload.known_count||0), missing=Number(payload.unknown_count||0);
+    const amount=payload.position_day_pnl;
+    const amountText=amount==null
+      ? 'Total no verificable (datos P/L incompletos)'
+      : money(Number(amount));
+    const seen=String(payload.as_of_utc||'').replace('T',' ').slice(0,19);
+    const lines=positions.map(p=>{
+      const pnl=p.broker_position_day_pnl==null?'P/L N/D':money(Number(p.broker_position_day_pnl));
+      return `${String(p.ticker||'').replace(/[^A-Z0-9.-]/g,'')} ${Number(p.quantity||0)} acc · ${pnl}`;
+    });
+    box.textContent=`Fuente SCHWAB · ${seen} UTC · Posiciones abiertas: ${positions.length} · ${amountText} · P/L disponible ${known}, no disponible ${missing}${lines.length?' · '+lines.join(' | '):''}`;
+  }catch(e){
+    box.textContent='No disponible: error consultando Schwab';
+  }
+}
+
+// ─────────────────────────────────────────────────────────
 // FETCH TRADES
 // ─────────────────────────────────────────────────────────
 async function fetchTrades(){
@@ -2348,10 +2399,10 @@ async function fetchTrades(){
       el('tr-closed').textContent = d.closed_count || 0;
       el('tr-open-mode').textContent = `PAPER ${Number(d.paper_open_count || 0)} · REAL ${Number(d.real_open_count || 0)}`;
       el('tr-closed-mode').textContent = `PAPER ${Number(d.paper_closed_count || 0)} · REAL ${Number(d.real_closed_count || 0)}`;
-      const pnl = Number(d.paper_session_pnl || 0);
-      el('tr-pnl').textContent = '$'+pnl.toFixed(2);
+      const pnl = financialNumber(d.paper_session_pnl);
+      el('tr-pnl').textContent = money(pnl);
       el('tr-pnl').style.color = pnl>=0 ? 'var(--green)':'var(--red)';
-      el('tr-pnl-detail').textContent = `Abierto ${money(Number(d.paper_unrealized_pnl || 0))} · Cerrado hoy ${money(Number(d.paper_realized_today || 0))}`;
+      el('tr-pnl-detail').textContent = `Abierto ${money(d.paper_unrealized_pnl)} · Cerrado hoy ${money(d.paper_realized_today)}`;
       renderPositions('livePositionsFeed', S.positions, false);
       renderPositions('dashTradesFeed', S.positions, true);
       renderTradeEvents('tradesFeed', S.tradeEvents.slice().reverse());
@@ -2366,54 +2417,59 @@ async function fetchTickerPerformance(){
     const r=await api('/api/ticker-performance');
     const d=await r.json();
     if(!r.ok || d.status!=='ok') throw new Error(d.message||'No disponible');
-    const rows=[...(d.rows||[])].sort((a,b)=>{
-      const ap=Math.abs(Number(a.total_pnl||0)),bp=Math.abs(Number(b.total_pnl||0));
-      if(bp!==ap) return bp-ap;
-      return String(a.ticker||'').localeCompare(String(b.ticker||''));
-    });
-    const summary=d.summary||{};
-    const total=Number(summary.total_pnl||0);
-    const realized=Number(summary.realized_pnl||0);
-    const floating=Number(summary.unrealized_pnl||0);
+    const rows=(d.rows||[]).flatMap(row=>Object.entries(row.mode_breakdown||{}).filter(
+      ([mode,b])=>mode===row.mode || b.closed_trades || b.excluded_closed_trades || b.open_positions
+    ).map(([mode,b])=>({...row,...b,mode})));
+    const summary=d.summary||{}, byMode=summary.by_mode||{};
     const sumEl=el('tickerPerfSummary');
     if(sumEl){
-      sumEl.textContent=`${d.date||'Hoy'} · ${Number(summary.signals||0)} señales · ${Number(summary.closed_trades||0)} cierres · Realizado ${money(realized)} · Flotante ${money(floating)} · Total ${money(total)}`;
-      sumEl.style.color=total>=0?'var(--green)':'var(--red)';
+      sumEl.textContent=`${d.date||'Hoy'} · ${Number(summary.signals||0)} señales de estrategia · PAPER simulado ${money(byMode.PAPER?.total_pnl)} · REAL cierres con fills (bruto) ${money(byMode.REAL?.realized_pnl)} · no P/L de cuenta Schwab`;
+      sumEl.style.color='var(--txt2)';
     }
     grid.innerHTML=rows.map(row=>{
-      const pnl=Number(row.total_pnl||0);
-      const realizedPnl=Number(row.realized_pnl||0);
-      const unrealized=Number(row.unrealized_pnl||0);
-      const pnlCls=pnl>0?'pos':pnl<0?'neg':'';
-      const mode=String(row.mode||'PAPER').toUpperCase();
+      const pnl=financialNumber(row.mode==='REAL'?row.realized_pnl:row.total_pnl);
+      const pnlCls=pnl==null?'':pnl>0?'pos':pnl<0?'neg':'';
+      const mode=String(row.mode||'UNKNOWN').toUpperCase();
+      const source=mode==='REAL'?'Cálculo local de fills · bruto, no P/L Schwab':mode==='PAPER'?'Simulación PAPER':'Modo desconocido · sin verificar';
       return `<div class="ticker-perf-card">
         <div class="ticker-perf-head">
           <div style="display:flex;align-items:center;gap:7px">
             <span class="ticker-perf-symbol notranslate" translate="no">${escHtml(row.ticker||'—')}</span>
-            <span class="pill ${mode==='REAL'?'real':'paper'}">${escHtml(mode)}</span>
+            <span class="pill ${mode==='REAL'?'real':mode==='PAPER'?'paper':''}">${escHtml(mode)}</span>
           </div>
           <span class="ticker-perf-pnl ${pnlCls}">${pnl>0?'+':''}${money(pnl)}</span>
         </div>
+        <div class="section-note">${source}</div>
         <div class="ticker-perf-meta">
-          <span>Señales <b>${Number(row.signals||0)}</b></span>
-          <span>BUY/SELL <b>${Number(row.buy_signals||0)}/${Number(row.sell_signals||0)}</b></span>
-          <span>Aprobadas <b>${Number(row.approved_signals||0)}</b></span>
-          <span>Vetadas <b>${Number(row.vetoed_signals||0)}</b></span>
-          <span>Cierres <b>${Number(row.closed_trades||0)}</b></span>
+          <span>Señales estrategia <b>${Number(row.signals||0)}</b></span>
+          <span>Aprobadas (no fills) <b>${Number(row.approved_signals||0)}</b></span>
+          <span>Cierres con evidencia <b>${Number(row.closed_trades||0)}</b></span>
           <span>W/L <b>${Number(row.wins||0)}/${Number(row.losses||0)}</b></span>
-          <span>Realizado <b>${realizedPnl>0?'+':''}${money(realizedPnl)}</b></span>
-          <span>Flotante <b>${unrealized>0?'+':''}${money(unrealized)}</b></span>
+          <span>Realizado bruto <b>${money(row.realized_pnl)}</b></span>
+          <span>${mode==='REAL'?'P/L Schwab: consulta separada':'Flotante PAPER'} <b>${mode==='REAL'?'N/D':money(row.unrealized_pnl)}</b></span>
+          <span>Sin verificar / excluidos <b>${Number(row.excluded_closed_trades||0)}</b></span>
         </div>
       </div>`;
-    }).join('') || '<div class="empty-state"><div class="es-icon">📊</div><div>Sin actividad por ticker hoy.</div></div>';
+    }).join('') || '<div class="empty-state">Sin actividad por ticker hoy.</div>';
   }catch(e){
-    grid.innerHTML=`<div class="empty-state"><div class="es-icon">⚠️</div><div>No se pudo cargar P&L por ticker: ${escHtml(e.message||e)}</div></div>`;
+    const sumEl=el('tickerPerfSummary');
+    if(sumEl) sumEl.textContent='Datos no disponibles · no se muestran totales anteriores';
+    grid.innerHTML=`<div class="empty-state">No se pudo cargar rendimiento: ${escHtml(e.message||e)}</div>`;
   }
 }
 
-function money(v){
-  const n = Number(v || 0);
-  return '$' + n.toFixed(2);
+function financialNumber(value){
+  if(value==null || value==='' || typeof value==='boolean') return null;
+  const n=Number(value);
+  return Number.isFinite(n)?n:null;
+}
+function money(value){
+  const n=financialNumber(value);
+  return n==null?'N/D':'$'+n.toFixed(2);
+}
+function positiveMoney(value){
+  const n=financialNumber(value);
+  return n!=null && n>0 ? money(n) : 'N/D';
 }
 
 function renderPositions(id, positions, compact=false){
@@ -2431,8 +2487,10 @@ function renderPositions(id, positions, compact=false){
     const plannedPartial = Number(p.planned_partial_quantity || 0);
     const plannedRemaining = Number(p.planned_remaining_quantity || 0);
     const lastPrice = Number(p.last_price || 0);
-    const floatingPnl = Number(p.floating_pnl || 0);
-    const floatingColor = floatingPnl >= 0 ? 'var(--green)' : 'var(--red)';
+    const isReal = String(p.mode).toUpperCase()==='REAL';
+    const floatingPnl = isReal ? null : financialNumber(p.floating_pnl);
+    const floatingLabel = isReal ? 'P/L Schwab: consulta separada' : 'P/L PAPER simulado';
+    const floatingColor = floatingPnl==null?'var(--txt3)':floatingPnl >= 0 ? 'var(--green)' : 'var(--red)';
     const be = Boolean(p.breakeven_active);
     if(compact){
       return `<div class="trade-row">
@@ -2442,7 +2500,7 @@ function renderPositions(id, positions, compact=false){
         <span class="sig-price">Entrada ${money(p.entry_price)}</span>
         <span class="sig-price">Actual ${lastPrice > 0 ? money(lastPrice) : '—'}</span>
         <span style="font-size:.75rem;color:var(--txt2)">${remaining}/${initial} acc</span>
-        <span style="font-family:var(--mono);font-weight:800;color:${floatingColor}">PnL ${money(floatingPnl)}</span>
+        <span style="font-family:var(--mono);font-weight:800;color:${floatingColor}">${floatingLabel} ${money(floatingPnl)}</span>
         ${be?'<span class="sig-ia">BE activo</span>':''}
       </div>`;
     }
@@ -2455,20 +2513,21 @@ function renderPositions(id, positions, compact=false){
         <span class="position-mode">${escHtml(p.mode||'')} ${escHtml((p.opened_at||'').replace('T',' '))}</span>
       </div>
       <div class="position-grid">
-        <div class="position-metric"><div class="pm-label">Cantidad inicial</div><div class="pm-value">${initial}</div></div>
+        <div class="position-metric"><div class="pm-label">Cantidad inicial / solicitada</div><div class="pm-value">${initial}</div></div>
         <div class="position-metric"><div class="pm-label">Cantidad restante</div><div class="pm-value">${remaining}</div></div>
         <div class="position-metric"><div class="pm-label">Entrada</div><div class="pm-value">${money(p.entry_price)}</div></div>
-        <div class="position-metric"><div class="pm-label">Precio actual</div><div class="pm-value">${lastPrice > 0 ? money(lastPrice) : '—'}</div></div>
-        <div class="position-metric"><div class="pm-label">PnL flotante</div><div class="pm-value" style="color:${floatingColor}">${money(floatingPnl)}</div></div>
-        <div class="position-metric"><div class="pm-label">Stop actual</div><div class="pm-value">${money(p.stop_current)}</div></div>
-        <div class="position-metric"><div class="pm-label">Objetivo final</div><div class="pm-value">${money(p.final_target)}</div></div>
+        <div class="position-metric"><div class="pm-label">Último cierre de vela</div><div class="pm-value">${lastPrice > 0 ? money(lastPrice) : '—'}</div></div>
+        <div class="position-metric"><div class="pm-label">${floatingLabel}</div><div class="pm-value" style="color:${floatingColor}">${money(floatingPnl)}</div></div>
+        <div class="position-metric"><div class="pm-label">Stop actual</div><div class="pm-value">${positiveMoney(p.stop_current)}</div></div>
+        <div class="position-metric"><div class="pm-label">Objetivo final</div><div class="pm-value">${positiveMoney(p.final_target)}</div></div>
       </div>
+      <div class="section-note">Datos del motor local · no P/L oficial Schwab · vela ${escHtml(p.market_bar_at||'N/D')} ${p.valuation_available===false?'· valoración no disponible':''}</div>
       <div class="position-progress">
-        <span>TP1: ${plannedPartial || '—'} acc @ ${money(p.tp1_price)}</span>
+        <span>TP1: ${plannedPartial || '—'} acc @ ${positiveMoney(p.tp1_price)}</span>
         <span>Parcial ejecutado: ${partialDone} acc</span>
         <span>Plan restante: ${plannedRemaining || '—'} acc</span>
         <span class="${be?'be-active':''}">Protección: ${be?'BREAK-EVEN':escHtml(p.protection_mode||'Stop inicial')}</span>
-        <span>PnL realizado: ${money(p.realized_pnl)}</span>
+        <span>Realizado local (bruto): ${String(p.mode).toUpperCase()==='REAL'?'N/D · verificar fills':money(p.realized_pnl)}</span>
       </div>
     </div>`;
   }).join('');
@@ -2487,7 +2546,9 @@ function renderTradeEvents(id, events){
     CLOSE: 'CIERRE', CLOSED: 'CIERRE'
   };
   feed.innerHTML = events.map(t => {
-    const pnl = Number(t.pnl || 0);
+    const pnl = t.pnl_verified===true ? financialNumber(t.pnl) : null;
+    const mode = String(t.mode||'UNKNOWN').toUpperCase();
+    const source = mode==='REAL'?(t.pnl_verified===true?'REAL · bruto de fills':'REAL · P/L N/D'):mode==='PAPER'?'PAPER · simulado':'SIN VERIFICAR';
     const rawEvent = String(t.evento || t.estado || 'EVENT');
     const label = labels[rawEvent] || rawEvent;
     const cssState = rawEvent==='OPEN'?'ENTRY':rawEvent;
@@ -2496,9 +2557,10 @@ function renderTradeEvents(id, events){
       <span class="trade-status ${cssState}">${escHtml(label)}</span>
       <span class="sig-badge ${escHtml(t.tipo||'BUY')}">${escHtml(t.tipo||'—')}</span>
       <span class="sig-ticker">${escHtml(t.ticker||'—')}</span>
+      <span class="section-note">${source}</span>
       <span class="sig-price">${money(t.precio)}</span>
       <span style="font-size:.75rem;color:var(--txt3)">${Number(t.acciones||0)} acc</span>
-      ${showPnl ? `<span class="trade-pnl ${pnl>=0?'pos':'neg'}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</span>` : ''}
+      ${showPnl ? `<span class="trade-pnl ${pnl==null?'':pnl>=0?'pos':'neg'}">${pnl!=null&&pnl>0?'+':''}${money(pnl)}</span>` : ''}
       <span class="sig-time">${escHtml(t.timestamp||'')}</span>
     </div>`;
   }).join('');
@@ -2513,7 +2575,8 @@ async function fetchTickerAnalysis(){
   if(!grid) return;
   const days=Number(el('tickerAnalysisDays')?.value||30);
   try{
-    const r=await api('/api/ticker-analysis?days='+encodeURIComponent(days));
+    const modeFilter=el('tickerAnalysisMode')?.value||'REAL';
+    const r=await api('/api/ticker-analysis?days='+encodeURIComponent(days)+'&mode='+encodeURIComponent(modeFilter));
     const d=await r.json();
     if(!r.ok || d.status!=='ok') throw new Error(d.message||'No disponible');
     const rows=[...(d.rows||[])];
@@ -2521,21 +2584,21 @@ async function fetchTickerAnalysis(){
     const top=String(summary.top_ticker||'');
     const sumEl=el('tickerAnalysisSummary');
     if(sumEl){
-      sumEl.textContent=`${d.lookback_days||days} días · mínimo ${d.min_closed_trades||10} cierres · ${Number(summary.eligible||0)} elegibles · ${Number(summary.low_sample||0)} con muestra baja${top?' · mejor evidencia actual: '+top:''}`;
+      sumEl.textContent=`${d.evidence_mode||modeFilter} · ${d.lookback_days||days} días · mínimo ${d.min_closed_trades||10} cierres · ${Number(summary.eligible||0)} elegibles · ${Number(summary.low_sample||0)} con muestra baja${top?' · mejor evidencia actual: '+top:''}`;
     }
     grid.innerHTML=rows.map(row=>{
       const rank=row.rank==null?'—':'#'+Number(row.rank);
       const eligible=!!row.sample_eligible;
       const win=row.win_rate_pct==null?'—':Number(row.win_rate_pct).toFixed(1)+'%';
-      const wilson=Number(row.win_rate_wilson_lb_pct||0).toFixed(1)+'%';
+      const wilson=row.win_rate_wilson_lb_pct==null?'N/D':Number(row.win_rate_wilson_lb_pct).toFixed(1)+'%';
       const pf=row.profit_factor==null?'—':(Number(row.profit_factor)>=999?'∞':Number(row.profit_factor).toFixed(2));
-      const net=Number(row.net_pnl||0);
-      const ret=Number(row.net_return_pct||0);
+      const net=financialNumber(row.net_pnl);
+      const ret=financialNumber(row.net_return_pct);
       const candidateBA=row.model_candidate_ba_pct==null?'—':Number(row.model_candidate_ba_pct).toFixed(1)+'%';
       const incumbentBA=row.model_incumbent_ba_pct==null?'—':Number(row.model_incumbent_ba_pct).toFixed(1)+'%';
       const mode=String(row.mode||'PAPER').toUpperCase();
       const topCls=Number(row.rank||0)===1?' top':'';
-      const badge=eligible?(row.review_candidate?'REVISAR':'ELEGIBLE'):'MUESTRA BAJA';
+      const badge=row.excluded_closed_trades?'EVIDENCIA INCOMPLETA':eligible?(row.review_candidate?'REVISAR':'ELEGIBLE'):'MUESTRA BAJA';
       return `<div class="accuracy-card${topCls}">
         <div class="accuracy-head">
           <div style="display:flex;align-items:center;gap:7px">
@@ -2550,14 +2613,15 @@ async function fetchTickerAnalysis(){
           <span>W/L/N <b>${Number(row.wins||0)}/${Number(row.losses||0)}/${Number(row.neutral||0)}</b></span>
           <span>Wilson 95% <b>${wilson}</b></span>
           <span>Profit factor <b>${pf}</b></span>
-          <span>P&amp;L neto <b style="color:${net>=0?'var(--green)':'var(--red)'}">${net>0?'+':''}${money(net)}</b></span>
-          <span>Retorno norm. <b>${ret>0?'+':''}${ret.toFixed(3)}%</b></span>
-          <span>PAPER/REAL <b>${Number(row.paper_closed||0)}/${Number(row.real_closed||0)}</b></span>
+          <span>P&amp;L bruto local <b style="color:${net>=0?'var(--green)':'var(--red)'}">${net>0?'+':''}${money(net)}</b></span>
+          <span>Retorno norm. <b>${ret==null?'N/D':(ret>0?'+':'')+ret.toFixed(3)+'%'}</b></span>
+          <span>Excluidos sin verificar <b>${Number(row.excluded_closed_trades||0)}</b></span>
+          <span>Ruta actual <b>${escHtml(row.configured_mode||'UNKNOWN')}</b></span>
           <span>BA cand/inc <b>${candidateBA} / ${incumbentBA}</b></span>
           <span>Vetos útiles/perdidos <b>${Number(row.veto_good||0)}/${Number(row.veto_bad||0)}</b></span>
           <span>Estado <b>${badge}</b></span>
         </div>
-        <div class="accuracy-note">${eligible?'Ranking basado en evidencia reciente ejecutada; requiere revisión manual antes de cambiar a REAL.':`Aún no entra al ranking: requiere al menos ${Number(row.min_closed_trades||10)} cierres decisivos.`}</div>
+        <div class="accuracy-note">${row.excluded_closed_trades?'Excluido del ranking: hay registros sin evidencia verificable.':eligible?'Cálculo bruto local del modo seleccionado, no P/L oficial Schwab. Requiere revisión manual.':`Aún no entra al ranking: requiere al menos ${Number(row.min_closed_trades||10)} cierres decisivos.`}</div>
       </div>`;
     }).join('') || '<div class="empty-state"><div class="es-icon">🧭</div><div>Sin cierres suficientes para analizar.</div></div>';
   }catch(e){
@@ -2571,31 +2635,35 @@ async function fetchHistorial(){
     const d = await r.json();
     if(d.status !== 'ok'){ return; }
     const ops = d.operaciones || [];
-    const closed = ops.filter(o => String(o.evento||'POSITION_CLOSE').toUpperCase()==='POSITION_CLOSE');
-    let win=0, loss=0, pnl=0;
+    const closed = ops.filter(o => String(o.evento||'POSITION_CLOSE').toUpperCase()==='POSITION_CLOSE' && o.performance_verified===true);
+    let win=0, loss=0;
     closed.forEach(o => {
-      pnl += parseFloat(o.pnl_usd||0);
       if((o.resultado||'')==='GANADA') win++;
       else if((o.resultado||'')==='PERDIDA') loss++;
     });
     el('h-total').textContent = d.total || closed.length;
     el('h-win').textContent   = win;
     el('h-loss').textContent  = loss;
-    el('h-pnl').textContent   = '$'+pnl.toFixed(2);
-    el('h-pnl').style.color   = pnl>=0 ? 'var(--green)':'var(--red)';
+    const paperPnl=closed.filter(o=>o.modo==='PAPER').reduce((sum,o)=>sum+Number(o.display_pnl_usd),0);
+    const realPnl=closed.filter(o=>o.modo==='REAL').reduce((sum,o)=>sum+Number(o.display_pnl_usd),0);
+    const realUnknown=ops.some(o=>o.modo==='REAL' && o.evento==='POSITION_CLOSE' && !o.performance_verified);
+    el('h-pnl').textContent = `PAPER ${money(paperPnl)} · REAL ${realUnknown?'N/D':money(realPnl)}`;
+    el('h-pnl').title='Cálculo bruto local · no P/L Schwab · excluidos '+Number(d.excluded_closed_count||0);
+    el('h-pnl').style.color = 'var(--txt2)';
     const body = el('histBody');
     if(!ops.length){
       body.innerHTML = '<tr><td colspan="16"><div class="empty-state"><div class="es-icon">📒</div><div>Sin eventos de posición todavía.</div></div></td></tr>';
       return;
     }
     body.innerHTML = ops.map(o => {
-      const p = parseFloat(o.pnl_usd||0);
+      const p = financialNumber(o.display_pnl_usd);
+      const unverifiedReal=o.modo==='REAL' && o.performance_verified!==true;
       const isClose=String(o.evento||'POSITION_CLOSE').toUpperCase()==='POSITION_CLOSE';
       const rcls = (o.resultado||'')==='GANADA' ? 'hist-win' : ((o.resultado||'')==='PERDIDA'?'hist-loss':'');
       const state=`${o.state_before||'—'} → ${o.state_after||'—'}`;
-      const entry=o.entrada===''?'—':'$'+parseFloat(o.entrada||0).toFixed(2);
-      const exit=o.salida===''?'—':'$'+parseFloat(o.salida||0).toFixed(2);
-      const pnlText=isClose?`${p>=0?'+':''}$${p.toFixed(2)}`:'—';
+      const entry=unverifiedReal?'N/D':positiveMoney(o.entrada);
+      const exit=unverifiedReal?'N/D':positiveMoney(o.salida);
+      const pnlText=isClose?money(p):'—';
       const reversal=o.reversal_id||'';
       return `<tr>
         <td>${escHtml(o.fecha||'')}</td><td>${escHtml(o.hora_ny||'')}</td>
@@ -2604,8 +2672,8 @@ async function fetchHistorial(){
         <td>${escHtml(o.signal_side||'—')}</td><td>${escHtml(o.order_action||'—')}</td>
         <td>${entry}</td><td>${exit}</td><td>${escHtml(o.cantidad||'0')}</td>
         <td class="${isClose?(p>=0?'hist-win':'hist-loss'):''}">${pnlText}</td>
-        <td class="${rcls}">${escHtml(o.resultado||'—')}</td>
-        <td>${escHtml(o.motivo||'')}</td>
+        <td class="${rcls}">${unverifiedReal?'SIN VERIFICAR':escHtml(o.resultado||'—')}</td>
+        <td>${escHtml(o.performance_exclusion_reason||o.motivo||'')}</td>
         <td title="${escHtml(reversal)}">${escHtml(reversal?reversal.slice(-12):'—')}</td>
         <td>${escHtml(o.modo||'')}</td>
       </tr>`;
@@ -2987,11 +3055,28 @@ function renderAILearningSummary(data){
   setText('aiLearningPolicy',`Fuentes: cierres REAL + PAPER verificados y señales resueltas de menor peso. Revisión: ${aiCountText(data.warning_samples)} cierres nuevos; reentrenamiento: ${aiCountText(data.retrain_samples)}. ${data.automatic_retraining ? schedule : 'Inicio manual'}.`);
 }
 
+function renderAutoAIControl(data){
+  const enabled=data && typeof data.automatic_retraining === 'boolean' ? data.automatic_retraining : null;
+  S.autoAIEnabled=enabled;
+  const button=el('autoAIButton'), detail=el('autoAIState');
+  if(button){
+    button.disabled=enabled == null || !!S.autoAISaving;
+    button.textContent=enabled == null ? 'Auto IA: estado desconocido' : (enabled ? 'Desactivar Auto IA' : 'Activar Auto IA');
+  }
+  if(detail){
+    if(enabled == null){detail.textContent='No se pudo verificar Auto IA; vuelve a consultar el estado.';return;}
+    const policy=data.auto_ai_policy || {}, service=data.auto_ai_service || {};
+    const waiting=service.message || (enabled ? 'Esperando comprobación del worker' : 'Entrenamiento manual disponible');
+    detail.textContent=`Auto IA ${enabled ? 'ON' : 'OFF'} · ${waiting} · L–V desde ${policy.not_before_ny || '16:15'} NY, con motor detenido · Sólo SHADOW; producción requiere aprobación manual.${service.next_window_ny ? ` Próxima ventana: ${service.next_window_ny}.` : ''}`;
+  }
+}
+
 async function fetchAIStatus(){
   try {
     const r = await api('/api/ai/status');
     const d = await r.json();
-    if(d.status !== 'ok') return;
+    if(d.status !== 'ok'){renderAutoAIControl(null);return;}
+    renderAutoAIControl(d);
     S.aiStatus = d.tickers || [];
     renderAILearningSummary(d);
     const sum = d.summary || {};
@@ -3117,19 +3202,50 @@ async function fetchAIStatus(){
       </tr>`;
     }).join('') || '<tr><td colspan="20">Sin estado disponible</td></tr>';
     if(S.tickerExecution.length) renderTickerExecution();
-  } catch(e){}
+  } catch(e){renderAutoAIControl(null);}
 }
 
 // ─────────────────────────────────────────────────────────
 // AI TRAINING
 // ─────────────────────────────────────────────────────────
+async function toggleAutoAI(){
+  if(typeof S.autoAIEnabled !== 'boolean' || S.autoAISaving) return;
+  const enabled=!S.autoAIEnabled;
+  S.autoAISaving=true;
+  const button=el('autoAIButton');
+  if(button) button.disabled=true;
+  try{
+    const r=await api('/api/ai/automatic',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
+    const d=await r.json();
+    if(!r.ok || d.status !== 'ok') throw new Error(d.message || 'No se pudo guardar Auto IA');
+    renderAutoAIControl({automatic_retraining:d.policy.enabled,auto_ai_policy:d.policy,auto_ai_service:d.service});
+    toast('ok',d.policy.enabled ? 'Auto IA activado' : 'Auto IA desactivado',
+      d.policy.enabled ? 'Evaluará pendientes después de la sesión con el motor detenido. Sólo SHADOW.' : 'No se iniciarán nuevos tickers automáticos. El ticker en curso puede terminar.');
+    await fetchAIStatus();
+  }catch(e){
+    renderAutoAIControl(null);
+    toast('err','Auto IA no confirmado',e.message || 'Consulta el estado antes de reintentar');
+  }finally{
+    S.autoAISaving=false;
+    if(button) button.disabled=typeof S.autoAIEnabled !== 'boolean';
+  }
+}
+
 async function triggerTraining(){
   try {
     const r = await api('/api/ai/train',{method:'POST'});
     const d = await r.json();
-    if(r.ok) toast('ok','Entrenamiento iniciado 🧠',d.message);
-    else toast('err','Entrenamiento no iniciado',d.message || 'No hay tickers elegibles');
-    setTimeout(fetchAIStatus, 1000);
+    if(r.ok) {
+      toast('ok','Evaluación SHADOW en cola 🧠',d.message || 'Iniciada manualmente');
+      // The worker updates lifecycle asynchronously. Never imply that the
+      // candidate was accepted or made PRODUCTION by an HTTP 200 response.
+      setTimeout(fetchAIStatus, 1000);
+      setTimeout(fetchAIStatus, 5000);
+      setTimeout(fetchAIStatus, 15000);
+    } else {
+      toast('err','Entrenamiento no iniciado',d.message || 'No hay tickers con 50 cierres nuevos');
+      setTimeout(fetchAIStatus, 1000);
+    }
   } catch(e){ toast('err','Error','No se pudo iniciar el entrenamiento'); }
 }
 
@@ -3937,3 +4053,4 @@ setInterval(checkSchwabStatus, 30000);
 </dialog>
 </body>
 </html>
+

@@ -138,10 +138,10 @@ class EntrenadorAgentes:
         self.reentrenar_cada_n: int = int(cfg.get("reentrenar_cada_n", 50))
         self.auto_retrain_enabled: bool = bool(
             auto_cfg.get("enabled", self.activo))
-        self.auto_retrain_only_after_session: bool = bool(
-            auto_cfg.get("only_after_session", False))
-        self.auto_activate_production: bool = bool(
-            auto_cfg.get("auto_activate_production", False))
+        self.auto_retrain_only_after_session: bool = True
+        self.auto_activate_production: bool = False
+        self._automatic_training_config = config
+        self._eligible_batch_running = False
         self.retrain_warning_samples: int = int(
             auto_cfg.get("warning_samples", 30))
         self.retrain_trigger_samples: int = int(
@@ -373,12 +373,26 @@ class EntrenadorAgentes:
     # ENTRENAMIENTO (por ticker)
     # =========================================================
 
+    def _automatic_training_allowed(self):
+        if not self.auto_retrain_enabled:
+            return False
+        callback = getattr(self, "automatic_training_allowed", None)
+        try:
+            if callable(callback):
+                return bool(callback())
+            config = getattr(self, "_automatic_training_config", None)
+            if config is not None:
+                from core.auto_ai import window
+                return window(config, datetime.now(timezone.utc))[0]
+            return True
+        except Exception:
+            return False
+
     def quizas_reentrenar_ticker(self, ticker: str, total_cerradas_ticker: int) -> Optional[dict]:
         """Update the per-ticker counter and schedule only when policy permits.
 
-        In v2.1 the default deployment is end-of-session only.  Legacy configs
-        without ``automatic_retraining.only_after_session`` retain the former
-        background behavior for backwards compatibility.
+        Automatic training is post-session SHADOW evaluation. Production
+        activation remains an explicit, separate approval operation.
         """
         ticker = str(ticker or "").upper()
         if not ticker:
@@ -419,11 +433,13 @@ class EntrenadorAgentes:
         metricas = None
         
         try:
+            if not self._automatic_training_allowed():
+                return
             self.retraining.mark_training(ticker, total_count)
 
             metricas = self.entrenar_ticker(
                 ticker,
-                allow_production_activation=self.auto_activate_production,
+                allow_production_activation=False,
                 automatic=True,
             )
             accepted = bool(metricas and metricas.get("shadow_candidate_accepted"))
@@ -628,13 +644,15 @@ class EntrenadorAgentes:
         self,
         ticker: str,
         *,
-        allow_production_activation: bool = True,
+        allow_production_activation: bool = False,
         automatic: bool = False,
     ) -> Optional[dict]:
         """
         Entrena el modelo XGBoost de UN ticker con SOLO sus filas del CSV de
-        feedback y lo activa en caliente. Devuelve métricas o None.
+        feedback y evalúa un candidato SHADOW. Devuelve métricas o None.
         """
+        if automatic:
+            allow_production_activation = False
         if not ticker or not os.path.exists(self.feedback_path):
             return None
         try:
@@ -1047,7 +1065,7 @@ class EntrenadorAgentes:
     ) -> dict:
         """Train all requested tickers while preserving the production safety gate."""
         if allow_production_activation is None:
-            allow_production_activation = bool(self.activo and self.umbral_meta > 0)
+            allow_production_activation = False
         res = {}
         diagnostico = {}
         esquema_features = False
@@ -1124,35 +1142,68 @@ class EntrenadorAgentes:
         tickers,
         *,
         solo_elegibles: bool = False,
+        manual_request: bool = False,
     ) -> bool:
-        """Schedule retraining without blocking the trading engine.
+        """Schedule strictly eligible SHADOW training without enabling auto AI.
 
-        ``solo_elegibles=True`` is used by the end-of-session workflow and
-        trains only tickers that accumulated the configured 50 new observations.
-        The manual dashboard action keeps the explicit all-ticker behavior.
+        The scheduler must honor automatic_retraining.enabled. A deliberate
+        dashboard manual request may run while Auto IA is OFF, but STILL uses
+        eligible_tickers/x50 and the normal FIT/VALIDATION/TEST gates.
+        API /api/ai/train checks that the REAL engine is stopped first.
         """
         lista = list(dict.fromkeys(str(t).upper() for t in (tickers or []) if str(t).strip()))
         if solo_elegibles:
-            if not self.auto_retrain_enabled:
+            # Auto IA OFF disables unattended scheduled retraining, NOT the
+            # operator's explicit manual "Reentrenar pendientes" action.
+            if not manual_request and not self._automatic_training_allowed():
                 return False
             lista = self.retraining.eligible_tickers(lista)
         elif not self.activo and not self.shadow_enabled:
             return False
         if not lista:
             return False
-        target = self._retrain_eligible_batch if solo_elegibles else self.entrenar_todos
-        threading.Thread(
-            target=target,
-            args=(lista,),
-            name="retrain-fin-sesion" if solo_elegibles else "retrain-manual",
-            daemon=not solo_elegibles,
-        ).start()
+        target = self._retrain_eligible_batch if solo_elegibles else self._retrain_all_batch
+        # The explicit manual review path is SHADOW-only regardless of any
+        # unattended production-activation configuration.
+        worker_args = (lista, True) if solo_elegibles and manual_request else (lista,)
+        with self._lock:
+            if getattr(self, "_eligible_batch_running", False) or self._entrenando:
+                return False
+            self._eligible_batch_running = True
+        try:
+            threading.Thread(
+                target=target,
+                args=worker_args,
+                name=("retrain-manual-shadow" if manual_request else
+                      "retrain-fin-sesion" if solo_elegibles else "retrain-manual"),
+                daemon=not solo_elegibles,
+            ).start()
+        except Exception:
+            with self._lock:
+                self._eligible_batch_running = False
+            return False
         return True
 
-    def _retrain_eligible_batch(self, tickers) -> dict:
+    def _retrain_eligible_batch(self, tickers, manual_request: bool = False) -> dict:
+        try:
+            return self._retrain_eligible_batch_impl(tickers, manual_request)
+        finally:
+            with self._lock:
+                self._eligible_batch_running = False
+
+    def _retrain_all_batch(self, tickers):
+        try:
+            return self.entrenar_todos(tickers, allow_production_activation=False)
+        finally:
+            with self._lock:
+                self._eligible_batch_running = False
+
+    def _retrain_eligible_batch_impl(self, tickers, manual_request: bool = False) -> dict:
         results = {}
 
         for ticker in tickers:
+            if not manual_request and not self._automatic_training_allowed():
+                break
             ticker = str(ticker or "").upper()
             if not ticker:
                 continue
@@ -1190,7 +1241,7 @@ class EntrenadorAgentes:
 
                 metrics = self.entrenar_ticker(
                     ticker,
-                    allow_production_activation=self.auto_activate_production,
+                    allow_production_activation=False,
                     automatic=True,
                 )
 
@@ -1746,3 +1797,4 @@ class EntrenadorAgentes:
         except Exception as e:
             print(f"[Agentes] Error guardando el modelo de {ticker}: {e}")
             return False
+
