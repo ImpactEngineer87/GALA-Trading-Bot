@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.14</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.15</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -643,6 +643,7 @@
   <!-- ══ DASHBOARD PAGE ══════════════════════════════════ -->
   <div class="page active" id="page-dashboard">
     <div class="page-title">📊 Dashboard de Trading</div>
+    <div class="section-note" id="engineRuntimeStatus" role="status">Inicio del hilo: sin consultar · ACTIVO no confirma envíos ni fills.</div>
     <div class="page-sub">Visión general del sistema en tiempo real</div>
 
     <!-- Stats Row -->
@@ -1595,18 +1596,18 @@ async function toggleBot(el){
       toast('err','Control del Bot',d.message || 'Operación bloqueada');
       return;
     }
-    updateBotUI(d.running);
+    updateBotUI(d.running,d.engine_runtime);
     if(d.running) toast('ok','Bot Activado',d.message || 'El bot está monitorizando el mercado');
     else if(d.automatic_resume === 'next_session')
       toast('info','Bot Detenido','Automático suspendido hasta la próxima sesión');
     else toast('info','Bot Detenido','El bot ha sido pausado');
   } catch(e){ el.checked = !el.checked; toast('err','Error',String(e)); }
 }
-function updateBotUI(running){
+function updateBotUI(running,runtime){
   S.botRunning = running;
   document.getElementById('botToggle').checked = running;
   const s = document.getElementById('botStatus');
-  s.textContent = running ? 'ACTIVO' : 'PARADO';
+  s.textContent = runtime?.state==='FAILED' ? 'ERROR MOTOR' : runtime?.state==='STARTING' ? 'INICIANDO' : running ? 'ACTIVO' : 'PARADO';
   s.className = 'bot-status ' + (running ? 'on' : 'off');
 }
 
@@ -1617,8 +1618,12 @@ async function fetchStatus(){
   try {
     const r = await api('/api/status');
     const d = await r.json();
+    if(!r.ok || d.status!=='ok') throw new Error('Estado no disponible');
     if(d.status === 'ok'){
-      updateBotUI(d.bot.running);
+      el('botToggle').disabled=false;
+      updateBotUI(d.bot.running,d.bot.engine_runtime);
+      const runtime=d.bot.engine_runtime||{}, runtimeEl=el('engineRuntimeStatus');
+      if(runtimeEl) runtimeEl.textContent=`Servidor ${d.bot.server_version||'sin verificar'} · Inicio del hilo (NY): ${runtime.thread_started_at_ny||'sin registro en este proceso'} · Estado: ${runtime.state||'sin verificar'}${runtime.last_error_code?' · '+runtime.last_error_code:''} · ACTIVO no confirma envíos ni fills.`;
       const stats = d.stats || {};
       el('stBuy').textContent   = stats.buy   || 0;
       el('stSell').textContent  = stats.sell  || 0;
@@ -1641,7 +1646,14 @@ async function fetchStatus(){
       updateSchedulerStatus(d.scheduler || {});
       updateBrokerReconciliation(d.broker_reconciliation || {});
     }
-  } catch(e){}
+  } catch(e){
+    el('botStatus').textContent='SIN CONEXIÓN';
+    el('botStatus').className='bot-status off';
+    el('botToggle').disabled=true;
+    el('engineRuntimeStatus').textContent='Estado del motor no verificable. No confirma parada ni cuenta plana; revise Schwab y el servicio.';
+    for(const id of ['stTrades','stPnl','dailyRiskNet','dailyRiskRoom']) el(id).textContent='N/D';
+    el('dailyRiskState').textContent='Estado de riesgo no verificable desde el panel';
+  }
 }
 
 function updateDailyRisk(risk){
@@ -1753,6 +1765,7 @@ async function fetchSignals(){
   try {
     const r = await api('/api/signals?limit=2000');
     const d = await r.json();
+    if(!r.ok || d.status!=='ok') throw new Error('Señales no disponibles');
     if(d.status === 'ok'){
       const sigs = d.signals || [];
       S.signals = sigs;
@@ -1770,7 +1783,14 @@ async function fetchSignals(){
       renderSignalFeed('dashSignalFeed', sigs.slice().reverse().slice(0,6));
       updateTickerSignalBadges(sigs);
     }
-  } catch(e){}
+  } catch(e){
+    for(const id of ['allSignalFeed','dashSignalFeed']){
+      const feed=el(id);
+      if(feed) feed.innerHTML='<div class="empty-state">Señales y ejecución no verificables en esta consulta.</div>';
+    }
+    const count=el('signalHistoryCount');
+    if(count) count.textContent='Consulta no disponible · no se confirma el estado de órdenes';
+  }
 }
 
 function renderSignalFeed(id, sigs){
@@ -1794,15 +1814,17 @@ function renderSignalFeed(id, sigs){
          onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openSignalChart(this.dataset.ticker,this.dataset.signalId)}">
       <span class="sig-badge ${tipo}">${tipo}</span>
       <span class="sig-ticker">${ticker||'—'}</span>
-      <span class="sig-price">$${parseFloat(s.precio||0).toFixed(2)}</span>
+      <span class="sig-price" title="Referencia de estrategia; no es precio de ejecución">Señal ${positiveMoney(s.precio)}</span>
       <span class="sig-ia">${
         s.prob_ia == null
           ? 'IA: N/A'
           : `IA: ${(s.prob_ia*100).toFixed(0)}%${threshold == null ? '' : ` / umbral:${(Number(threshold)*100).toFixed(0)}%`}`
       }</span>
       <span class="pill ${String(s.ai_decision||'').includes('VETO') || String(s.ai_decision||'').includes('BLOCKED') ? 'real' : 'paper'}" title="${escHtml(s.motivo||'')}">${escHtml(s.ai_decision||s.motivo||'SEÑAL')}</span>
+      <span class="pill" title="Registro local enlazado por señal, fecha, ticker y modo; no consulta de órdenes en vivo">${escHtml(s.execution_mode||'Modo sin verificar')} · ${escHtml(s.execution_evidence?.label||'Ejecución sin verificar')}${s.execution_evidence?.reason_code?' · '+escHtml(s.execution_evidence.reason_code):''}</span>
       <details style="max-width:100%;font-size:.72rem"><summary>Por qué / modelo</summary>
         <div>${escHtml(s.motivo || 'Sin motivo registrado')}</div>
+        <div>IA aprobada no confirma envío/fill. ${escHtml(s.execution_evidence?.label||'Sin evidencia enlazada')}. Referencia de señal: no es precio de ejecución.</div>
         <div>Modelo: ${escHtml((s.ai_context||{}).model_version || 'N/A')} · ${escHtml((s.ai_context||{}).model_tier || 'N/A')}</div>
         <div>Balanced accuracy: ${(s.ai_context||{}).balanced_accuracy == null ? 'N/A' : Number(s.ai_context.balanced_accuracy).toFixed(2)+'%'} · Régimen: ${escHtml((s.ai_context||{}).market_regime || 'N/A')}</div>
         <div>Probabilidad del modelo: ${(s.ai_context||{}).raw_probability == null ? 'N/A' : (Number(s.ai_context.raw_probability)*100).toFixed(2)+'%'} · Estado: ${escHtml((s.ai_context||{}).production_status || 'N/A')}</div>
@@ -2391,8 +2413,10 @@ async function fetchTrades(){
   try {
     const r = await api('/api/trades');
     const d = await r.json();
+    if(!r.ok || d.status!=='ok') throw new Error('Posiciones no disponibles');
     if(d.status === 'ok'){
       S.positions = d.positions || [];
+      S.positionsAvailable=true;
       S.tradeEvents = d.events || d.trades || [];
       S.trades = S.tradeEvents;
       el('tr-open').textContent   = S.positions.length;
@@ -2407,7 +2431,16 @@ async function fetchTrades(){
       renderPositions('dashTradesFeed', S.positions, true);
       renderTradeEvents('tradesFeed', S.tradeEvents.slice().reverse());
     }
-  } catch(e){}
+  } catch(e){
+    S.positions=[];
+    S.positionsAvailable=false;
+    for(const id of ['livePositionsFeed','dashTradesFeed']){
+      const feed=el(id);
+      if(feed) feed.innerHTML='<div class="empty-state">Posiciones no verificables · no implica cuenta plana. Consulte Schwab.</div>';
+    }
+    for(const id of ['tr-open','tr-closed','tr-pnl']) el(id).textContent='N/D';
+    for(const id of ['tr-open-mode','tr-closed-mode','tr-pnl-detail']) el(id).textContent='Sin verificar';
+  }
 }
 
 async function fetchTickerPerformance(){

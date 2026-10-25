@@ -13,6 +13,7 @@ aur dashboard par real-time dikhte hain.
 import os
 import sys
 import json
+import csv
 import queue
 import sqlite3
 import yaml
@@ -46,10 +47,16 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() not in ('utf-8', 'utf8'):
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
+try:
+    with open(os.path.join(BASE_DIR, "VERSION"), encoding="utf-8") as _version_handle:
+        _SERVER_VERSION = _version_handle.read().strip()
+except OSError:
+    _SERVER_VERSION = "unknown"
 
 from core.daily_loss_guard import DailyLossGuard
 from core.auto_ai import AutoAIService, policy as auto_ai_policy, update_enabled as update_auto_ai_enabled, training_busy
 from core.runtime_store import path_lock
+from core.signal_execution_evidence import annotate_signals, read_signal_audit
 from core.ticker_execution import TickerExecutionRegistry
 from core.live_capacity import max_real_tickers as real_ticker_limit
 from core.runtime_reliability import (
@@ -2627,6 +2634,8 @@ def get_status():
         "status": "ok",
         "bot": {
             "running":          BOT_STATE["running"],
+            "engine_runtime":   _engine_runtime_snapshot(),
+            "server_version":   _SERVER_VERSION,
             "mode":             BOT_STATE["mode"],
             "tickers":          BOT_STATE["tickers"],
             "timestamp":        datetime.now().isoformat(),
@@ -2672,6 +2681,24 @@ def reconcile_broker_read_only():
 _ENGINE = None
 _engine_thread = None
 _ENGINE_CONTROL_LOCK = threading.RLock()
+_ENGINE_RUNTIME_LOCK = threading.RLock()
+_ENGINE_RUNTIME = {"state": "NOT_STARTED", "thread_started_at_utc": None,
+                   "thread_ended_at_utc": None, "last_error_code": None}
+
+
+def _engine_runtime_snapshot():
+    from zoneinfo import ZoneInfo
+    with _ENGINE_RUNTIME_LOCK:
+        result = dict(_ENGINE_RUNTIME)
+    thread = _engine_thread
+    result['thread_alive'] = bool(thread is not None and thread.is_alive())
+    for name in ('thread_started_at', 'thread_ended_at'):
+        value = result.get(name + '_utc')
+        result[name + '_ny'] = (
+            datetime.fromisoformat(value).astimezone(ZoneInfo('America/New_York')).isoformat()
+            if value else None)
+    result['scope'] = 'Current process thread lifecycle; not proof of submitted/filled orders'
+    return result
 _STARTUP_QUARANTINE = {}
 _SCHEDULER = None
 _AI_STATUS_TRAINER = None
@@ -2709,7 +2736,7 @@ def _hook_log(nivel, mensaje):
 
 def _start_engine(mode: str, capital: float):
     """Instancia el motor real y lo arranca en un hilo de background."""
-    global _ENGINE, _engine_thread
+    global _ENGINE, _engine_thread, _ENGINE_RUNTIME
     from engine.bot_engine import ChocoletraBot
 
     bot = ChocoletraBot(CONFIG_PATH)
@@ -2748,18 +2775,45 @@ def _start_engine(mode: str, capital: float):
     bot.account_number = BOT_STATE.get("account_number", "") or get_env("SCHWAB_ACCOUNT_NUMBER", "")
     tickers = list(BOT_STATE.get("tickers") or bot.TICKERS_DEFAULT)
 
-    _ENGINE = bot
+    runtime = {'state': 'STARTING', 'thread_started_at_utc': None,
+               'thread_ended_at_utc': None, 'last_error_code': None}
+    with _ENGINE_RUNTIME_LOCK:
+        _ENGINE = bot
+        _ENGINE_RUNTIME = runtime
+        # Publish BEFORE starting the runner. A fast failure must not be
+        # overwritten by the controller after the runner has set False.
+        BOT_STATE['running'] = True
 
     def _runner():
+        failed = False
+        with _ENGINE_RUNTIME_LOCK:
+            runtime['state'] = 'THREAD_RUNNING'
+            runtime['thread_started_at_utc'] = datetime.now(timezone.utc).isoformat()
         try:
+            _log('INFO', f'[Motor] HILO INICIADO (modo: {mode.upper()})')
             bot.iniciar(tickers=tickers, account_number=bot.account_number, capital=capital)
         except Exception as e:
+            failed = True
             _log("ERROR", f"[Motor] Terminó con error: {e}")
         finally:
-            BOT_STATE["running"] = False
+            with _ENGINE_RUNTIME_LOCK:
+                runtime.update(state='FAILED' if failed else 'STOPPED',
+                    thread_ended_at_utc=datetime.now(timezone.utc).isoformat(),
+                    last_error_code='ENGINE_RUNTIME_ERROR' if failed else None)
+                if _ENGINE is bot and _ENGINE_RUNTIME is runtime:
+                    BOT_STATE["running"] = False
+            _log('ERROR' if failed else 'INFO',
+                 '[Motor] HILO TERMINADO: ' + ('FAILED' if failed else 'STOPPED'))
 
     _engine_thread = threading.Thread(target=_runner, daemon=True, name="ChocoletraEngine")
-    _engine_thread.start()
+    try:
+        _engine_thread.start()
+    except Exception:
+        with _ENGINE_RUNTIME_LOCK:
+            runtime.update(state='FAILED', last_error_code='ENGINE_THREAD_START_ERROR',
+                           thread_ended_at_utc=datetime.now(timezone.utc).isoformat())
+            BOT_STATE['running'] = False
+        raise
 
 
 def _read_config_runtime() -> dict:
@@ -3056,7 +3110,8 @@ def _start_engine_controlled(source: str, capital: float = None):
         BOT_STATE["mode"] = modo
         BOT_STATE["capital"] = capital_real
         _start_engine(modo, capital_real)
-        BOT_STATE["running"] = True
+        if not BOT_STATE['running']:
+            return False, 'El hilo del motor terminó durante el arranque; revise Logs y estado del motor'
         origen = "horario automático" if source == "scheduler" else "dashboard"
         _log(
             "INFO",
@@ -3193,7 +3248,8 @@ def start_bot():
             }), 400
         return jsonify({
             "status": "ok",
-            "running": True,
+            "running": bool(BOT_STATE['running']),
+            "engine_runtime": _engine_runtime_snapshot(),
             "mode": BOT_STATE["mode"],
             "message": mensaje,
         })
@@ -3228,9 +3284,14 @@ def get_signals():
     if not all_rows and not ticker:
         with _SIGNAL_LOCK:
             all_rows = list(BOT_STATE["signals"])
+    selected = all_rows[-limit:]
+    try:
+        audit, available = read_signal_audit(_order_audit_path(), selected)
+    except (OSError, ValueError, csv.Error):
+        audit, available = [], False
     return jsonify({
         "status":  "ok",
-        "signals": all_rows[-limit:],
+        "signals": annotate_signals(selected, audit, audit_available=available),
         "total": len(all_rows),
         "persistent": True,
         "counts": _signal_counts(all_rows),
