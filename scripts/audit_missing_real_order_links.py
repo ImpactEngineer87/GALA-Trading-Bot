@@ -14,6 +14,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import sys
 import tempfile
@@ -38,6 +39,13 @@ def ny_time(value):
         return parsed.astimezone(NY).isoformat() if parsed.tzinfo else None
     except (ValueError, TypeError, OverflowError):
         return None
+
+
+def positive(value):
+    try:
+        return not isinstance(value, bool) and math.isfinite(float(value)) and float(value) > 0
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def broker_rows(orders, day, fill_evidence, order_index):
@@ -68,7 +76,7 @@ def broker_rows(orders, day, fill_evidence, order_index):
             unsupported += 1
             continue
         leg = target_legs[0]
-        times = set()
+        times, activity_times = set(), set()
         for activity in order.get("orderActivityCollection") or []:
             if not isinstance(activity, dict):
                 continue
@@ -76,9 +84,16 @@ def broker_rows(orders, day, fill_evidence, order_index):
                 if isinstance(execution, dict):
                     stamp = ny_time(execution.get("time"))
                     if stamp:
-                        times.add(stamp)
+                        activity_times.add(stamp)
+                        # CANCEL/REPLACE activities can contain executionLegs
+                        # with timestamps. They are not evidence of a fill.
+                        if (activity.get("activityType") in (None, "EXECUTION")
+                                and activity.get("executionType") in (None, "FILL")
+                                and positive(execution.get("quantity"))
+                                and positive(execution.get("price"))):
+                            times.add(stamp)
         entered = ny_time(order.get("enteredTime"))
-        if not any(stamp[:10] == day for stamp in times | ({entered} if entered else set())):
+        if not any(stamp[:10] == day for stamp in activity_times | ({entered} if entered else set())):
             continue
         ticker = leg["instrument"]["symbol"]
         instruction = leg.get("instruction")
@@ -90,6 +105,7 @@ def broker_rows(orders, day, fill_evidence, order_index):
             "broker_order_ref": reference(oid), "ticker": ticker,
             "broker_parent_refs": sorted(parents[oid]),
             "entered_ny": entered, "execution_times_ny": sorted(times),
+            "activity_times_ny": sorted(activity_times),
             "instruction": instruction, "order_type": evidence.get("order_type"),
             "status": evidence.get("status"),
             "broker_fill_verified": evidence["verified"],
