@@ -89,6 +89,34 @@ positions and working orders: stopping can trigger REAL liquidation. Run the
 complete isolated regression suite as gala before activation. Deployment is
 not authorization to resume REAL trading or promote SHADOW models.
 
+The maintenance helper scripts/upgrade_original_v315.sh takes the reviewed full
+commit SHA as its only argument. Run as root only after fresh operator checks
+show engine OFF, scheduler manual, AI idle, and no broker positions/orders,
+with all dashboard operators paused. It validates the original service path
+and user, a clean tracked checkout, the exact remote head, a fast-forward-only
+update, an unchanged private/runtime path diff, and network-namespace support.
+It ensures Node's Request/Headers APIs are available to gala for the UI tests.
+
+Before stopping, the helper rechecks the configured automatic-training window
+and fresh structured read-only broker flatness. An active Auto AI training
+window makes it abort rather than change the saved ON/OFF flag. It archives the
+original installation privately (excluding .git and .venv), including existing
+model/history/config artifacts, and records a private list of pre-existing
+non-source/non-operational-log files for a GNU tar comparison after tests.
+Only tracked public Python/HTML/CSS/JS source and VERSION gain read permission;
+.env, config.yaml and binary/JSON model/history permissions are preserved.
+
+The helper requires all 420 tests to pass as gala inside unshare -n with zero
+skips, checks .env/config checksums and preserved-file contents/metadata, then
+rechecks training-window and broker-flat evidence before starting gala.service.
+It never calls /api/bot/start, changes scheduler/modes/AI settings, clears an
+accounting block, repairs historical fills or promotes a model. A failed
+pre-start check leaves the service stopped for review; no automatic rollback
+or state reset is attempted. Failures after starting require service-status
+inspection. After success, authenticate to /api/status and /api/ai/status to
+verify loaded server version, engine OFF and saved Auto AI settings. OAuth may
+persist legitimately refreshed credentials during the read-only broker checks.
+
 Validation: 420 offline unittest tests passed with zero skips, including 33
 new tests of the real controller/runner race, authenticated signal/status APIs,
 actual JavaScript rendering and failed polls, read-only timeline extraction,
