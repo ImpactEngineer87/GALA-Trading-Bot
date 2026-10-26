@@ -13,6 +13,8 @@ git diff --cached --quiet
 test "$(systemctl show gala -p WorkingDirectory --value)" = /opt/gala/GALA-Trading-Bot
 test "$(systemctl show gala -p User --value)" = gala
 gala_target=${1:?Pass the reviewed full commit SHA}
+gala_hold_stopped=${2:-}
+[[ "$#" -le 2 && ( -z "$gala_hold_stopped" || "$gala_hold_stopped" == --hold-stopped ) ]]
 [[ "$gala_target" =~ ^[0-9a-f]{40}$ ]]
 git fetch origin fix/real-signal-execution-controls-20261023
 test "$(git rev-parse origin/fix/real-signal-execution-controls-20261023)" = "$gala_target"
@@ -107,8 +109,8 @@ fi
 import re, sys
 from pathlib import Path
 text = Path(sys.argv[1]).read_text(errors='replace')
-if not re.search(r'^Ran 420 tests\b', text, re.M) or not re.search(r'^OK$', text, re.M):
-    raise SystemExit('STOP: expected 420 successful tests with no skips. Inspect regression.log.')
+if not re.search(r'^Ran 444 tests\b', text, re.M) or not re.search(r'^OK$', text, re.M):
+    raise SystemExit('STOP: expected 444 successful tests with no skips. Inspect regression.log.')
 print('\n'.join(line for line in text.splitlines() if line.startswith(('Ran ', 'OK'))))
 PY
 sha256sum -c "$gala_backup/private.sha256"
@@ -116,6 +118,12 @@ tar --compare --file "$gala_backup/project.tar" --no-recursion --null --files-fr
 printf 'Preserved non-source/non-log files match the backup.\n'
 check_window
 broker_flat
+if [[ "$gala_hold_stopped" == --hold-stopped ]]; then
+  git log -1 --oneline
+  cat VERSION
+  printf 'Maintenance validated; gala.service remains STOPPED for reviewed reconciliation.\nBackup and full test log: %s\n' "$gala_backup"
+  exit 0
+fi
 systemctl start gala
 systemctl is-active gala
 git log -1 --oneline
