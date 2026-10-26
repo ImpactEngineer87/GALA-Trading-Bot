@@ -38,6 +38,21 @@ accounting block or trading/training/history/model/risk artifact is changed.
 
 ## Commit maintenance requirements
 
+For the reviewed NKE incident, `scripts/maintain_nke_reconciliation.sh` accepts
+the exact reviewed branch commit and private plan path. It must be run only
+after dashboard/TOS operators have coordinated a pause. It checks the plan and
+unchanged guard, manual scheduler, Auto AI window/headroom and idle worker,
+disabled automatic promotion, matching configured/dashboard account, zero
+local REAL positions and fresh zero broker positions/orders before requesting
+the normal authenticated CSRF-protected engine stop. This may close PAPER
+positions under the existing shutdown policy. It waits for the engine thread
+to end, delegates update/testing to the guarded helper in hold-stopped mode,
+applies only the reviewed plan, verifies three BA/META blocks remain and fresh
+broker flatness, then starts the dashboard service with trading OFF. It asks
+for dashboard credentials again to verify the new process. It never starts
+the trading engine, changes Auto AI settings, or assigns missing order IDs.
+Any unexpected check halts; there is no automatic rollback or restart-on-error.
+
 Before stopping anything, coordinate a maintenance window with operators and
 obtain fresh engine, scheduler, AI-worker and broker-position/working-order
 checks. Stopping this installation may liquidate REAL exposure. Never infer
