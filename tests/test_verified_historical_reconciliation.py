@@ -43,9 +43,11 @@ class BrokerReadOnly:
         return "account-private"
 
     def obtener_posiciones(self, account):
+        assert account == "account-private", "Position read must use the Schwab account hash"
         return self.positions
 
     def obtener_ordenes_abiertas(self, account):
+        assert account == "account-private", "Working-order read must use the Schwab account hash"
         return self.working
 
     def _get_autorizado(self, url, **kwargs):
