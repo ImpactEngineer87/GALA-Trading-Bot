@@ -99,6 +99,18 @@ class TerminalStopReconciliationTests(unittest.TestCase):
         bot.ejecutor_hibrido.colocar_salida.assert_not_called()
         bot.ejecutor_hibrido.liquidar_posicion.assert_not_called()
 
+    def test_terminal_stop_is_checked_before_any_tp1_submission(self):
+        bot, position = self.bot("REPLACED", 5)
+        position.update(
+            salida_parcial=True, tp1_order_id="", tp1_hit=False,
+            sl_reconcile_pending=False, orden=Mock(cantidad_parcial=3),
+            tp1=182.50,
+        )
+        bot._gestionar_real("BA", position, 183.07)
+        self.assertTrue(position["sl_reconcile_pending"])
+        bot.ejecutor_hibrido.colocar_salida.assert_not_called()
+        bot._cerrar_posicion.assert_not_called()
+
     def test_verified_stop_fill_keeps_existing_close_path(self):
         bot, position = self.bot("FILLED", 0)
         bot._gestionar_real("BA", position, 183.07)
