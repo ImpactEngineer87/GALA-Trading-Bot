@@ -15,7 +15,7 @@ The client reports manually intervening in a BA position on October 23, 2026. GA
 ## Readiness and deployment
 
 1. Keep the trading engine OFF using dashboard Stop; independently verify zero live broker positions AND zero working orders. Never blindly stop a bot managing live positions.
-2. As root on the live VPS, run scripts/deploy_historical_manual_close_resume.sh with the EXACT pinned SHA of the reviewed candidate. It runs all 463 tests with network disabled BEFORE touching the service, checks live broker state and AI idle, creates private backups, fast-forwards, runs 463 tests as gala, and restarts only the web dashboard. The feature remains OFF.
+2. As root on the live VPS, run scripts/deploy_historical_manual_close_resume.sh with the EXACT pinned SHA of the reviewed candidate. It runs all 464 tests with network disabled BEFORE touching the service, checks live broker state and AI idle, creates private backups, fast-forwards, runs 464 tests as gala, and restarts only the web dashboard. The feature remains OFF.
 3. An operator must separately coordinate client authorization. With engine OFF, stop gala.service and verify ActiveState=inactive, MainPID=0.
 4. Back up config.yaml. Run .venv/bin/python scripts/authorize_historical_manual_close.py --ack 'I AUTHORIZE OCT23 HISTORICAL ONLY'. The tool writes data/historical_manual_close_resume.json with mode 0640 root:gala; it does NOT change config or start trading.
 5. Under explicit operator review, edit ONLY live_trading.historical_manual_close_resume to true in config.yaml (preserve a byte-for-byte original backup); never disable the original accounting guard.
@@ -27,3 +27,7 @@ This is a narrow remedy for the exact verified NKE archive + known BA/META histo
 ## Failure handling
 
 If the suite, account or historical scope checks fail, STOP. Never force a new order, modify the guard file, delete old history, turn off daily-loss protection or promote AI models to work around the failure. Real-money execution should be enabled only after the explicit client/operator approval and fresh independent risk checks.
+
+## Post-install fail-closed hotfix
+
+After the first successful source installation, one further safety review identified that an in-process accounting storage/audit error must always block new entries, even if the October 23 historical guard file itself is unchanged. The follow-up candidate adds this explicit override and a fourteenth offline test. Install the latest pinned candidate with the same guarded installer (now supports previous installed source revision a2a30b6) before issuing any historical approval. The opt-in remains OFF by default.
