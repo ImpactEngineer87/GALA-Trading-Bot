@@ -14,18 +14,31 @@ test "$(systemctl show gala -p User --value)" = gala
 git fetch --no-tags origin fix/reviewed-historical-manual-close-resume-20261028
 test "$(git rev-parse FETCH_HEAD)" = "$target"
 git merge-base --is-ancestor HEAD "$target"
-git diff --quiet
-git diff --cached --quiet
-test -z "$(git diff --name-only HEAD "$target" -- .env config.yaml data models dashboard/index.html)"
+echo "=== CHECK LOCAL CHANGES WITHOUT DISCARDING THEM ==="
 GALA_TARGET="$target" ./.venv/bin/python - <<'PY'
-import os, subprocess
+import os, subprocess, sys
+
 def files(*args):
-    return set(subprocess.check_output(["git",*args]).split(b"\0")[:-1])
-future=files("diff","--name-only","-z","HEAD",os.environ["GALA_TARGET"])
-local=files("ls-files","--others","--exclude-standard","-z")
-if future & local:
-    raise SystemExit("STOP: release would collide with local untracked files")
-print("PASS: repository preflight")
+    return set(filter(None, subprocess.check_output(["git", *args]).split(b"\0")))
+
+target = os.environ["GALA_TARGET"]
+new = files("diff", "--name-only", "-z", "HEAD", target)
+tracked = files("diff", "--name-only", "-z", "HEAD")
+untracked = files("ls-files", "--others", "--exclude-standard", "-z")
+collision = sorted(new & (tracked | untracked))
+protected = (b".env", b"config.yaml", b"dashboard/index.html")
+protected_paths = sorted(x for x in new if x in protected
+                         or x.startswith((b"data/", b"models/")))
+if protected_paths:
+    for x in protected_paths:
+        print("STOP: release unexpectedly edits protected file", os.fsdecode(x), file=sys.stderr)
+    raise SystemExit(2)
+if collision:
+    for x in collision:
+        print("STOP: local file conflicts with release:", os.fsdecode(x), file=sys.stderr)
+    print("Local files will not be overwritten. No stash/reset performed.", file=sys.stderr)
+    raise SystemExit(2)
+print("PASS: no source collisions; local unrelated changes preserved")
 PY
 
 echo "=== FIRST RUN ALL 463 TESTS IN ISOLATED WORKTREE BEFORE STOPPING ANYTHING ==="
