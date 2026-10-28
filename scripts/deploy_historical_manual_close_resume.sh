@@ -28,6 +28,27 @@ if future & local:
 print("PASS: repository preflight")
 PY
 
+echo "=== FIRST RUN ALL 463 TESTS IN ISOLATED WORKTREE BEFORE STOPPING ANYTHING ==="
+review=$(mktemp -d /tmp/gala-historical-code-review-XXXXXXXX)
+git worktree add --detach "$review/source" "$target" >/dev/null
+if ! (cd "$review/source" && unshare -n -- \
+    /opt/gala/GALA-Trading-Bot/.venv/bin/python -m unittest discover -s tests -q \
+    > "$review/predeploy.log" 2>&1); then
+  tail -n 70 "$review/predeploy.log"
+  echo "STOP: offline tests failed, live service untouched." >&2
+  exit 1
+fi
+./.venv/bin/python - "$review/predeploy.log" <<'PY'
+import re,sys
+from pathlib import Path
+log=Path(sys.argv[1]).read_text(errors="replace")
+if not re.search(r"^Ran 463 tests\b",log,re.M) or not re.search(r"^OK$",log,re.M) or "skipped=" in log:
+    raise SystemExit("STOP: offline reviewed worktree did not pass 463 tests")
+print("PASS: 463 offline tests before maintenance")
+PY
+git worktree remove --force "$review/source"
+rm -rf -- "$review"
+
 echo "=== ENGINE OFF / AI IDLE / BROKER FLAT ==="
 ./.venv/bin/python - <<'PY'
 import contextlib, getpass, io, os, sys
