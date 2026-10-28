@@ -22,13 +22,52 @@ test "$(git show "$target:VERSION")" = 3.3.15
 if test -n "$(git diff --name-only HEAD "$target" -- .env config.yaml data models dashboard/index.html)"; then
   echo "STOP: target modifies protected runtime files"; exit 1
 fi
-changed=$(mktemp); local_files=$(mktemp)
-trap 'rm -f -- "$changed" "$local_files"' EXIT
-git diff --name-only HEAD "$target" | sort -u > "$changed"
-{ git diff --name-only HEAD; git diff --cached --name-only; git ls-files --others --exclude-standard; } | sort -u > "$local_files"
-if test -n "$(comm -12 "$changed" "$local_files")"; then
-  echo "STOP: uncommitted files conflict with the update"; comm -12 "$changed" "$local_files"; exit 1
-fi
+# Git's tracked/untracked status is more reliable than locale-sensitive comm.
+# An untracked file added upstream may be adopted only if byte-identical.
+# Nonidentical or locally edited files are never overwritten or stashed.
+overlap_file=$(mktemp)
+trap 'rm -f -- "$overlap_file"' EXIT
+GALA_TARGET="$target" GALA_OVERLAP_FILE="$overlap_file" ./.venv/bin/python - <<'PY'
+import os, subprocess, sys
+from pathlib import Path
+
+def git(*args):
+    return subprocess.check_output(["git", *args]).split(b"\0")[:-1]
+
+target = os.environ["GALA_TARGET"]
+overlap = Path(os.environ["GALA_OVERLAP_FILE"])
+changed = set(git("diff", "--name-only", "-z", "HEAD", target))
+local_tracked = set(git("diff", "--name-only", "-z", "HEAD"))
+untracked = set(git("ls-files", "--others", "--exclude-standard", "-z"))
+conflicts = sorted(changed & (local_tracked | untracked))
+identical_untracked = []
+unsafe = []
+
+for raw in conflicts:
+    path = os.fsdecode(raw)
+    if raw in local_tracked:
+        unsafe.append((path, "tracked local modification"))
+        continue
+    p = Path(path)
+    if not p.is_file() or p.is_symlink():
+        unsafe.append((path, "missing/non-regular/symlink path"))
+        continue
+    exact = subprocess.run(["git", "show", f"{target}:{path}"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if exact.returncode != 0 or p.read_bytes() != exact.stdout:
+        unsafe.append((path, "untracked file differs from reviewed commit"))
+    else:
+        identical_untracked.append(raw)
+
+if unsafe:
+    for path, why in unsafe:
+        print(f"STOP: preserve local file {path!r} ({why})", file=sys.stderr)
+    sys.exit(1)
+with overlap.open("wb") as out:
+    for raw in identical_untracked:
+        out.write(raw + b"\0")
+print("Safe byte-identical untracked overlap(s):", len(identical_untracked))
+PY
 
 echo "=== FRESH STOPPED-ENGINE AND SCHWAB PREFLIGHT ==="
 ./.venv/bin/python - <<'PY'
@@ -112,10 +151,31 @@ done
 sha256sum .env config.yaml data/real_accounting_reconciliation.json > "$backup/private.sha256"
 echo "Private backup: $backup"
 
+# Keep original local untracked bytes and metadata inside the private backup.
+# git merge must NOT overwrite these before we have archived them.
+while IFS= read -r -d '' file; do
+  mkdir -p "$backup/untracked-before-update/$(dirname "$file")"
+  cp -a -- "$file" "$backup/untracked-before-update/$file"
+  cmp -s "$file" "$backup/untracked-before-update/$file" || {
+    echo "STOP: overlap backup verification failed for $file" >&2; exit 1;
+  }
+done < "$overlap_file"
+
 echo "=== STOP DASHBOARD; INSTALL TESTED COMMIT ==="
 systemctl stop gala
 test "$(systemctl show gala -p ActiveState --value)" = inactive
 test "$(systemctl show gala -p MainPID --value)" = 0
+# The upstream ADD is exactly the same as this archived untracked file.
+# Move, do not delete. If anything changed during preflight, abort.
+while IFS= read -r -d '' file; do
+  cmp -s <(git show "$target:$file") "$file" || {
+    echo "STOP: local overlap changed during maintenance: $file" >&2; exit 1;
+  }
+  test -f "$backup/untracked-before-update/$file" || {
+    echo "STOP: archived original missing: $file" >&2; exit 1;
+  }
+  mv -- "$file" "$backup/untracked-before-update/$file"
+done < "$overlap_file"
 git merge --ff-only "$target"
 test "$(git rev-parse HEAD)" = "$target"
 # Root-owned 0600 source files previously caused crash loops.
@@ -126,7 +186,7 @@ while IFS= read -r f; do
   case "$f" in
     *.py|*.sh|*.html|*.js) test ! -f "$f" || chmod a+r "$f" ;;
   esac
-done < "$changed"
+done < <(git diff --name-only HEAD^ HEAD)
 
 echo "=== 450 OFFLINE REGRESSIONS AS gala ==="
 if ! unshare -n -- runuser -u gala -- ./.venv/bin/python -m unittest discover -s tests -q > "$backup/regression.log" 2>&1; then
