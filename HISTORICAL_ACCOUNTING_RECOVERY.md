@@ -60,7 +60,7 @@ flatness from a closed market or an earlier dashboard snapshot.
 
 After those checks and coordinated operator pause, the original installation
 maintenance helper accepts a reviewed commit plus `--hold-stopped`. It backs
-up, updates, requires all 444 isolated tests as gala, checks preserved files
+up, updates, requires all 450 isolated tests as gala, checks preserved files
 and fresh broker flatness, then leaves gala.service stopped for reconciliation.
 Without that flag its existing dashboard-start behavior is unchanged. Do not
 use it as a substitute for the required pre-maintenance operator checks.
@@ -108,6 +108,23 @@ independent exact evidence and a separate reviewed recovery path. Correcting
 historical accounting also does not repair the independently rejected TP1
 protection orders or establish readiness to resume REAL trading.
 
-The original maintenance updater now requires all 444 regression tests with
+The original maintenance updater now requires all 450 regression tests with
 zero skips when deploying this branch. No tests or commands may submit live
 orders or promote SHADOW models.
+
+## Terminal STOP monitoring regression (2026-10-28)
+
+`engine/bot_engine.py` now checks a terminal tracked STOP (CANCELED, REPLACED,
+REJECTED or EXPIRED) against the authoritative Schwab position reader **before**
+attempting a TP1 submission. Broker flatness takes the existing strict local
+close/quarantine path: no inferred exit order IDs, fill prices, realized P/L,
+model labels, or new broker orders. Remaining REAL exposure enters the existing
+`sl_reconcile_pending` path and must recheck working orders before any
+replacement STOP. Unknown broker exposure results in no trading action.
+
+Six offline unit tests cover terminal states, broker-flat, unknown exposure,
+remaining exposure, STOP fill and the TP1-ordering regression. This patch does
+not resolve historical NKE/BA/META accounting guards or authorize REAL entries.
+No live order should be placed just to validate this patch. The complete
+isolated regression suite must report 450 passed tests with zero skips before
+considering a coordinated deployment.
