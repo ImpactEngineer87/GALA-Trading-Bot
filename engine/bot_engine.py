@@ -5049,37 +5049,6 @@ class ChocoletraBot:
                 )
                 return
 
-        # If a 3-share partial plan was deferred because the STOP had not become
-        # visible yet, place TP1 only after the STOP is confirmed WORKING.
-        if (
-            pos.get("salida_parcial")
-            and not pos.get('normal_exit_progress')
-            and not pos.get("tp1_hit")
-            and not pos.get("tp1_order_id")
-            and pos.get("sl_order_id")
-            and not pos.get("sl_reconcile_pending")
-        ):
-            orden = pos.get("orden")
-            cantidad_parcial = int(getattr(orden, "cantidad_parcial", 0) or 0)
-            if cantidad_parcial > 0:
-                tp1 = self.ejecutor_hibrido.colocar_salida(
-                    ticker, pos["tipo"], cantidad_parcial, pos["tp1"],
-                    "LIMIT", self.account_number
-                )
-                tp1_id = self._submitted_exit_order_id(tp1)
-                if tp1_id:
-                    with self._lock:
-                        pos["tp1_order_id"] = tp1_id
-                        pos["tp1_reconcile_pending"] = (
-                            str((tp1 or {}).get("status", "") or "").upper()
-                            == "RECONCILIAR"
-                        )
-
-        # TP1 llenado → mover a breakeven una vez
-        if pos["salida_parcial"] and not pos["tp1_hit"] and pos["tp1_order_id"]:
-            if self.ejecutor_hibrido._estado_orden(self.account_number, pos["tp1_order_id"]) == "FILLED":
-                self._ejecutar_parcial(ticker, pos)
-                return
         # SL/remanente llenado → finalizar.  A terminal STOP that did NOT fill
         # cannot be treated as ongoing protection.  This used to leave local
         # positions stale when Schwab had already flattened the ticker, as seen
@@ -5129,6 +5098,37 @@ class ChocoletraBot:
                 )
                 return
 
+        # If a 3-share partial plan was deferred because the STOP had not become
+        # visible yet, place TP1 only after the STOP is confirmed WORKING.
+        if (
+            pos.get("salida_parcial")
+            and not pos.get('normal_exit_progress')
+            and not pos.get("tp1_hit")
+            and not pos.get("tp1_order_id")
+            and pos.get("sl_order_id")
+            and not pos.get("sl_reconcile_pending")
+        ):
+            orden = pos.get("orden")
+            cantidad_parcial = int(getattr(orden, "cantidad_parcial", 0) or 0)
+            if cantidad_parcial > 0:
+                tp1 = self.ejecutor_hibrido.colocar_salida(
+                    ticker, pos["tipo"], cantidad_parcial, pos["tp1"],
+                    "LIMIT", self.account_number
+                )
+                tp1_id = self._submitted_exit_order_id(tp1)
+                if tp1_id:
+                    with self._lock:
+                        pos["tp1_order_id"] = tp1_id
+                        pos["tp1_reconcile_pending"] = (
+                            str((tp1 or {}).get("status", "") or "").upper()
+                            == "RECONCILIAR"
+                        )
+
+        # TP1 llenado → mover a breakeven una vez
+        if pos["salida_parcial"] and not pos["tp1_hit"] and pos["tp1_order_id"]:
+            if self.ejecutor_hibrido._estado_orden(self.account_number, pos["tp1_order_id"]) == "FILLED":
+                self._ejecutar_parcial(ticker, pos)
+                return
         progress = pos.get('normal_exit_progress') or {}
         if (progress and progress.get('attempts', 0) < 3
                 and time.time() >= progress.get('retry_after', float('inf'))
