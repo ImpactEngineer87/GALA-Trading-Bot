@@ -149,6 +149,20 @@ class ManualCloseHistoricalResumeTests(unittest.TestCase):
         self.assertEqual(state["unresolved"], 3)
         self.assertTrue(state["historical_resume_active"])
 
+    def test_accounting_runtime_failure_must_override_historical_grant(self):
+        bot = ChocoletraBot.__new__(ChocoletraBot)
+        bot.config = self.config
+        bot.account_number = self.account
+        bot.real_accounting_guard = RealAccountingGuard(self.state_path)
+        bot.real_accounting_guard._failure = "Current-session history could not be audited"
+        bot._ahora_et = lambda: self.now
+        with patch("core.historical_manual_resume._trusted_approval_file", return_value=True):
+            state = bot._real_accounting_status()
+        self.assertTrue(state["blocked"])
+        self.assertTrue(state["entry_blocked"])
+        self.assertFalse(state["historical_resume_active"])
+        self.assertEqual(state["unresolved"], 3)
+
     def test_any_other_symbol_requires_new_independent_review(self):
         self.state["unresolved"]["meta-local"]["ticker"] = "MSFT"
         self.write_state()
