@@ -76,6 +76,13 @@ def approval_path(config, root):
     return Path(resolve_runtime_path(value, project_root=Path(root)))
 
 
+def _trusted_approval_file(path):
+    if not path.is_file() or path.is_symlink():
+        return False
+    metadata = path.stat(follow_symlinks=False)
+    return metadata.st_uid == 0 and not (stat.S_IMODE(metadata.st_mode) & 0o022)
+
+
 def exception_status(config, guard_path, account, *, now=None, root=None):
     """Read-only admission decision, recomputed at entry time. Never a broker order."""
     reply = {"entry_blocked": True, "historical_resume_active": False,
@@ -92,11 +99,9 @@ def exception_status(config, guard_path, account, *, now=None, root=None):
         digest, keys = strict_historical_guard(guard_path)
         root = Path(root) if root is not None else Path(__file__).resolve().parent.parent
         path = approval_path(config, root)
-        if not path.is_file() or path.is_symlink():
-            raise ValueError("APPROVAL_MISSING")
-        metadata = path.stat(follow_symlinks=False)
-        # The dashboard/engine can read but cannot rewrite an operator-issued grant.
-        if metadata.st_uid != 0 or stat.S_IMODE(metadata.st_mode) & 0o022:
+        # Only root can create or rewrite the operator grant; the dashboard
+        # user receives read-only group access. Never trust symlinks.
+        if not _trusted_approval_file(path):
             raise ValueError("APPROVAL_PERMISSION_INVALID")
         grant = json.loads(path.read_text(encoding="utf-8"))
         if (grant.get("kind") != APPROVAL_KIND or grant.get("session_ny") != session
