@@ -5080,10 +5080,53 @@ class ChocoletraBot:
             if self.ejecutor_hibrido._estado_orden(self.account_number, pos["tp1_order_id"]) == "FILLED":
                 self._ejecutar_parcial(ticker, pos)
                 return
-        # SL/remanente llenado → finalizar
+        # SL/remanente llenado → finalizar.  A terminal STOP that did NOT fill
+        # cannot be treated as ongoing protection.  This used to leave local
+        # positions stale when Schwab had already flattened the ticker, as seen
+        # in the BA/META incidents.  Do not guess the exit order or fill price.
         if pos["sl_order_id"]:
-            if self.ejecutor_hibrido._estado_orden(self.account_number, pos["sl_order_id"]) == "FILLED":
+            stop_id = str(pos["sl_order_id"])
+            stop_status = str(
+                self.ejecutor_hibrido._estado_orden(self.account_number, stop_id)
+                or "DESCONOCIDO"
+            ).upper()
+            if stop_status == "FILLED":
                 self._cerrar_posicion(ticker, pos["sl_actual"], motivo="SL(real)")
+                return
+            if stop_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "REPLACED"}:
+                remaining = self._cantidad_real_broker(ticker, pos["tipo"])
+                if remaining is None:
+                    # Unknown broker exposure: do not clear the STOP identifier,
+                    # invent a close, or submit another protective order.
+                    return
+                if remaining == 0:
+                    self._audit_event(
+                        "STOP_TERMINAL_BROKER_FLAT",
+                        ticker=ticker, lado=pos["tipo"], estado=stop_status,
+                        order_id=stop_id,
+                        motivo="Schwab reports flat; exit identity requires independent evidence",
+                    )
+                    # The existing close path quarantines unknown REAL P/L and
+                    # blocks further entries instead of inventing broker fills.
+                    self._cerrar_posicion(
+                        ticker, precio_actual,
+                        motivo="reconciliacion: STOP terminal, broker plano",
+                    )
+                    return
+                # Exposure persists with a terminal old STOP.  On the next
+                # monitor tick use the EXISTING guarded stale-STOP route, which
+                # rechecks exact order visibility and broker exposure before
+                # replacing protection. Never place an order directly here.
+                with self._lock:
+                    if self._posiciones.get(ticker) is not pos:
+                        return
+                    pos["sl_reconcile_pending"] = True
+                self._audit_event(
+                    "STOP_TERMINAL_RECONCILE_REQUIRED",
+                    ticker=ticker, lado=pos["tipo"], estado=stop_status,
+                    order_id=stop_id,
+                    motivo="STOP terminal with broker exposure; verify working orders before protection",
+                )
                 return
 
         progress = pos.get('normal_exit_progress') or {}
