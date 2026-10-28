@@ -866,7 +866,26 @@ def _engine_daily_risk_snapshot():
             cfg,
             history_path=_history_path(),
         )
-        return guard.snapshot(paper, unrealized_pnl=0.0)
+        snapshot = guard.snapshot(paper, unrealized_pnl=0.0)
+        # The stopped dashboard must expose the same durable REAL accounting
+        # truth as the running engine. Never present an absent field as proof
+        # that the historical guard is cleared.
+        from core.real_accounting import RealAccountingGuard
+        from core.historical_manual_resume import exception_status
+        from core.project_paths import resolve_runtime_path
+        account_path = resolve_runtime_path(
+            (cfg.get("execution_engine") or {}).get(
+                "accounting_state_path", "data/real_accounting_reconciliation.json"),
+            project_root=BASE_DIR)
+        accounting = RealAccountingGuard(account_path).snapshot()
+        accounting["entry_blocked"] = bool(accounting["blocked"])
+        accounting["historical_resume_active"] = False
+        if accounting["blocked"]:
+            account = str(BOT_STATE.get("account_number") or get_env(
+                "SCHWAB_ACCOUNT_NUMBER", "") or "").strip()
+            accounting.update(exception_status(cfg, account_path, account, root=BASE_DIR))
+        snapshot["real_accounting"] = accounting
+        return snapshot
     except Exception:
         return {
             "enabled": False, "blocked": False, "mode": "PAPER",
