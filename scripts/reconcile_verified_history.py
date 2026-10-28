@@ -225,7 +225,7 @@ def apply_plan(root, plan, client, account, account_hash, backup_root, *, check_
     with os.fdopen(lock_fd, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         scope = scope_for(root, plan["position_ref"], plan["session_ny"], now)
-        require(client.obtener_posiciones(account) == [] and client.obtener_ordenes_abiertas(account) == [], "BROKER_MUST_CONFIRM_ZERO_POSITIONS_AND_ORDERS")
+        require(client.obtener_posiciones(account_hash) == [] and client.obtener_ordenes_abiertas(account_hash) == [], "BROKER_MUST_CONFIRM_ZERO_POSITIONS_AND_ORDERS")
         proof = proof_for(scope, client, account, account_hash)
         require(plan_for(scope, proof) == plan, "PLAN_STALE_OR_BROKER_EVIDENCE_CHANGED")
         check_service()
