@@ -109,8 +109,8 @@ fi
 import re, sys
 from pathlib import Path
 text = Path(sys.argv[1]).read_text(errors='replace')
-if not re.search(r'^Ran 444 tests\b', text, re.M) or not re.search(r'^OK$', text, re.M):
-    raise SystemExit('STOP: expected 444 successful tests with no skips. Inspect regression.log.')
+if not re.search(r'^Ran 450 tests\b', text, re.M) or not re.search(r'^OK$', text, re.M):
+    raise SystemExit('STOP: expected 450 successful tests with no skips. Inspect regression.log.')
 print('\n'.join(line for line in text.splitlines() if line.startswith(('Ran ', 'OK'))))
 PY
 sha256sum -c "$gala_backup/private.sha256"
