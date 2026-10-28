@@ -56,6 +56,8 @@ def strict_historical_guard(guard_path, *, expected_count=EXPECTED_COUNT):
         raise ValueError("ACCOUNTING_STATE_UNAVAILABLE")
     raw = p.read_bytes()
     state = json.loads(raw)
+    if not isinstance(state, dict):
+        raise ValueError("ACCOUNTING_STATE_INVALID")
     rows = state.get("unresolved")
     if not isinstance(rows, dict) or len(rows) != expected_count:
         raise ValueError("HISTORICAL_SCOPE_MISMATCH")
