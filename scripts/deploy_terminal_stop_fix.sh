@@ -155,6 +155,40 @@ for i in $(seq 1 25); do
 done
 test "$http" = 200
 sha256sum -c "$backup/private.sha256"
+echo "=== POST-RESTART AUTHENTICATED ENGINE-OFF CHECK ==="
+./.venv/bin/python - <<'PY'
+import getpass, sys
+import requests
+try:
+    with open("/dev/tty", "r", encoding="utf-8") as tty:
+        print("Verify dashboard username: ", end="", file=sys.stderr, flush=True)
+        username = tty.readline().strip()
+    password = getpass.getpass("Verify dashboard password: ")
+except (EOFError, OSError):
+    raise SystemExit("STOP: interactive terminal unavailable for final verification")
+s = requests.Session(); s.trust_env = False
+try:
+    r = s.post("http://127.0.0.1:5000/api/login",
+        json={"username": username, "password": password}, timeout=(5, 30))
+    if r.status_code != 200 or r.json().get("status") != "ok":
+        raise ValueError("Login failed")
+    r = s.get("http://127.0.0.1:5000/api/status", timeout=(5, 30))
+    if r.status_code != 200 or r.json().get("status") != "ok":
+        raise ValueError("Status unavailable")
+    state = r.json()
+except (requests.RequestException, ValueError):
+    raise SystemExit("STOP: dashboard re-authentication or status unavailable")
+finally:
+    password = None
+bot = state.get("bot") or {}
+if (bot.get("running") is not False
+        or (bot.get("engine_runtime") or {}).get("thread_alive") is not False
+        or state.get("scheduler", {}).get("modo") != "manual"):
+    raise SystemExit("STOP: engine-off/manual-scheduler postcondition failed; do not enable REAL")
+if (state.get("daily_risk", {}).get("real_accounting") or {}).get("blocked") is not True:
+    raise SystemExit("STOP: accounting guard status unexpectedly differs; do not enable REAL")
+print("PASS: post-restart engine OFF, manual scheduler, accounting guard still blocks REAL")
+PY
 echo "=== FINAL STATE ==="
 git log -1 --oneline
 systemctl show gala -p ActiveState -p MainPID -p NRestarts --no-pager
