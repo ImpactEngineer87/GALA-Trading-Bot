@@ -814,7 +814,10 @@ class ChocoletraBot:
         # immutable approval against guard bytes at each decision.
         snapshot["entry_blocked"] = bool(snapshot["blocked"])
         snapshot["historical_resume_active"] = False
-        if snapshot["blocked"]:
+        # In-process accounting read/write failure always blocks new REAL
+        # orders, even if the saved file still exactly matches an old grant.
+        # A prior-session exception only applies to sound, readable accounting.
+        if snapshot["blocked"] and not getattr(guard, "_failure", ""):
             from core.historical_manual_resume import exception_status
             approval = exception_status(
                 getattr(self, "config", {}) or {}, guard.store.path,
