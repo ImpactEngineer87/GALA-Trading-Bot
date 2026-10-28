@@ -123,7 +123,7 @@ print('Engine OFF and thread ended. Ready for the stopped-service update.', flus
 PRE_STOP_PY
 
 # Existing guarded updater performs private backup, fresh flatness checks,
-# fast-forward update, all 444 isolated tests as gala and preservation checks.
+# fast-forward update, all 450 isolated tests as gala and preservation checks.
 bash "$gala_tmp/upgrade.sh" "$gala_target" --hold-stopped
 ./.venv/bin/python scripts/reconcile_verified_history.py \
   --runtime-root /opt/gala/GALA-Trading-Bot --apply "$gala_plan" | tee "$gala_tmp/apply.json"
