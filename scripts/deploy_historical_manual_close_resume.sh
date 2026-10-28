@@ -7,7 +7,11 @@ test "$#" = 1
 target="$1"
 [[ "$target" =~ ^[0-9a-f]{40}$ ]]
 test "$(id -u)" = 0
-test "$(git rev-parse HEAD)" = cc74a5496ef260062615422ec46013e66a81552a
+current="$(git rev-parse HEAD)"
+case "$current" in
+  cc74a5496ef260062615422ec46013e66a81552a|a2a30b640b0e78679892bcef18a5062daf6d862b) ;;
+  *) echo "STOP: unexpected installed code revision" >&2; exit 1 ;;
+esac
 test "$(git branch --show-current)" = fix/real-signal-execution-controls-20261023
 test "$(systemctl is-active gala)" = active
 test "$(systemctl show gala -p User --value)" = gala
@@ -41,7 +45,7 @@ if collision:
 print("PASS: no source collisions; local unrelated changes preserved")
 PY
 
-echo "=== FIRST RUN ALL 463 TESTS IN ISOLATED WORKTREE BEFORE STOPPING ANYTHING ==="
+echo "=== FIRST RUN ALL 464 TESTS IN ISOLATED WORKTREE BEFORE STOPPING ANYTHING ==="
 review=$(mktemp -d /tmp/gala-historical-code-review-XXXXXXXX)
 git worktree add --detach "$review/source" "$target" >/dev/null
 if ! (cd "$review/source" && unshare -n -- \
@@ -55,9 +59,9 @@ fi
 import re,sys
 from pathlib import Path
 log=Path(sys.argv[1]).read_text(errors="replace")
-if not re.search(r"^Ran 463 tests\b",log,re.M) or not re.search(r"^OK$",log,re.M) or "skipped=" in log:
-    raise SystemExit("STOP: offline reviewed worktree did not pass 463 tests")
-print("PASS: 463 offline tests before maintenance")
+if not re.search(r"^Ran 464 tests\b",log,re.M) or not re.search(r"^OK$",log,re.M) or "skipped=" in log:
+    raise SystemExit("STOP: offline reviewed worktree did not pass 464 tests")
+print("PASS: 464 offline tests before maintenance")
 PY
 git worktree remove --force "$review/source"
 rm -rf -- "$review"
@@ -147,10 +151,10 @@ fi
 import re,sys
 from pathlib import Path
 output=Path(sys.argv[1]).read_text(errors="replace")
-if not re.search(r"^Ran 463 tests\b",output,re.M) or not re.search(
+if not re.search(r"^Ran 464 tests\b",output,re.M) or not re.search(
         r"^OK$",output,re.M) or "skipped=" in output:
-    raise SystemExit("STOP: expected 463 successful offline tests, zero skipped")
-print("PASS: 463 offline tests")
+    raise SystemExit("STOP: expected 464 successful offline tests, zero skipped")
+print("PASS: 464 offline tests")
 PY
 sha256sum -c "$backup/original.sha256"
 
