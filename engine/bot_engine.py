@@ -805,9 +805,24 @@ class ChocoletraBot:
     def _real_accounting_status(self):
         guard = getattr(self, "real_accounting_guard", None)
         if guard is None:
-            return {"blocked": True, "unresolved": 0,
+            return {"blocked": True, "entry_blocked": True, "unresolved": 0,
                     "reasons": ["REAL accounting guard unavailable"]}
-        return guard.snapshot()
+        snapshot = guard.snapshot()
+        # Reporting remains honest: the historical records stay unresolved and
+        # daily P/L remains unknown. Only the NEW ENTRY gate can be scoped to an
+        # explicitly reviewed prior-session manual intervention. Re-evaluate the
+        # immutable approval against guard bytes at each decision.
+        snapshot["entry_blocked"] = bool(snapshot["blocked"])
+        snapshot["historical_resume_active"] = False
+        if snapshot["blocked"]:
+            from core.historical_manual_resume import exception_status
+            approval = exception_status(
+                getattr(self, "config", {}) or {}, guard.store.path,
+                getattr(self, "account_number", ""), 
+                now=self._ahora_et() if callable(getattr(self, "_ahora_et", None)) else None,
+            )
+            snapshot.update(approval)
+        return snapshot
 
     def _require_real_accounting(self, ticker, pos, reason, **evidence):
         # Latch before releasing exposure/history: an unknown outcome must not
@@ -2733,7 +2748,7 @@ class ChocoletraBot:
         ticker = prop.ticker
         paper_ticker = self._is_paper_ticker(ticker)
         execution_mode = "PAPER" if paper_ticker else "REAL"
-        if not paper_ticker and self._real_accounting_status()["blocked"]:
+        if not paper_ticker and self._real_accounting_status()["entry_blocked"]:
             decision.execution_skip_reason = "REAL_ACCOUNTING_UNRESOLVED"
             self._audit_event("ENTRY_BLOCKED", ticker=ticker, lado=prop.tipo,
                               estado="REAL_ACCOUNTING_UNRESOLVED",
@@ -2878,6 +2893,15 @@ class ChocoletraBot:
         if self._daily_blocked():
             decision.execution_skip_reason = "DAILY_LOSS_BLOCK"
             self._emit_log("WARN", f"[{ticker}] Entrada no enviada: límite diario activo")
+            return False
+        # Recheck the immutable historical scope immediately before reserving and
+        # submitting: another worker or manual close may have raised a new guard
+        # record since the first eligibility check.
+        if self._real_accounting_status()["entry_blocked"]:
+            decision.execution_skip_reason = "REAL_ACCOUNTING_CHANGED"
+            self._audit_event("ENTRY_BLOCKED", ticker=ticker, lado=prop.tipo,
+                              estado="REAL_ACCOUNTING_CHANGED",
+                              motivo="Nueva discrepancia o autorización histórica caducada")
             return False
         if not self._reserve_real_capacity(ticker, orden):
             decision.execution_skip_reason = "REAL_CAPACITY_BLOCK"
