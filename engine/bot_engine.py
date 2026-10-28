@@ -951,7 +951,10 @@ class ChocoletraBot:
         snapshot["valuation_source"] = "trusted_market_data"
         accounting = self._real_accounting_status()
         snapshot["real_accounting"] = accounting
-        if not guard_paper and accounting["blocked"]:
+        if not guard_paper and accounting["entry_blocked"]:
+            # Past-day records under an exact operator-approved exception remain
+            # unresolved, but they must not make today's verified risk totals
+            # appear unknown. A NEW discrepancy immediately masks totals again.
             # The numeric known component can still trigger the existing loss
             # guard conservatively; never display it as a complete daily total.
             snapshot["known_net_pnl"] = snapshot["net_pnl"]
