@@ -1467,10 +1467,14 @@ class EjecutorHibridoDeOrdenes:
     def montar_proteccion_parcial(self, orden: OrdenTradingCalculada,
                                   account_number: str) -> dict:
         """
-        Tras el llenado de la entrada, monta la protección 70/30:
-          - TP1: LIMIT de salida del 70% en take_profit_parcial
-          - SL : STOP de salida del 100% en stop_loss
-        Devuelve los ids para que el motor gestione el breakeven al saltar TP1.
+        Following a confirmed entry fill, place a full-quantity STOP first.
+
+        LIVE SAFETY: The former independent STOP 100% + TP1 LIMIT 70% created
+        overlapping closing orders rejected by Schwab. REAL execution retains
+        only its verified STOP; the 70/30 TP1 is suspended until a linked,
+        quantity-safe strategy is implemented and broker-verified. The engine
+        separately blocks new REAL entries that require this partial plan.
+        PAPER retains its existing simulated 70/30 workflow.
         """
         # STOP PRIMERO: si el segundo POST falla, la posición sigue protegida.
         # Colocar TP1 antes del stop dejaba una ventana de exposición desnuda.
