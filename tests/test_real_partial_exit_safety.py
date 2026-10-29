@@ -11,9 +11,58 @@ import pandas as pd
 
 from api.hybrid_order_executor import EjecutorHibridoDeOrdenes
 from engine.bot_engine import ChocoletraBot
+from core.live_guard import validate_live_start_partitioned
+
+
+def _read_only_startup_config(partial=True):
+    return {
+        "salida_parcial": {"activo": partial},
+        "live_trading": {
+            "allowed_tickers": ["TSLA"], "max_real_tickers": 5,
+            "max_shares_per_order": 10, "per_ticker_execution": True,
+            "require_approved_models": False, "require_broker_preflight": False,
+            "arm_env": "",
+        },
+        "scheduler": {"modo": "manual"},
+        "kill_switch": {
+            "daily_loss": {"enabled": True},
+            "liquidar_al_apagar": True,
+            "liquidar_al_cierre_mercado": True,
+        },
+        "agents": {"entrenamiento": {
+            "requerir_modelo_aprobado_en_real": True,
+            "automatic_retraining": {"auto_activate_production": False},
+        }},
+    }
+
 
 
 class RealPartialExitSafetyTests(unittest.TestCase):
+    def test_preflight_quarantines_real_three_share_partial_exit(self):
+        result = validate_live_start_partitioned(
+            _read_only_startup_config(partial=True),
+            get_env=lambda key, default="": default,
+            real_tickers=["TSLA"],
+            ticker_settings={"TSLA": {"shares": 3}},
+        )
+        self.assertEqual(result["global_errors"], [])
+        self.assertEqual(result["approved_real"], [])
+        self.assertEqual(result["blocked_real"], ["TSLA"])
+        self.assertIn("70/30", " ".join(result["ticker_errors"]["TSLA"]))
+
+    def test_preflight_does_not_block_one_share_or_explicit_no_partial(self):
+        for partial, shares in ((True, 1), (False, 3)):
+            with self.subTest(partial=partial, shares=shares):
+                result = validate_live_start_partitioned(
+                    _read_only_startup_config(partial=partial),
+                    get_env=lambda key, default="": default,
+                    real_tickers=["TSLA"],
+                    ticker_settings={"TSLA": {"shares": shares}},
+                )
+                self.assertEqual(result["global_errors"], [])
+                self.assertEqual(result["blocked_real"], [])
+                self.assertEqual(result["approved_real"], ["TSLA"])
+
     def test_real_partial_protection_never_submits_overlapping_tp1(self):
         executor = EjecutorHibridoDeOrdenes.__new__(EjecutorHibridoDeOrdenes)
         executor.paper_trading = False
