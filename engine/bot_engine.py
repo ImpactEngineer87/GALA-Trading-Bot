@@ -2793,6 +2793,31 @@ class ChocoletraBot:
             )
             return False
 
+        # Schwab rejected TSLA's standalone TP1 BUY_TO_COVER 2 while a
+        # standalone BUY_TO_COVER STOP for all 3 shares was still WORKING.
+        # Do not create another REAL position whose 70/30 exit plan would
+        # require two conflicting, unlinked closing orders. PAPER is unchanged.
+        # Only a separately verified linked/quantity-safe broker strategy may
+        # remove this fail-closed gate.
+        if (not paper_ticker and bool(orden.salida_parcial_activa)
+                and int(getattr(orden, "cantidad_parcial", 0) or 0) > 0):
+            decision.execution_skip_reason = "REAL_PARTIAL_EXIT_UNSUPPORTED"
+            self._audit_event(
+                "ENTRY_BLOCKED", ticker=ticker, lado=prop.tipo,
+                estado="REAL_PARTIAL_EXIT_UNSUPPORTED",
+                cantidad=orden.cantidad,
+                motivo=("Schwab rechaza TP1 independiente con STOP total "
+                        "ya WORKING; no enviar entrada REAL 70/30 sin "
+                        "salida broker-compatible"),
+            )
+            self._emit_log(
+                "ERROR",
+                f"[{ticker}] Entrada REAL 70/30 bloqueada: STOP completo "
+                "y TP1 independiente producirían sobrecierre en Schwab. "
+                "No se envió orden.",
+            )
+            return False
+
         self._audit_event(
             "ENTRY_REQUESTED", ticker=ticker, lado=prop.tipo,
             estado="PREPARADA", cantidad=orden.cantidad,
@@ -5132,37 +5157,64 @@ class ChocoletraBot:
                 )
                 return
 
-        # If a 3-share partial plan was deferred because the STOP had not become
-        # visible yet, place TP1 only after the STOP is confirmed WORKING.
+        # A standalone TP1 alongside a full-position STOP can exceed the
+        # broker's closing quantity (TSLA SELL_SHORT 3 / STOP 3 / TP1 2).
+        # Never emit the deferred TP1 here: a missing TP1 id is not evidence
+        # that sending an overlapping close is safe. Preserve the STOP.
         if (
             pos.get("salida_parcial")
-            and not pos.get('normal_exit_progress')
             and not pos.get("tp1_hit")
             and not pos.get("tp1_order_id")
             and pos.get("sl_order_id")
-            and not pos.get("sl_reconcile_pending")
+            and not pos.get("tp1_suspended_reported")
         ):
-            orden = pos.get("orden")
-            cantidad_parcial = int(getattr(orden, "cantidad_parcial", 0) or 0)
-            if cantidad_parcial > 0:
-                tp1 = self.ejecutor_hibrido.colocar_salida(
-                    ticker, pos["tipo"], cantidad_parcial, pos["tp1"],
-                    "LIMIT", self.account_number
-                )
-                tp1_id = self._submitted_exit_order_id(tp1)
-                if tp1_id:
-                    with self._lock:
-                        pos["tp1_order_id"] = tp1_id
-                        pos["tp1_reconcile_pending"] = (
-                            str((tp1 or {}).get("status", "") or "").upper()
-                            == "RECONCILIAR"
-                        )
+            with self._lock:
+                if self._posiciones.get(ticker) is not pos:
+                    return
+                pos["tp1_suspended_reported"] = True
+                pos["tp1_reconcile_pending"] = False
+            self._audit_event(
+                "TP1_SUSPENDED_CONFLICT", ticker=ticker,
+                lado=pos.get("tipo", ""), estado="NO_ORDER_SENT",
+                parent_order_id=str(pos.get("sl_order_id") or ""),
+                motivo="STOP total existente; TP1 independiente suspendido "
+                       "para evitar sobrecierre Schwab",
+            )
+            self._emit_log(
+                "ERROR", f"[{ticker}] TP1 REAL suspendido; STOP conservado. "
+                "Requiere corrección de salidas enlazadas antes de nuevo REAL 70/30.",
+            )
 
-        # TP1 llenado → mover a breakeven una vez
-        if pos["salida_parcial"] and not pos["tp1_hit"] and pos["tp1_order_id"]:
-            if self.ejecutor_hibrido._estado_orden(self.account_number, pos["tp1_order_id"]) == "FILLED":
+        # Existing TP1 order IDs remain traceable; a terminal broker reject
+        # is reported exactly once, not silently polled forever or retried.
+        if pos.get("salida_parcial") and not pos.get("tp1_hit") and pos.get("tp1_order_id"):
+            tp1_id = str(pos["tp1_order_id"])
+            tp1_status = str(
+                self.ejecutor_hibrido._estado_orden(self.account_number, tp1_id)
+                or "DESCONOCIDO"
+            ).upper()
+            if tp1_status == "FILLED":
                 self._ejecutar_parcial(ticker, pos)
                 return
+            if (tp1_status in {"REJECTED", "CANCELED", "CANCELLED",
+                               "EXPIRED", "REPLACED"}
+                    and not pos.get("tp1_terminal_reported")):
+                with self._lock:
+                    if self._posiciones.get(ticker) is not pos:
+                        return
+                    pos["tp1_terminal_reported"] = True
+                    pos["tp1_reconcile_pending"] = False
+                self._audit_event(
+                    "TP1_TERMINAL_UNFILLED", ticker=ticker,
+                    lado=pos.get("tipo", ""), estado=tp1_status,
+                    order_id=tp1_id,
+                    motivo="TP1 terminal no llenado; STOP original "
+                           "conservado y sin reenvío automático",
+                )
+                self._emit_log(
+                    "ERROR", f"[{ticker}] TP1 {tp1_status} (orden {tp1_id}); "
+                    "STOP original conservado. Verificar Schwab directamente.",
+                )
         progress = pos.get('normal_exit_progress') or {}
         if (progress and progress.get('attempts', 0) < 3
                 and time.time() >= progress.get('retry_after', float('inf'))
