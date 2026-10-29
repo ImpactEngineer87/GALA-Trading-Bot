@@ -19,6 +19,17 @@ def _ticker_list(values: Iterable[str]):
     ))
 
 
+def _unsupported_real_partial_exit(cfg: dict, shares: int) -> bool:
+    """A standalone TP1 + full STOP for >=3 shares over-closes at Schwab.
+
+    GALA's risk manager defaults salida_parcial.activo to True. Keep this
+    preflight consistent with its default and fail closed until a vetted
+    broker-linked 70/30 protective-order strategy replaces the SINGLE orders.
+    """
+    return (bool((cfg.get("salida_parcial") or {}).get("activo", True))
+            and int(shares) >= 3)
+
+
 def validate_live_start(
     cfg: dict,
     *,
@@ -85,6 +96,11 @@ def validate_live_start(
                 errors.append(
                     f"{ticker}: shares REAL debe estar entre 1 y {max_shares}"
                 )
+            elif _unsupported_real_partial_exit(cfg, shares):
+                errors.append(
+                    f"{ticker}: REAL 70/30 no seguro: TP1 independiente "
+                    "conflicta con STOP total Schwab; entrada bloqueada"
+                )
     else:
         if str(risk_cfg.get("sizing_mode", "")).lower() != "fixed":
             errors.append("risk.sizing_mode debe ser fixed durante la validación REAL")
@@ -97,6 +113,11 @@ def validate_live_start(
             )
         if fixed_shares <= 0 or fixed_shares > max_shares:
             errors.append(f"risk.fixed_shares debe estar entre 1 y {max_shares}")
+        elif _unsupported_real_partial_exit(cfg, fixed_shares):
+            errors.append(
+                "REAL 70/30 no seguro: TP1 independiente conflicta con STOP "
+                "total Schwab; entrada bloqueada"
+            )
 
     if not bool(ent_cfg.get("requerir_modelo_aprobado_en_real", True)):
         errors.append("requerir_modelo_aprobado_en_real debe permanecer true")
@@ -240,6 +261,11 @@ def validate_live_start_partitioned(
                 ticker_errors[ticker].append(
                     f"shares REAL debe estar entre 1 y {max_shares}"
                 )
+            elif _unsupported_real_partial_exit(cfg, shares):
+                ticker_errors[ticker].append(
+                    "REAL 70/30 no seguro: TP1 independiente conflicta con "
+                    "STOP total Schwab; entrada bloqueada"
+                )
     else:
         if str(risk_cfg.get("sizing_mode", "")).lower() != "fixed":
             global_errors.append(
@@ -255,6 +281,11 @@ def validate_live_start_partitioned(
         if fixed_shares <= 0 or fixed_shares > max_shares:
             global_errors.append(
                 f"risk.fixed_shares debe estar entre 1 y {max_shares}"
+            )
+        elif _unsupported_real_partial_exit(cfg, fixed_shares):
+            global_errors.append(
+                "REAL 70/30 no seguro: TP1 independiente conflicta con STOP "
+                "total Schwab; entrada bloqueada"
             )
 
     if not bool(ent_cfg.get("requerir_modelo_aprobado_en_real", True)):
