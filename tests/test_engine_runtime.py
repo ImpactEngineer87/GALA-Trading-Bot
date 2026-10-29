@@ -109,6 +109,29 @@ class EngineRuntimeTests(unittest.TestCase):
         self.bot.iniciar.assert_not_called()
         self.bot.detener.assert_not_called()
 
+    def test_duplicate_start_keeps_existing_mixed_execution_mode(self):
+        # Dashboard still sends legacy mode='paper'. A second START while
+        # running must not misreport the actual REAL/PAPER routing.
+        with patch.object(server, '_ENGINE', self.bot), patch.dict(
+                server.BOT_STATE, {'running': True, 'mode': 'mixed'}):
+            with server.app.test_request_context(
+                    '/api/bot/start', method='POST', json={'mode': 'paper'}):
+                response = server.start_bot()
+            self.assertEqual(response.json['status'], 'ok')
+            self.assertEqual(response.json['mode'], 'mixed')
+            self.assertEqual(server.BOT_STATE['mode'], 'mixed')
+
+    def test_duplicate_start_ignores_client_real_mode_when_running_paper(self):
+        # Request body cannot override the server's saved execution routing.
+        with patch.object(server, '_ENGINE', self.bot), patch.dict(
+                server.BOT_STATE, {'running': True, 'mode': 'paper'}):
+            with server.app.test_request_context(
+                    '/api/bot/start', method='POST', json={'mode': 'real'}):
+                response = server.start_bot()
+            self.assertEqual(response.json['status'], 'ok')
+            self.assertEqual(response.json['mode'], 'paper')
+            self.assertEqual(server.BOT_STATE['mode'], 'paper')
+
     def test_status_distinguishes_running_python_version_and_thread_scope(self):
         with patch.object(server, '_dashboard_stats', return_value={}), patch.object(
                 server, '_engine_daily_risk_snapshot', return_value={}), patch.object(
