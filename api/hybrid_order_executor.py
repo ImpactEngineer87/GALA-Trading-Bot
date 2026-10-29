@@ -1478,6 +1478,23 @@ class EjecutorHibridoDeOrdenes:
                                  orden.stop_loss, "STOP", account_number)
         if sl.get("status") != "OK":
             return {"tp1": {}, "sl": sl}
+        if not self.paper_trading:
+            # Last-resort guard for an already-filled REAL position. Schwab
+            # rejected TSLA's unlinked BUY_TO_COVER TP1 2 while its full STOP 3
+            # was WORKING. Keep the acknowledged full STOP and never send a
+            # second closing order exceeding broker exposure. New partial REAL
+            # entries are blocked in the engine until a linked exit is verified.
+            self._audit(
+                "TP1_SUSPENDED_CONFLICT",
+                ticker=orden.ticker, lado=orden.tipo,
+                estado="NO_ORDER_SENT",
+                parent_order_id=str(sl.get("order_id") or ""),
+                cantidad=orden.cantidad_parcial,
+                precio=orden.take_profit_parcial,
+                motivo="Standalone TP1 conflicts with a full-position STOP; "
+                       "Schwab oversold/overbought rejection",
+            )
+            return {"tp1": {}, "sl": sl, "partial_exit_suspended": True}
         tp1 = self.colocar_salida(orden.ticker, orden.tipo, orden.cantidad_parcial,
                                   orden.take_profit_parcial, "LIMIT", account_number)
         return {"tp1": tp1, "sl": sl}
