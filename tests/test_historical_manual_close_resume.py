@@ -149,6 +149,34 @@ class ManualCloseHistoricalResumeTests(unittest.TestCase):
         self.assertEqual(state["unresolved"], 3)
         self.assertTrue(state["historical_resume_active"])
 
+    def test_engine_authorizes_original_account_after_schwab_hash_resolution(self):
+        # Schwab order APIs require a hashed account ID. The operator grant was
+        # explicitly bound to the original account number before preparation.
+        bot = ChocoletraBot.__new__(ChocoletraBot)
+        bot.config = self.config
+        bot._account_plain = self.account
+        bot.account_number = "schwab-api-hash-for-same-account"
+        bot.real_accounting_guard = RealAccountingGuard(self.state_path)
+        bot._ahora_et = lambda: self.now
+        with patch("core.historical_manual_resume._trusted_approval_file", return_value=True):
+            state = bot._real_accounting_status()
+        self.assertFalse(state["entry_blocked"])
+        self.assertTrue(state["historical_resume_active"])
+        self.assertEqual(state["unresolved"], 3)
+        self.assertEqual(bot.account_number, "schwab-api-hash-for-same-account")
+
+    def test_engine_never_approves_wrong_original_account_after_hashing(self):
+        bot = ChocoletraBot.__new__(ChocoletraBot)
+        bot.config = self.config
+        bot._account_plain = "another-plain-account"
+        bot.account_number = "broker-hash"
+        bot.real_accounting_guard = RealAccountingGuard(self.state_path)
+        bot._ahora_et = lambda: self.now
+        with patch("core.historical_manual_resume._trusted_approval_file", return_value=True):
+            state = bot._real_accounting_status()
+        self.assertTrue(state["entry_blocked"])
+        self.assertFalse(state["historical_resume_active"])
+
     def test_accounting_runtime_failure_must_override_historical_grant(self):
         bot = ChocoletraBot.__new__(ChocoletraBot)
         bot.config = self.config
