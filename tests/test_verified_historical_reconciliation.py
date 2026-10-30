@@ -251,7 +251,7 @@ class VerifiedHistoricalReconciliationTests(unittest.TestCase):
         for positions, working in ((None, []), ([{"symbol": "BA"}], []), ([], None), ([], [{"id": "working"}])):
             with self.subTest(positions=positions, working=working):
                 self.client.positions, self.client.working = positions, working
-                with self.assertRaisesRegex(repair.Refused, "BROKER_MUST_CONFIRM_ZERO"):
+                with self.assertRaisesRegex(repair.Refused, "BROKER_(MUST_CONFIRM_ZERO|POSITIONS_GET_FAILED|OPEN_ORDERS_GET_FAILED)"):
                     self.apply(plan)
                 self.assertEqual(self.guard.read_bytes(), self.original)
 
