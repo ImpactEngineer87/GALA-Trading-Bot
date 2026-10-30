@@ -3247,7 +3247,10 @@ def start_bot():
             ),
         }), 409
 
-    BOT_STATE["mode"] = data.get("mode", "paper")
+    # Per-ticker execution is authoritative. The dashboard's legacy START
+    # request includes mode='paper' even for mixed REAL/PAPER trading. Do not
+    # overwrite the running engine's computed mode on a repeated START call.
+    # _start_engine_controlled recomputes mode from REAL-routed tickers.
     runtime_cfg = _read_config_runtime()
     configured_capital = float(
         ((runtime_cfg.get("risk", {}) or {}).get("operating_capital_usd", 10000) or 10000)

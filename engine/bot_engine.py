@@ -821,7 +821,11 @@ class ChocoletraBot:
             from core.historical_manual_resume import exception_status
             approval = exception_status(
                 getattr(self, "config", {}) or {}, guard.store.path,
-                getattr(self, "account_number", ""), 
+                # The approval is bound to the plain account identity. Trading
+                # preparation replaces account_number with Schwab's broker hash;
+                # never use that API routing token to validate an operator grant.
+                (getattr(self, "_account_plain", "") or
+                 getattr(self, "account_number", "")),
                 now=self._ahora_et() if callable(getattr(self, "_ahora_et", None)) else None,
             )
             snapshot.update(approval)
