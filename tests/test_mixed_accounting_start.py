@@ -137,6 +137,26 @@ class MixedAccountingStartupTests(unittest.TestCase):
         self.assertFalse(broker_confirmed_flat(
             self.config, "", BadBroker))
 
+    def test_hard_accounting_quarantine_survives_data_recovery(self):
+        from engine.bot_engine import ChocoletraBot
+
+        bot = ChocoletraBot.__new__(ChocoletraBot)
+        bot.config = {"live_trading": {"runtime_isolate_ticker_failures": True}}
+        bot._ticker_quarantine = {"BA": "REAL_ACCOUNTING_UNRESOLVED"}
+        bot._ticker_quarantine_health = {}
+        bot.execution_mode_for = lambda ticker: "REAL"
+        bot._audit_event = lambda *args, **kwargs: None
+        bot._emit_log = lambda *args, **kwargs: None
+
+        bot._quarantine_real_ticker("BA", "Synthetic market data")
+        self.assertEqual(bot._ticker_quarantine["BA"],
+                         "REAL_ACCOUNTING_UNRESOLVED")
+        self.assertFalse(bot._recover_ticker_quarantine("BA", "market_data"))
+        self.assertFalse(bot._recover_ticker_quarantine("BA", "model"))
+        self.assertFalse(bot._recover_ticker_quarantine("BA", "inference"))
+        self.assertEqual(bot._ticker_quarantine["BA"],
+                         "REAL_ACCOUNTING_UNRESOLVED")
+
 
 if __name__ == "__main__":
     unittest.main()
