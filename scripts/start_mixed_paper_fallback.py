@@ -85,6 +85,11 @@ def main():
         require(status.get("status") == "ok"
                 and isinstance(status.get("bot"), dict),
                 "Dashboard status invalid")
+        require(
+            status["bot"].get("mixed_accounting_startup_policy")
+            == "REAL_ACCOUNTING_HOLD_PAPER_ONLY_V1",
+            "Dashboard process is not running the patched mixed startup code"
+        )
         require(status["bot"].get("running") is False,
                 "Engine already running; refusing to restart or alter it")
 
