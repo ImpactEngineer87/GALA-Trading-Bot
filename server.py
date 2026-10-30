@@ -3057,7 +3057,44 @@ def _start_engine_controlled(source: str, capital: float = None):
             return False, mensaje
 
         fallback_notes = []
+        accounting_paper_fallback = False
         if real_tickers:
+            # An unresolved REAL accounting guard must not stop the PAPER
+            # universe. Quarantine ALL configured REAL tickers for this engine
+            # lifetime. Do not rewrite their persisted REAL selections and
+            # do not use an operator exception unless it is already valid.
+            from core.mixed_accounting_start import (
+                unresolved_real_accounting, broker_confirmed_flat,
+            )
+            account = str(BOT_STATE.get("account_number") or
+                          get_env("SCHWAB_ACCOUNT_NUMBER", "") or "").strip()
+            accounting_paper_fallback, accounting_reason = (
+                unresolved_real_accounting(cfg, BASE_DIR, account)
+            )
+            if accounting_paper_fallback:
+                # Do not strand real exposure by starting an engine that will
+                # intentionally quarantine its REAL entry universe.
+                if not broker_confirmed_flat(cfg, account):
+                    mensaje = (
+                        "MIXED PAPER START BLOCKED: Schwab account is not "
+                        "freshly verified flat with zero open orders. "
+                        "No REAL accounting bypass is permitted."
+                    )
+                    _log("ERROR", f"[MixedAccounting] {mensaje}")
+                    return False, mensaje
+                for ticker in real_tickers:
+                    _STARTUP_QUARANTINE[ticker] = "REAL_ACCOUNTING_UNRESOLVED"
+                fallback_notes.append(
+                    "REAL entries remain blocked by accounting; "
+                    "PAPER tickers only (saved MIXED routing unchanged)"
+                )
+                _log(
+                    "WARN",
+                    "[MixedAccounting] ALL configured REAL tickers are "
+                    "runtime-quarantined: " + ", ".join(real_tickers)
+                    + " | reason=" + accounting_reason,
+                )
+        if real_tickers and not accounting_paper_fallback:
             live_cfg = cfg.get("live_trading", {}) or {}
             isolate = bool(
                 live_cfg.get("preflight_isolate_ticker_failures", True)
