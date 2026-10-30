@@ -252,6 +252,8 @@ def verify_broker_flat(client, account, account_hash):
                 bool(security.get("type")), "BROKER_POSITIONS_ACCOUNT_INVALID")
         # Schwab omits the positions key for a genuinely empty account.
         require(security.get("positions", []) == [], "BROKER_MUST_CONFIRM_ZERO_POSITIONS_AND_ORDERS")
+    except Refused:
+        raise
     except (TypeError, ValueError, AttributeError):
         raise Refused("BROKER_POSITIONS_RESPONSE_INVALID")
     now = datetime.now(timezone.utc)
@@ -269,6 +271,8 @@ def verify_broker_flat(client, account, account_hash):
         orders = orders_response.json()
         require(isinstance(orders, list), "BROKER_OPEN_ORDERS_RESPONSE_INVALID")
         require(orders == [], "BROKER_MUST_CONFIRM_ZERO_POSITIONS_AND_ORDERS")
+    except Refused:
+        raise
     except (TypeError, ValueError, AttributeError):
         raise Refused("BROKER_OPEN_ORDERS_RESPONSE_INVALID")
 
