@@ -2325,6 +2325,10 @@ class ChocoletraBot:
             return
         reason = str(reason or 'Temporary REAL safety block')
         previous = self._ticker_quarantine.get(ticker)
+        # The startup REAL accounting hold is a hard, session-long entry gate.
+        # Market-data/model recovery must never replace it with a soft guard.
+        if previous == 'REAL_ACCOUNTING_UNRESOLVED':
+            return
         self._ticker_quarantine[ticker] = reason
         self._ticker_quarantine_health[ticker] = 0
         if previous != reason:
@@ -2363,6 +2367,10 @@ class ChocoletraBot:
         ticker = str(ticker or '').strip().upper()
         reason = self._ticker_quarantine.get(ticker)
         if not reason:
+            return False
+        # A fresh, independently approved restart is required to lift this
+        # startup quarantine; healthy candles/models cannot release it.
+        if reason == 'REAL_ACCOUNTING_UNRESOLVED':
             return False
         if self._quarantine_reason_category(reason) != str(category or ''):
             return False
