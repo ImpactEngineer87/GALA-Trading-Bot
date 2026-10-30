@@ -79,32 +79,44 @@ def load_runtime(root):
     return cfg, guard, raw, state, path(log.get("historial_operaciones", "data/historial_operaciones.csv")), path(log.get("auditoria_ordenes", "data/auditoria_ordenes.csv"))
 
 
-def scope_for(root, position_ref, day, now=None):
+def scope_for(root, position_ref, day, now=None, *, history_only=False):
     from core.dashboard_evidence import mode_of, session_date
     now = now or datetime.now(timezone.utc)
     require(date.fromisoformat(day) < now.astimezone(NY).date(), "PAST_SESSIONS_ONLY")
     cfg, guard, raw, state, history_path, audit_path = load_runtime(root)
-    keys = [key for key, row in state["unresolved"].items()
-            if not str(key).startswith(("history:", "pending_exit:")) and reference(key) == position_ref]
-    require(len(keys) == 1, "EXACT_RUNTIME_POSITION_REQUIRED")
-    position_id = keys[0]
-    require(position_id not in state.get(ARCHIVE_KEY, {}), "POSITION_ALREADY_RECONCILED_REVIEW_REQUIRED")
-    runtime = state["unresolved"][position_id]
-    require(runtime.get("kind") in (None, ""), "UNSUPPORTED_ACCOUNTING_RECORD_KIND")
     with history_path.open(encoding="utf-8-sig", newline="") as handle:
-        history = [row for row in csv.DictReader(handle)
-                   if mode_of(row) == "REAL" and session_date(row) == day and row.get("position_id") == position_id]
+        dated = [row for row in csv.DictReader(handle)
+                 if mode_of(row) == "REAL" and session_date(row) == day]
+    if history_only:
+        candidates = {row.get("position_id") for row in dated
+                      if row.get("evento") == "POSITION_CLOSE" and row.get("position_id")
+                      and reference(row["position_id"]) == position_ref}
+        require(len(candidates) == 1, "EXACT_HISTORY_POSITION_REQUIRED")
+        position_id = candidates.pop()
+        require(position_id not in state["unresolved"], "RUNTIME_GUARD_REQUIRES_STANDARD_MODE")
+    else:
+        keys = [key for key, row in state["unresolved"].items()
+                if not str(key).startswith(("history:", "pending_exit:")) and reference(key) == position_ref]
+        require(len(keys) == 1, "EXACT_RUNTIME_POSITION_REQUIRED")
+        position_id = keys[0]
+        runtime = state["unresolved"][position_id]
+        require(runtime.get("kind") in (None, ""), "UNSUPPORTED_ACCOUNTING_RECORD_KIND")
+    require(position_id not in state.get(ARCHIVE_KEY, {}), "POSITION_ALREADY_RECONCILED_REVIEW_REQUIRED")
+    history = [row for row in dated if row.get("position_id") == position_id]
     closes = [r for r in history if r.get("evento") == "POSITION_CLOSE"]
     require(len(closes) == 1, "ONE_EXACT_HISTORY_CLOSE_REQUIRED")
     row = closes[0]
-    require(row.get("ticker") == runtime.get("ticker") and bool(row.get("execution_id")), "LOCAL_IDENTITY_INCOMPLETE")
+    require(bool(row.get("ticker")) and bool(row.get("execution_id")), "LOCAL_IDENTITY_INCOMPLETE")
+    if not history_only:
+        require(row["ticker"] == runtime.get("ticker"), "LOCAL_IDENTITY_INCOMPLETE")
     require(row.get("position_side") in {"LONG", "SHORT"}, "LOCAL_DIRECTION_INCOMPLETE")
     require(row.get("lado") in (None, "", "BUY" if row["position_side"] == "LONG" else "SELL"), "LOCAL_DIRECTION_CONTRADICTORY")
     qty, entry = positive(row.get("cantidad")), positive(row.get("entrada"))
     require(qty is not None and entry is not None, "LOCAL_QUANTITY_OR_ENTRY_INVALID")
     entry_id, exit_id = row.get("parent_order_id"), row.get("order_id")
     require(bool(entry_id) and bool(exit_id) and entry_id != exit_id, "BOTH_EXACT_RECORDED_ORDER_IDS_REQUIRED")
-    require(runtime.get("entry_order_id") == entry_id and runtime.get("exit_order_id") == exit_id, "RUNTIME_HISTORY_ORDER_IDS_DIFFER")
+    if not history_only:
+        require(runtime.get("entry_order_id") == entry_id and runtime.get("exit_order_id") == exit_id, "RUNTIME_HISTORY_ORDER_IDS_DIFFER")
     history_key = "history:" + day + ":" + str(row.get("history_id") or position_id)
     require(history_key in state["unresolved"] and state["unresolved"][history_key].get("ticker") == row["ticker"], "EXACT_HISTORY_GUARD_REQUIRED")
     saved_history = state["unresolved"][history_key]
@@ -112,6 +124,18 @@ def scope_for(root, position_ref, day, now=None):
     for field, expected in (("position_id", position_id), ("entry_order_id", entry_id), ("exit_order_id", exit_id)):
         require(saved_history.get(field) in (None, "", expected), "HISTORY_GUARD_IDENTITY_DIFFERS")
     require(all(r.get("evento") in {"POSITION_OPEN", "POSITION_CLOSE"} for r in history), "PARTIAL_HISTORY_REQUIRES_SEPARATE_REVIEW")
+    if history_only:
+        opens = [r for r in history if r.get("evento") == "POSITION_OPEN"]
+        require(len(opens) == 1, "ONE_EXACT_HISTORY_OPEN_REQUIRED")
+        opening = opens[0]
+        require(opening.get("execution_id") == row["execution_id"] and
+                opening.get("order_id") == entry_id and opening.get("ticker") == row["ticker"] and
+                opening.get("position_side") == row["position_side"] and
+                positive(opening.get("cantidad")) == qty and
+                positive(opening.get("entrada")) == entry,
+                "HISTORY_OPEN_CLOSE_IDENTITY_DIFFERS")
+        require(not row.get("salida") and not row.get("pnl_usd"),
+                "HISTORY_ALREADY_PRICED_REVIEW_REQUIRED")
     with audit_path.open(encoding="utf-8-sig", newline="") as handle:
         audit = [r for r in csv.DictReader(handle)
                  if mode_of(r) == "REAL" and r.get("ticker") == row["ticker"]
@@ -132,7 +156,9 @@ def scope_for(root, position_ref, day, now=None):
     return {"root": str(root), "cfg": cfg, "guard": guard, "guard_raw": raw, "state": state,
             "position_id": position_id, "position_ref": position_ref, "day": day,
             "ticker": row["ticker"], "side": row["position_side"], "qty": qty, "entry": entry,
-            "entry_id": entry_id, "exit_id": exit_id, "keys": [position_id, history_key],
+            "entry_id": entry_id, "exit_id": exit_id,
+            "history_only": history_only,
+            "keys": [history_key] if history_only else [position_id, history_key],
             "local_fingerprint": digest({"history": history, "audit": audit})}
 
 
@@ -188,7 +214,7 @@ def plan_for(scope, proof):
     plan = {"format": 1, "action": "ARCHIVE_VERIFIED_PAST_ACCOUNTING", "root": scope["root"],
             "position_id": scope["position_id"], "position_ref": scope["position_ref"], "session_ny": scope["day"],
             "ticker": scope["ticker"], "guard_sha256": digest(scope["guard_raw"]), "local_fingerprint": scope["local_fingerprint"],
-            "keys": scope["keys"], "verified_proof": identity}
+            "keys": scope["keys"], "history_only": scope["history_only"], "verified_proof": identity}
     plan["fingerprint"] = digest(plan)
     return plan
 
@@ -224,7 +250,8 @@ def apply_plan(root, plan, client, account, account_hash, backup_root, *, check_
     lock_fd = os.open(guard.with_suffix(guard.suffix + ".reconcile.lock"), os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     with os.fdopen(lock_fd, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        scope = scope_for(root, plan["position_ref"], plan["session_ny"], now)
+        scope = scope_for(root, plan["position_ref"], plan["session_ny"], now,
+                          history_only=plan.get("history_only", False))
         require(client.obtener_posiciones(account) == [] and client.obtener_ordenes_abiertas(account) == [], "BROKER_MUST_CONFIRM_ZERO_POSITIONS_AND_ORDERS")
         proof = proof_for(scope, client, account, account_hash)
         require(plan_for(scope, proof) == plan, "PLAN_STALE_OR_BROKER_EVIDENCE_CHANGED")
@@ -285,18 +312,20 @@ def main(argv=None):
     parser.add_argument("--runtime-root", required=True, type=Path)
     parser.add_argument("--date", type=date.fromisoformat)
     parser.add_argument("--position-ref")
+    parser.add_argument("--history-only", action="store_true", help="Allow exactly one verified history guard without a runtime guard")
     parser.add_argument("--backup-root", type=Path, default=Path("/opt/gala/backups"))
     args = parser.parse_args(argv)
     root = args.runtime_root.resolve()
     sys.path.insert(0, str(root))
     if args.prepare:
         require(args.date is not None and bool(args.position_ref), "DATE_AND_POSITION_REFERENCE_REQUIRED")
-        scope = scope_for(root, args.position_ref, args.date.isoformat())
+        scope = scope_for(root, args.position_ref, args.date.isoformat(), history_only=args.history_only)
         cfg = scope["cfg"]
     else:
         require(os.geteuid() == 0, "ROOT_MAINTENANCE_REQUIRED")
         service_stopped()
         plan = json.loads(args.apply.read_text(encoding="utf-8"))
+        require(not args.history_only or plan.get("history_only") is True, "PLAN_MODE_DIFFERS")
         cfg = load_runtime(root)[0]
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         from api.schwab_client import SchwabClient, TRADER_URL
