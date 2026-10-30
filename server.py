@@ -871,16 +871,17 @@ def _engine_daily_risk_snapshot():
         # truth as the running engine. Never present an absent field as proof
         # that the historical guard is cleared.
         from core.real_accounting import RealAccountingGuard
-        from core.historical_manual_resume import exception_status
+        from core.accounting_entry_policy import exception_status
         from core.project_paths import resolve_runtime_path
         account_path = resolve_runtime_path(
             (cfg.get("execution_engine") or {}).get(
                 "accounting_state_path", "data/real_accounting_reconciliation.json"),
             project_root=BASE_DIR)
-        accounting = RealAccountingGuard(account_path).snapshot()
+        accounting_guard = RealAccountingGuard(account_path)
+        accounting = accounting_guard.snapshot()
         accounting["entry_blocked"] = bool(accounting["blocked"])
         accounting["historical_resume_active"] = False
-        if accounting["blocked"]:
+        if accounting["blocked"] and not accounting_guard._failure:
             account = str(BOT_STATE.get("account_number") or get_env(
                 "SCHWAB_ACCOUNT_NUMBER", "") or "").strip()
             accounting.update(exception_status(cfg, account_path, account, root=BASE_DIR))
@@ -4090,7 +4091,7 @@ def get_ticker_execution():
     rows = _ticker_execution_rows(cfg, persist_missing=True)
     allowed = set(str(t).upper() for t in (live.get("allowed_tickers") or []))
     max_real_shares = max(1, int(live.get("max_shares_per_order", 1) or 1))
-    max_paper_shares = max(1, int(live.get("max_paper_shares_per_order", 1000) or 1000))
+    max_paper_shares = max(1, int(live.get("max_paper_shares_per_order", 100000) or 100000))
     max_real_tickers = real_ticker_limit(live)
     max_paper_positions = max(1, int(live.get("max_paper_positions", 30) or 30))
     max_real_positions = max(1, int(live.get("max_real_positions", 30) or 30))
@@ -4099,6 +4100,15 @@ def get_ticker_execution():
     partial_enabled = bool(partial_cfg.get("activo", True))
     partial_pct = float(partial_cfg.get("pct_primer_objetivo", 0.70) or 0.70)
     from core.ticker_analysis import partial_share_plan
+    from core.live_guard import _unsupported_real_partial_exit
+    from core.exit_policy import effective_partial_enabled, real_exit_policy
+    risk = _engine_daily_risk_snapshot()
+    accounting = risk.get("real_accounting")
+    accounting = accounting if isinstance(accounting, dict) else {}
+    accounting_gate = accounting.get("entry_blocked", accounting.get("blocked"))
+    accounting_known = isinstance(accounting_gate, bool)
+    accounting_blocked = accounting_gate if accounting_known else True
+    quarantine = dict(getattr(_ENGINE, "_ticker_quarantine", {}) or {})
     for row in rows:
         row["real_allowed"] = (not allowed) or row["ticker"] in allowed
         row["real_block_reason"] = (
@@ -4108,14 +4118,37 @@ def get_ticker_execution():
         )
         row["max_real_shares"] = max_real_shares
         row["partial_plan"] = partial_share_plan(
-            row.get("shares", 1), partial_pct, partial_enabled
+            row.get("shares", 1), partial_pct,
+            effective_partial_enabled(cfg, paper=row.get("effective_mode", row["mode"]) != "REAL")
         )
+        blockers = []
+        if risk.get("blocked"):
+            blockers.append({"code": "DAILY_LOSS_BLOCK", "message": "Límite diario de pérdida activo"})
+        if row.get("effective_mode", row["mode"]) == "REAL":
+            if not row["real_allowed"]:
+                blockers.append({"code": "REAL_NOT_ALLOWED", "message": row["real_block_reason"]})
+            if not accounting_known:
+                blockers.append({"code": "REAL_ACCOUNTING_UNAVAILABLE", "message": "Estado de contabilidad REAL no verificable"})
+            elif accounting_blocked:
+                blockers.append({"code": "REAL_ACCOUNTING_UNRESOLVED", "message": "Contabilidad REAL pendiente de reconciliación"})
+            if row["ticker"] in quarantine:
+                blockers.append({"code": "REAL_STARTUP_QUARANTINE", "message": str(quarantine[row["ticker"]])})
+            if _unsupported_real_partial_exit(cfg, row.get("shares", 1)):
+                blockers.append({"code": "REAL_PARTIAL_EXIT_UNSUPPORTED", "message": "REAL 70/30 bloqueado: TP1 independiente y STOP total no son compatibles en Schwab"})
+        # Saved routing is not proof that a ticker may submit an order. These
+        # read-only blockers are explanatory; entry-time guards remain authority.
+        row["entry_blocked"] = bool(blockers)
+        row["entry_blockers"] = blockers
+        row["entry_status"] = "BLOCKED" if blockers else "NO_KNOWN_BLOCK"
     return jsonify({
         "status": "ok",
         "per_ticker_execution": bool(live.get("per_ticker_execution", False)),
         "max_real_tickers": max_real_tickers,
         "capacity": getattr(getattr(_ENGINE, "real_capacity", None), "last", {}),
-        "quarantine": getattr(_ENGINE, "_ticker_quarantine", {}),
+        "quarantine": quarantine,
+        "real_accounting": accounting,
+        "real_partial_exit_supported": False,
+        "real_exit_policy": real_exit_policy(cfg),
         "max_real_shares": max_real_shares,
         "max_paper_shares": max_paper_shares,
         "max_paper_positions": max_paper_positions,

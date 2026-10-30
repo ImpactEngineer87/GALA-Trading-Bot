@@ -140,6 +140,7 @@ class GestorDeRiesgo:
         stop_loss_override: Optional[float] = None,
         take_profit_override: Optional[float] = None,
         cantidad_override: Optional[int] = None,
+        partial_exit_override: Optional[bool] = None,
     ) -> Optional[OrdenTradingCalculada]:
         """
         Calcula los parámetros completos de una orden LIMIT, incluyendo el
@@ -221,7 +222,11 @@ class GestorDeRiesgo:
 
         # Clamp: TP1 SIEMPRE debe caer estrictamente entre la entrada y el TP final,
         # si no, la salida parcial no tiene sentido (TP1 no puede superar el objetivo).
-        salida_parcial_ok = self.salida_parcial_activa and cantidad >= 3
+        if partial_exit_override is not None and not isinstance(partial_exit_override, bool):
+            raise ValueError("partial_exit_override must be a boolean")
+        partial_enabled = (self.salida_parcial_activa if partial_exit_override is None
+                           else partial_exit_override)
+        salida_parcial_ok = partial_enabled and cantidad >= 3
         if salida_parcial_ok:
             if tipo == 'BUY':
                 if take_profit > precio_limite:
@@ -242,6 +247,8 @@ class GestorDeRiesgo:
 
         # --- Reparto 70/30 ---
         cantidad_parcial, cantidad_resto = self._repartir_cantidad(cantidad, salida_parcial_ok)
+        if partial_exit_override is False:
+            cantidad_parcial, cantidad_resto = 0, cantidad
 
         # Redondear a 2 decimales y GARANTIZAR separación mínima de 1 centavo entre
         # entrada y SL. distancia_sl se validó con valores SIN redondear; en un ticker

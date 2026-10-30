@@ -1604,7 +1604,15 @@ async function toggleBot(el){
   } catch(e){ el.checked = !el.checked; toast('err','Error',String(e)); }
 }
 function updateBotUI(running,runtime){
-  S.botRunning = running;
+  const changed=S.botRunning!==!!running;
+  S.botRunning = !!running;
+  if(S.tickerExecutionMeta)S.tickerExecutionMeta.bot_running=S.botRunning;
+  if(changed){
+    // Invalidate an in-flight settings poll from before this start/stop result.
+    S.execRevision=(S.execRevision||0)+1;
+    if(typeof renderRealLimitControls==='function')renderRealLimitControls();
+    if(typeof renderTickerExecution==='function')renderTickerExecution();
+  }
   document.getElementById('botToggle').checked = running;
   const s = document.getElementById('botStatus');
   s.textContent = runtime?.state==='FAILED' ? 'ERROR MOTOR' : runtime?.state==='STARTING' ? 'INICIANDO' : running ? 'ACTIVO' : 'PARADO';
@@ -1661,7 +1669,9 @@ function updateDailyRisk(risk){
   if(!card) return;
   const enabled = risk.enabled !== false;
   const blocked = !!risk.blocked;
-  const accountingBlocked = !!(risk.real_accounting || {}).blocked;
+  const accounting = risk.real_accounting || {};
+  const accountingBlocked = !!(accounting.entry_blocked ?? accounting.blocked);
+  const historicalPending = !!accounting.blocked && !accountingBlocked;
   const net = risk.net_pnl == null ? null : Number(risk.net_pnl);
   const limit = Number(risk.limit_usd || 0);
   const room = risk.remaining_to_limit_usd == null ? null : Number(risk.remaining_to_limit_usd);
@@ -1673,6 +1683,8 @@ function updateDailyRisk(risk){
     ? '⛔ NUEVAS ENTRADAS REAL BLOQUEADAS: CONTABILIDAD PENDIENTE'
     : blocked
     ? '⛔ BLOQUEADO POR PÉRDIDA DIARIA'
+    : historicalPending
+    ? '📋 CONTABILIDAD HISTÓRICA PENDIENTE · EXCEPCIÓN DE ENTRADA VIGENTE'
     : (enabled ? '🛡️ Kill Switch diario preparado' : '⚠️ Kill Switch diario desactivado');
   const realized = risk.realized_pnl == null ? null : Number(risk.realized_pnl);
   const unrealized = Number(risk.unrealized_pnl || 0);
@@ -1680,6 +1692,8 @@ function updateDailyRisk(risk){
     ? `Reconciliar ejecuciones Schwab · ${(risk.real_accounting.reasons || []).join('; ')} · protecciones existentes siguen activas`
     : blocked
     ? `${risk.trigger_mode || risk.mode || 'PAPER'} · ${risk.reason || ''} · reinicio ${risk.next_reset_at_ny || 'próxima sesión NY'}`
+    : historicalPending
+    ? 'Registros históricos sin resolver. La excepción permite evaluar nuevas entradas; los controles de riesgo, modelo y broker siguen activos.'
     : `${risk.mode || 'PAPER'} · Realizado ${money(realized)} · No realizado ${money(unrealized)}${risk.pricing_complete === false ? ' · valoración incompleta' : ''}`;
   card.classList.toggle('blocked', blocked || accountingBlocked);
 }
@@ -3482,9 +3496,10 @@ async function fetchTickerExecution(){
   }
 }
 function aiRowForTicker(ticker){return (S.aiStatus||[]).find(row=>String(row.ticker||'').toUpperCase()===String(ticker).toUpperCase())||null;}
-function partialPlanForShares(shares){
+function partialPlanForShares(shares,mode='PAPER'){
   const qty=Number(shares),meta=S.tickerExecutionMeta||{};
   if(!Number.isSafeInteger(qty)||qty<1)return {enabled:false,text:'Introduzca una cantidad entera'};
+  if(mode==='REAL'&&meta.real_exit_policy==='FULL_POSITION')return {enabled:false,text:`Salida completa: ${qty} acciones · STOP total`};
   if(meta.partial_exit_enabled===false)return {enabled:false,text:'Salida parcial desactivada'};
   if(qty<3)return {enabled:false,text:'Sin parcial (<3)'};
   const pct=Math.max(0,Math.min(1,Number(meta.partial_exit_pct??.70)));
@@ -3492,12 +3507,14 @@ function partialPlanForShares(shares){
   const raw=qty*pct,lower=Math.floor(raw);
   const rounded=raw-lower===.5?lower+(lower%2):Math.round(raw);
   const partial=Math.max(1,Math.min(rounded,qty-1)),runner=qty-partial;
+  if(mode==='REAL'&&meta.real_partial_exit_supported===false)
+    return {enabled:true,blocked:true,partial,runner,text:`REAL bloqueado: TP1 ${partial} + resto ${runner} no compatible`};
   return {enabled:true,partial,runner,text:`TP1 ${partial} + resto ${runner}`};
 }
-function renderExecPartialPlan(ticker,shares){
+function renderExecPartialPlan(ticker,shares,mode){
   const target=el('exec-plan-'+ticker);if(!target)return;
-  const plan=partialPlanForShares(shares);target.textContent=plan.text;
-  target.style.color=plan.enabled?'#b8d9ff':'#a5b4cc';
+  const plan=partialPlanForShares(shares,mode);target.textContent=plan.text;
+  target.style.color=plan.blocked?'#fca5a5':plan.enabled?'#b8d9ff':'#a5b4cc';
 }
 function execSavedRow(ticker){return (S.tickerExecution||[]).find(row=>row.ticker===ticker);}
 function execRowIssue(ticker,draft){
@@ -3513,6 +3530,15 @@ function execRowIssue(ticker,draft){
   if(qty>max)return `La cantidad supera el máximo ${mode} guardado (${max}). ${mode==='REAL'?'Ajuste el máximo REAL de arriba o reduzca esta cantidad.':'Reduzca esta cantidad.'}`;
   if(mode==='REAL'&&row.real_allowed===false)return 'Este ticker no está autorizado en la lista REAL.';
   return '';
+}
+function tickerEntryStatus(row){
+  const mode=row.effective_mode||row.mode||'N/D';
+  if(row.entry_blocked===true){
+    const reasons=(row.entry_blockers||[]).map(item=>item.message||item.code).filter(Boolean);
+    return `${mode} · entradas bloqueadas${reasons.length?' · '+reasons.join('; '):''}`;
+  }
+  if(row.entry_status==='NO_KNOWN_BLOCK')return `${mode} · sin bloqueo conocido; cada señal requiere validación`;
+  return `${mode} · estado de entradas no verificable`;
 }
 function renderTickerExecution(){
   const body=el('tickerExecutionRows');if(!body)return;
@@ -3541,7 +3567,7 @@ function renderTickerExecution(){
     let tr=el('exec-row-'+ticker);
     if(!tr){
       tr=document.createElement('tr');tr.id='exec-row-'+ticker;tr.dataset.ticker=ticker;
-      tr.innerHTML=`<td data-label="Ticker"><div class="exec-ticker notranslate" translate="no">${escaped}</div><span id="exec-badge-${escaped}" class="exec-badge"></span></td>
+      tr.innerHTML=`<td data-label="Ticker"><div class="exec-ticker notranslate" translate="no">${escaped}</div><span id="exec-badge-${escaped}" class="exec-badge"></span><div class="exec-ai-detail" id="exec-entry-${escaped}" role="status"></div></td>
         <td data-label="Ejecución"><select class="exec-mode-select" id="exec-mode-${escaped}" aria-label="Ejecución de ${escaped}"><option value="PAPER">PAPER</option><option value="REAL">REAL</option></select></td>
         <td data-label="Acciones por orden"><input class="exec-shares-input" id="exec-shares-${escaped}" type="number" min="1" step="1" inputmode="numeric" aria-label="Acciones de ${escaped}" aria-describedby="exec-quantity-note-${escaped}"><div class="exec-saved-value" id="exec-quantity-note-${escaped}"></div><button class="exec-cap-action" id="exec-raise-${escaped}" hidden>Ajustar máximo REAL ↑</button></td>
         <td data-label="Salida parcial"><span class="exec-muted" id="exec-plan-${escaped}"></span></td>
@@ -3574,11 +3600,13 @@ function renderTickerExecution(){
     shareInput.setAttribute('aria-invalid',String(!!issue));
     tr.dataset.dirty=String(!!draft);
     const badge=el('exec-badge-'+ticker);badge.className='exec-badge '+row.mode;badge.textContent=row.mode;
+    const entryStatus=el('exec-entry-'+ticker);entryStatus.textContent=tickerEntryStatus(row);
+    entryStatus.style.color=row.entry_blocked?'#fca5a5':'#a5b4cc';
     el('exec-quantity-note-'+ticker).textContent=`Guardado: ${row.shares} · Máximo: ${max}`;
     const raise=el('exec-raise-'+ticker);raise.hidden=!(mode==='REAL'&&Number(shares)>max);raise.disabled=running||saving;
     const raiseTickers=el('exec-raise-tickers-'+ticker);
     raiseTickers.hidden=!(mode==='REAL'&&row.mode!=='REAL'&&real>=Number(meta.max_real_tickers));raiseTickers.disabled=running||saving;
-    renderExecPartialPlan(ticker,shares);
+    renderExecPartialPlan(ticker,shares,mode);
     const ai=aiRowForTicker(ticker),production=!!ai?.production_model_loaded,shadow=!!ai?.shadow_model_loaded;
     const model=el('exec-model-'+ticker);model.className='exec-model-badge '+(production?'production':shadow?'shadow':'');
     model.textContent=production?(ai.production_manual_override?'● Producción · override':'● Producción'):shadow?'● En validación':'○ Sin modelo';
@@ -3669,7 +3697,7 @@ async function applyTickerExecution(ticker){
   const ai = aiRowForTicker(ticker);
   const progress = ai ? `${aiCountText(ai.new_observations)}/${aiCountText(ai.retrain_samples)}` : 'actual';
   if(mode === 'REAL' && saved.mode !== 'REAL'){
-    const plan=partialPlanForShares(shares);
+    const plan=partialPlanForShares(shares,mode);
     const planText=plan.enabled?`\nPlan parcial: ${plan.text}.`:`\nPlan parcial: no activo con menos de 3 acciones.`;
     const ok = confirm(
       `⚠️ Activar REAL para ${ticker} con ${shares} acción(es)?\n\n` +

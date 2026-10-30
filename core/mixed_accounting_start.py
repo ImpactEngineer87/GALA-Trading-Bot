@@ -16,7 +16,7 @@ def unresolved_real_accounting(config, root, account_number):
     historical exception is the only permitted bypass, and the normal REAL
     preflight must still pass before a REAL ticker can enter.
     """
-    from core.historical_manual_resume import exception_status
+    from core.accounting_entry_policy import exception_status
     from core.project_paths import resolve_runtime_path
 
     try:

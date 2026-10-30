@@ -818,7 +818,7 @@ class ChocoletraBot:
         # orders, even if the saved file still exactly matches an old grant.
         # A prior-session exception only applies to sound, readable accounting.
         if snapshot["blocked"] and not getattr(guard, "_failure", ""):
-            from core.historical_manual_resume import exception_status
+            from core.accounting_entry_policy import exception_status
             approval = exception_status(
                 getattr(self, "config", {}) or {}, guard.store.path,
                 # The approval is bound to the plain account identity. Trading
@@ -2784,6 +2784,11 @@ class ChocoletraBot:
             decision.execution_skip_reason = "ATR_INVALID"
             return False
 
+        from core.exit_policy import effective_partial_enabled
+        exit_options = {}
+        if not paper_ticker and not effective_partial_enabled(self.config, paper=False):
+            # Per-order choice: never change the shared PAPER risk manager.
+            exit_options["partial_exit_override"] = False
         orden = self.gestor_riesgo.calcular_orden(
             ticker=ticker, tipo=prop.tipo, precio_actual=precio_actual, atr=atr_micro,
             capital_disponible=self.capital,
@@ -2791,6 +2796,7 @@ class ChocoletraBot:
             stop_loss_override=prop.stop_loss,
             take_profit_override=prop.take_profit,
             cantidad_override=self.shares_for_ticker(ticker),
+            **exit_options,
         )
         if orden is None:
             decision.execution_skip_reason = "RISK_ORDER_REJECTED"
@@ -6008,7 +6014,16 @@ class ChocoletraBot:
         with self._lock:
             items = list(self._posiciones.items())
             last_prices = dict(getattr(self, "_last_prices", {}))
+            price_times = dict(getattr(self, "_last_price_times", {}))
             bar_times = dict(getattr(self, "_last_bar_times", {}))
+
+        observed_now = time.time()
+        try:
+            max_price_age = float(getattr(self, "_max_risk_price_age_sec", 120.0))
+            if not math.isfinite(max_price_age) or max_price_age <= 0:
+                max_price_age = 120.0
+        except (TypeError, ValueError, OverflowError):
+            max_price_age = 120.0
 
         for ticker, pos in items:
             if not isinstance(pos, dict) or pos.get("reservado"):
@@ -6077,16 +6092,24 @@ class ChocoletraBot:
             entry_verified = paper or (pos.get("entry_integrity") or {}).get("entry_confirmed") is True
             bar_at = str(bar_times.get(ticker, ""))
             age = None
+            last_price_at = ""
             try:
-                bar = pd.Timestamp(bar_at)
-                if bar.tzinfo is not None:
-                    age = time.time() - bar.timestamp()
-            except (TypeError, ValueError):
+                # Candle timestamps describe the bar's opening time, not when
+                # its price was observed. A healthy confirmed 5m/15m bar must
+                # not lose valuation solely because its opening is >120s old.
+                # Use the same observation clock as the daily risk valuation.
+                stamp = price_times.get(ticker)
+                observed_at = float(stamp)
+                if (not isinstance(stamp, bool) and math.isfinite(observed_at)
+                        and 0 < observed_at <= observed_now):
+                    age = observed_now - observed_at
+                    last_price_at = datetime.fromtimestamp(observed_at).isoformat(timespec="seconds")
+            except (TypeError, ValueError, OverflowError, OSError):
                 pass
             valuation_available = bool(
-                not pending and entry_verified and entry > 0
+                not pending and entry_verified and math.isfinite(entry) and entry > 0
                 and math.isfinite(last_price) and last_price > 0
-                and age is not None and 0 <= age <= 120
+                and age is not None and 0 <= age <= max_price_age
             )
             floating_pnl = None
             if valuation_available:
@@ -6138,11 +6161,7 @@ class ChocoletraBot:
                          or 'verified_gross_pnl' in pos['normal_exit_progress']) else None),
                 "floating_pnl": floating_pnl,
                 "last_price": round(last_price, 4) if math.isfinite(last_price) and last_price > 0 else None,
-                "last_price_at": datetime.fromtimestamp(
-                    float(getattr(self, "_last_price_times", {}).get(ticker, 0.0) or 0.0)
-                ).isoformat(timespec="seconds") if float(
-                    getattr(self, "_last_price_times", {}).get(ticker, 0.0) or 0.0
-                ) > 0 else "",
+                "last_price_at": last_price_at,
                 "planned_risk_usd": round(
                     float(getattr(order, "riesgo_usd", 0.0) or 0.0), 2
                 ),

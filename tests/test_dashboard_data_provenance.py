@@ -181,6 +181,7 @@ class MarketDataProvenanceTests(unittest.TestCase):
         pos["entry_integrity"]["entry_confirmed"] = True
         self.assertEqual(bot.dashboard_snapshot()[0]["floating_pnl"], 10)
         bot._last_bar_times["META"] = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+        bot._last_price_times["META"] = time.time() - 600
         self.assertIsNone(bot.dashboard_snapshot()[0]["floating_pnl"])
         self.assertIs(bot._posiciones["META"], pos)
         bot._last_prices["META"] = float("nan")

@@ -7,6 +7,7 @@ The validator itself is side-effect free; broker callbacks must be read-only.
 
 from __future__ import annotations
 from core.live_capacity import max_real_tickers
+from core.exit_policy import effective_partial_enabled, real_exit_policy
 
 from typing import Callable, Iterable, Optional, Tuple
 
@@ -26,8 +27,7 @@ def _unsupported_real_partial_exit(cfg: dict, shares: int) -> bool:
     preflight consistent with its default and fail closed until a vetted
     broker-linked 70/30 protective-order strategy replaces the SINGLE orders.
     """
-    return (bool((cfg.get("salida_parcial") or {}).get("activo", True))
-            and int(shares) >= 3)
+    return effective_partial_enabled(cfg, paper=False) and int(shares) >= 3
 
 
 def validate_live_start(
@@ -61,6 +61,11 @@ def validate_live_start(
     # remains safe even when the master mixed-mode switch is enabled.
     if not active_real:
         return True, [], []
+
+    try:
+        real_exit_policy(cfg)
+    except ValueError as exc:
+        return False, [str(exc)], active_real
 
     if len(active_real) > max_tickers:
         errors.append(
@@ -225,6 +230,13 @@ def validate_live_start_partitioned(
             "approved_real": [],
             "blocked_real": [],
         }
+
+    try:
+        real_exit_policy(cfg)
+    except ValueError as exc:
+        return {"start_allowed": False, "global_errors": [str(exc)],
+                "ticker_errors": ticker_errors, "requested_real": active_real,
+                "approved_real": [], "blocked_real": active_real}
 
     if len(active_real) > max_tickers:
         global_errors.append(
