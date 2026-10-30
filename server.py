@@ -2656,6 +2656,7 @@ def get_status():
             "engine_runtime":   _engine_runtime_snapshot(),
             "server_version":   _SERVER_VERSION,
             "mode":             BOT_STATE["mode"],
+            "mixed_accounting_startup_policy": "REAL_ACCOUNTING_HOLD_PAPER_ONLY_V1",
             "tickers":          BOT_STATE["tickers"],
             "timestamp":        datetime.now().isoformat(),
             "schwab_connected": schwab_ok,
