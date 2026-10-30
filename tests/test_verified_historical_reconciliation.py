@@ -49,10 +49,22 @@ class BrokerReadOnly:
         return self.working
 
     def _get_autorizado(self, url, **kwargs):
-        assert "/accounts/account-private/orders/" in url
         self.calls.append(("GET", url))
-        oid = url.rsplit("/", 1)[-1]
-        return SimpleNamespace(status_code=self.status, json=lambda: copy.deepcopy(self.orders[oid]))
+        if url.endswith("/accounts/account-private"):
+            payload = {"securitiesAccount": {"accountNumber": "123456789", "type": "MARGIN"}}
+            if self.positions is not None:
+                payload["securitiesAccount"]["positions"] = copy.deepcopy(self.positions)
+            else:
+                return SimpleNamespace(status_code=503, json=lambda: {})
+        elif url.endswith("/accounts/account-private/orders"):
+            if self.working is None:
+                return SimpleNamespace(status_code=503, json=lambda: {})
+            payload = copy.deepcopy(self.working)
+        else:
+            assert "/accounts/account-private/orders/" in url
+            oid = url.rsplit("/", 1)[-1]
+            payload = copy.deepcopy(self.orders[oid])
+        return SimpleNamespace(status_code=self.status, json=lambda: payload)
 
 
 class VerifiedHistoricalReconciliationTests(unittest.TestCase):
@@ -213,6 +225,26 @@ class VerifiedHistoricalReconciliationTests(unittest.TestCase):
             self.apply(plan, active)
         self.assertEqual(self.client.calls, [])
         self.assertEqual(self.guard.read_bytes(), self.original)
+
+    def test_flat_snapshot_requires_exact_account_and_valid_order_response(self):
+        base = self.client._get_autorizado
+        def bad_account(url, **kwargs):
+            response = base(url, **kwargs)
+            if url.endswith("/accounts/account-private"):
+                return SimpleNamespace(status_code=200, json=lambda:
+                    {"securitiesAccount": {"accountNumber": "wrong", "type": "MARGIN"}})
+            return response
+        with patch.object(self.client, "_get_autorizado", side_effect=bad_account):
+            with self.assertRaisesRegex(repair.Refused, "BROKER_POSITIONS_ACCOUNT_INVALID"):
+                repair.verify_broker_flat(self.client, "123456789", "account-private")
+        def malformed_orders(url, **kwargs):
+            response = base(url, **kwargs)
+            if url.endswith("/accounts/account-private/orders"):
+                return SimpleNamespace(status_code=200, json=lambda: {"not": "an order list"})
+            return response
+        with patch.object(self.client, "_get_autorizado", side_effect=malformed_orders):
+            with self.assertRaisesRegex(repair.Refused, "BROKER_OPEN_ORDERS_RESPONSE_INVALID"):
+                repair.verify_broker_flat(self.client, "123456789", "account-private")
 
     def test_apply_requires_fresh_zero_positions_and_zero_orders(self):
         plan = self.plan()
