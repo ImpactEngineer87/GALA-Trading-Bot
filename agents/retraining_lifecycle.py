@@ -442,6 +442,7 @@ class RetrainingLifecycle:
                             key, record.get(key, 0)
                         )) for key in (
                             "eligible_closed_real", "eligible_closed_paper",
+                            "quarantined_closed_real", "quarantined_closed_paper",
                             "eligible_closed_legacy", "duplicate_closed_rows",
                         )
                     },
@@ -669,6 +670,7 @@ class RetrainingLifecycle:
         )
         for key in (
             "eligible_closed_real", "eligible_closed_paper",
+            "quarantined_closed_real", "quarantined_closed_paper",
             "eligible_closed_legacy", "duplicate_closed_rows",
         ):
             record[key] = int(self._feedback_cache_sources.get(ticker, {}).get(
@@ -776,7 +778,9 @@ class RetrainingLifecycle:
                 self._feedback_integrity_schema = bool(
                     reader.fieldnames and "execution_valid" in reader.fieldnames
                 )
-                sources = summarize_closed_trades(list(reader), fieldnames=reader.fieldnames)
+                # DictReader is streamed: building a list of 291k wide rows
+                # caused multi-GB transient allocations during dashboard polls.
+                sources = summarize_closed_trades(reader, fieldnames=reader.fieldnames)
                 counts = {ticker: row["eligible_observations"] for ticker, row in sources.items()}
                 quarantined = {ticker: row["quarantined_observations"] for ticker, row in sources.items()}
                 lifetime = {ticker: row["lifetime_observations"] for ticker, row in sources.items()}

@@ -67,12 +67,47 @@ class SmartExit:
                 'posicion_plana': False, 'mensaje': reason,
                 'cantidad': state.get('quantity', 0), 'broker_side': state.get('side', '')}
 
+    def _defer_limit(self, key, state, account, reason):
+        """Only terminal orders + fresh exposure permit a replacement STOP.
+
+        A timed-out DELETE or an unreadable order never grants this permission.
+        The durable legs remain available for a later LIMIT or emergency close.
+        """
+        result = self._pending_result(state, reason)
+        if any(not x.get('order_id') or x.get('status') not in TERMINAL
+               for x in state.get('legs', [])):
+            return result
+        working = self._working_orders_for_ticker(account, state['ticker'])
+        snap, side, remaining = self._snapshot_exposure(account, state['ticker'])
+        filled = sum(float(x.get('filled', 0)) for x in state.get('legs', []))
+        if (working != [] or snap is None or side != state['side']
+                or remaining <= 0 or not math.isfinite(filled) or filled < 0
+                or any(float(x.get('filled', 0)) < 0 for x in state.get('legs', []))
+                or filled + remaining != state['quantity']):
+            return result
+        partial = self._verified_fill_legs({**state, 'quantity': filled}) if filled else None
+        state['deferred'] = True
+        self.pending.put(key, state)
+        result.update(status='LIMIT_DEFERRED', safe_to_reprotect=True,
+                      remaining_quantity=remaining, filled_quantity=filled,
+                      partial_avg_price=partial[0] if partial else None,
+                      partial_price_verified=bool(partial) if filled else True,
+                      execution_details=dict(state))
+        self.executor._audit('EXIT_LIMIT_DEFERRED', ticker=state['ticker'],
+            lado=state['side'], cantidad=remaining, estado='LIMIT_DEFERRED',
+            motivo=reason, detalle={'execution_id': state['execution_id'],
+                'normal_exit_policy': 'LIMIT_ONLY', 'filled_quantity': filled,
+                'order_ids': [x['order_id'] for x in state.get('legs', [])]})
+        return result
+
     def _refresh(self, account, leg):
         if not leg.get('order_id'):
             return False
         d = self.executor.detalle_orden(account, leg['order_id'])
         leg.update(status=str(d.get('status', '')).upper(), filled=float(d.get('filled', 0) or 0),
                    avg_price=float(d.get('avg_price', 0) or 0))
+        if d.get('fill_price_verified') is False:
+            leg['avg_price'] = 0
         return leg['status'] in TERMINAL
 
     def _snapshot_exposure(self, account, ticker):
@@ -109,7 +144,7 @@ class SmartExit:
             return None
 
     def _new_state(self, ticker, side, quantity, reason, reference_price=None,
-                   recovery_from=None):
+                   recovery_from=None, position_id=None):
         q = self._quote(ticker)
         emergency = self._is_emergency(reason)
         limit = marketable_price(
@@ -121,6 +156,7 @@ class SmartExit:
             'side': side,
             'quantity': int(quantity),
             'reason': reason,
+            'position_id': str(position_id or ''),
             'created_utc': utc_now(),
             'reference_price': reference_price,
             'quote': q,
@@ -135,7 +171,55 @@ class SmartExit:
             state['recovery_from'] = recovery_from
         return state
 
-    def _recover_flat(self, key, state, reason):
+    @staticmethod
+    def _verified_fill_legs(state):
+        """Return actual broker-weighted exit fill price and order id, or None.
+
+        A FLAT position, quoted price, limit price, incomplete order list, or
+        duplicate order identity is never sufficient for training evidence.
+        Require a terminal broker order detail and a real execution price for
+        *every* filled share, with total shares exactly equal to the original
+        exit intent. Partial fills in canceled LIMIT legs are allowed.
+        """
+        try:
+            target = int(state.get('quantity', 0))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if target <= 0 or not state.get('legs'):
+            return None
+        seen = set()
+        qty = 0.0
+        gross = 0.0
+        last_filled_id = ''
+        for leg in state['legs']:
+            if not isinstance(leg, dict):
+                return None
+            oid = str(leg.get('order_id', '') or '').strip()
+            status = str(leg.get('status', '') or '').upper()
+            try:
+                filled = float(leg.get('filled', 0) or 0)
+                price = float(leg.get('avg_price', 0) or 0)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if (not oid or oid in seen or status not in TERMINAL
+                    or not math.isfinite(filled) or filled < 0):
+                return None
+            seen.add(oid)
+            if filled:
+                if (status not in {'FILLED', 'CANCELED', 'CANCELLED', 'EXPIRED'}
+                        or not math.isfinite(price) or price <= 0):
+                    return None
+                qty += filled
+                gross += filled * price
+                last_filled_id = oid
+        if not last_filled_id or not math.isclose(qty, target, abs_tol=1e-6, rel_tol=0):
+            return None
+        avg = gross / qty
+        return (avg, last_filled_id) if math.isfinite(avg) and avg > 0 else None
+
+    def _recover_flat(self, key, state, reason, *, account=None,
+                      requested_side=None, requested_quantity=None,
+                      requested_position_id=None):
         """Broker is flat but historical fill evidence is incomplete.
 
         Safety and model-learning are intentionally separated: the position is
@@ -143,6 +227,37 @@ class SmartExit:
         ``fill_price_verified=False`` tells the engine to quarantine this close
         from the verified x/50 learning set.
         """
+        # The pending journal may belong to a previous trade in the same
+        # ticker. Do not attribute its executions to a later position, even if
+        # Schwab is flat. Match the requesting side and expected share count.
+        try:
+            matches_request = (
+                account is not None
+                and str(state.get('side', '') or '').upper()
+                    == str(requested_side or '').upper()
+                and int(state.get('quantity', 0)) == int(requested_quantity)
+                and bool(state.get('position_id'))
+                and str(state.get('position_id')) == str(requested_position_id or '')
+            )
+        except (TypeError, ValueError, OverflowError):
+            matches_request = False
+        if matches_request:
+            # Read-only broker details: no new order, cancel, or fill is
+            # generated. Never trust stale cached fields after a GET failure.
+            for leg in state.get('legs', []):
+                try:
+                    if not leg.get('order_id'):
+                        break
+                    self._refresh(account, leg)
+                except Exception:
+                    leg['status'] = 'UNKNOWN'
+                    leg['filled'] = 0
+                    leg['avg_price'] = 0
+            evidence = self._verified_fill_legs(state)
+            if evidence is not None:
+                state['recovered_from_broker_flat'] = True
+                state['fill_evidence_source'] = 'BROKER_ORDER_EXECUTION_LEGS'
+                return self._complete(key, state)
         last = (state.get('legs') or [{}])[-1]
         last_id = str(last.get('order_id', '') or '')
         event = {
@@ -213,7 +328,7 @@ class SmartExit:
         return True
 
     def _replace_stale_emergency_state(self, key, state, ticker, side, quantity,
-                                       reason, reference_price):
+                                       reason, reference_price, position_id=None):
         old_ids = [str(x.get('order_id', '') or '') for x in state.get('legs', [])]
         recovery = {
             'old_execution_id': state.get('execution_id', ''),
@@ -223,7 +338,7 @@ class SmartExit:
         }
         new_state = self._new_state(
             ticker, side, quantity, reason, reference_price,
-            recovery_from=recovery,
+            recovery_from=recovery, position_id=position_id,
         )
         # One atomic replacement: there is never a window where a crash loses the
         # durable intent while broker exposure still exists.
@@ -250,7 +365,7 @@ class SmartExit:
         return new_state
 
     def _replace_stale_normal_state(self, key, state, ticker, side, quantity,
-                                    reason, reference_price):
+                                    reason, reference_price, position_id=None):
         """Rebuild a proven-stale normal exit from current broker exposure.
 
         v3.3.5 extends stale-journal recovery to reversals/TP/opposite-signal
@@ -267,7 +382,7 @@ class SmartExit:
         }
         new_state = self._new_state(
             ticker, side, quantity, reason, reference_price,
-            recovery_from=recovery,
+            recovery_from=recovery, position_id=position_id,
         )
         self.pending.put(key, new_state)
         self.history.append({
@@ -291,7 +406,8 @@ class SmartExit:
         )
         return new_state
 
-    def close(self, ticker, side, quantity, account, reason, reference_price=None):
+    def close(self, ticker, side, quantity, account, reason, reference_price=None,
+              position_id=None):
         key = hashlib.sha256(str(account).encode()).hexdigest()[:16] + ':' + ticker
         emergency = self._is_emergency(reason)
         # This method is called within the executor's symbol lock.
@@ -307,9 +423,22 @@ class SmartExit:
                         'broker_status': 'FLAT', 'order_id': '', 'avg_price': 0,
                         'fill_price_verified': False}
             state = self._new_state(
-                ticker, broker_side, broker_qty, reason, reference_price
+                ticker, broker_side, broker_qty, reason, reference_price,
+                position_id=position_id,
             )
             self.pending.put(key, state)
+
+        if (not emergency and position_id and state.get('position_id')
+                and str(position_id) != str(state['position_id'])):
+            snap, broker_side, broker_qty = self._snapshot_exposure(account, ticker)
+            if (snap is not None and broker_qty == 0
+                    and self._working_orders_for_ticker(account, ticker) == []):
+                return self._recover_flat(key, state,
+                    'Flat broker; stale exit belongs to another local position',
+                    account=account, requested_side=side, requested_quantity=quantity,
+                    requested_position_id=position_id)
+            return self._pending_result(state,
+                'Pending exit belongs to another position; no ordinary replacement submitted')
 
         # Resume accepted orders on retries/restarts.  v3.3.2 recovery rule:
         # an old journal row may block a replacement only while its broker order
@@ -330,9 +459,12 @@ class SmartExit:
                 )
                 hinted = str((cancel_result or {}).get('broker_status', '') or '').upper()
                 if hinted in TERMINAL:
-                    leg['status'] = hinted
-                    leg['filled'] = float((cancel_result or {}).get('filled', 0) or 0)
-                    terminal = True
+                    terminal = self._refresh(account, leg)
+                    if not terminal:
+                        leg['status'] = hinted
+                        leg['filled'] = float((cancel_result or {}).get('filled', 0) or 0)
+                        leg['avg_price'] = 0
+                        terminal = True
                 else:
                     terminal = self._refresh(account, leg)
                 self.pending.put(key, state)
@@ -379,6 +511,8 @@ class SmartExit:
                 return self._recover_flat(
                     key, state,
                     'Prior exit is no longer WORKING and Schwab confirms the position is flat',
+                    account=account, requested_side=side,
+                    requested_quantity=quantity, requested_position_id=position_id,
                 )
             if not emergency:
                 requested_side = str(side or '').upper()
@@ -395,17 +529,21 @@ class SmartExit:
                 # broker-confirmed remaining quantity and continue with the normal
                 # marketable-LIMIT policy.
                 state = self._replace_stale_normal_state(
-                    key, state, ticker, broker_side, broker_qty, reason, reference_price
+                    key, state, ticker, broker_side, broker_qty, reason, reference_price,
+                    position_id=position_id,
                 )
             else:
                 # Emergency/KILL path: safety takes precedence over stale historical
                 # accounting. Rebuild from *current* broker side/quantity and submit a
                 # fresh MARKET close only after proving there are no live orders.
                 state = self._replace_stale_emergency_state(
-                    key, state, ticker, broker_side, broker_qty, reason, reference_price
+                    key, state, ticker, broker_side, broker_qty, reason, reference_price,
+                    position_id=position_id,
                 )
 
-        # At most one LIMIT attempt and one MARKET remainder per operation.
+        # One ordinary LIMIT per invocation, including retries. A fresh quote
+        # is required each time. Legacy market_fallback never changes this rule.
+        submitted_this_call = False
         while True:
             snap = self.executor._position_snapshot(account, ticker)
             if snap is None:
@@ -414,6 +552,29 @@ class SmartExit:
             actual = int(snap.get('long', 0)) if state['side'] == 'BUY' else int(snap.get('short', 0))
             opposite = int(snap.get('short', 0)) if state['side'] == 'BUY' else int(snap.get('long', 0))
             if opposite or actual != expected or expected < 0:
+                # A protective STOP, a partially filled LIMIT, or a prior exit
+                # can flatten Schwab without leaving a fully readable order
+                # journal. If the broker is authoritatively FLAT and there are
+                # no outstanding WORKING orders, do not leave this ticker stuck
+                # forever in RECONCILIAR merely because fills are incomplete.
+                # Reconcile local exposure, but keep the close excluded from
+                # AI training unless exact broker fill evidence is recovered.
+                if actual == 0 and opposite == 0:
+                    working_ids = self._working_orders_for_ticker(account, ticker)
+                    if working_ids is None:
+                        return self._pending_result(
+                            state, 'Schwab is flat but WORKING-order snapshot unavailable'
+                        )
+                    if working_ids:
+                        return self._pending_result(
+                            state, 'Schwab is flat but WORKING orders remain'
+                        )
+                    return self._recover_flat(
+                        key, state,
+                        'Schwab confirms FLAT with no WORKING orders; recorded exit fills disagree',
+                        account=account, requested_side=side,
+                        requested_quantity=quantity, requested_position_id=position_id,
+                    )
                 if emergency:
                     working_ids = self._working_orders_for_ticker(account, ticker)
                     if working_ids is None:
@@ -439,25 +600,75 @@ class SmartExit:
                         return self._recover_flat(
                             key, state,
                             'Schwab is flat after a terminal/unknown prior exit; fill accounting was incomplete',
+                            account=account, requested_side=side,
+                            requested_quantity=quantity, requested_position_id=position_id,
                         )
                     state = self._replace_stale_emergency_state(
-                        key, state, ticker, broker_side, broker_qty, reason, reference_price
+                        key, state, ticker, broker_side, broker_qty, reason, reference_price,
+                        position_id=position_id,
                     )
                     continue
                 return self._pending_result(state, 'Position and confirmed fills disagree; reconcile before retry')
             if actual == 0:
-                return self._complete(key, state)
-            if len(state['legs']) >= (2 if state['limit'] is not None else 1):
-                return self._pending_result(state, 'Exit ended with residual exposure; operator reconciliation required')
-            is_limit = not state['legs'] and state['limit'] is not None
-            if state['legs'] and not self.config.get('market_fallback', True):
-                return self._pending_result(state, 'Limit canceled; market fallback disabled')
+                if (position_id and state.get('position_id')
+                        and str(position_id) != str(state['position_id'])):
+                    if self._working_orders_for_ticker(account, ticker) != []:
+                        return self._pending_result(state, 'Flat position but WORKING orders not cleared')
+                    return self._recover_flat(key, state,
+                        'Emergency flat; prior fills belong to another local position',
+                        account=account, requested_side=side, requested_quantity=quantity,
+                        requested_position_id=position_id)
+                if self._verified_fill_legs(state) is not None:
+                    return self._complete(key, state)
+                # Some terminal broker orders expose FILLED and quantity but
+                # not the executionLegs price. Remaining in RECONCILIAR does
+                # not protect an already-flat account; it only strands local
+                # state and prevents normal learning/next signals. Quarantine
+                # the label, but release the stale exit after the no-WORKING
+                # broker safety check.
+                working_ids = self._working_orders_for_ticker(account, ticker)
+                if working_ids is None:
+                    return self._pending_result(
+                        state, 'Schwab is flat but WORKING-order snapshot unavailable'
+                    )
+                if working_ids:
+                    return self._pending_result(
+                        state, 'Schwab is flat but WORKING orders remain'
+                    )
+                return self._recover_flat(
+                    key, state,
+                    'Schwab confirms FLAT with no WORKING orders; exit price unverified',
+                    account=account, requested_side=side,
+                    requested_quantity=quantity, requested_position_id=position_id,
+                )
+            if not emergency:
+                if submitted_this_call:
+                    return self._defer_limit(key, state, account,
+                        'LIMIT terminal with residual exposure; no MARKET fallback')
+                if self._working_orders_for_ticker(account, ticker) != []:
+                    return self._pending_result(state,
+                        'Ordinary exit requires a verified empty WORKING-order snapshot')
+                quote = self._quote(ticker)
+                if not quote:
+                    return self._defer_limit(key, state, account,
+                        'Fresh bid/ask unavailable; ordinary MARKET exit prohibited')
+                state['quote'] = quote
+                state['limit'] = marketable_price(state['side'], quote['bid'], quote['ask'],
+                                                 self.config.get('exit_buffer_bps', 5))
+                state['route_reason'] = 'NORMAL_LIMIT_ONLY'
+            elif submitted_this_call:
+                return self._pending_result(state,
+                    'Emergency exit ended with residual exposure; reconcile before retry')
+            else:
+                state['route_reason'] = 'EMERGENCY'
+            is_limit = not emergency
             leg = {'order_id': '', 'type': 'LIMIT' if is_limit else 'MARKET',
                    'quantity': actual, 'limit_price': state['limit'] if is_limit else None,
                    'filled': 0, 'avg_price': 0, 'status': 'SUBMITTING'}
             state['legs'].append(leg)
             # Durable intent BEFORE POST. Timeout or missing Location is ambiguous.
             self.pending.put(key, state)
+            submitted_this_call = True
             body = {'session': 'NORMAL', 'duration': 'DAY', 'orderStrategyType': 'SINGLE',
                     'orderType': leg['type'], 'orderLegCollection': [{
                         'orderLegType': 'EQUITY', 'legId': 1, 'positionEffect': 'CLOSING',
@@ -478,21 +689,28 @@ class SmartExit:
                     motivo=reason, estado='SUBMITTED', detalle={'tipo_orden': leg['type'],
                     'signal_price': state['reference_price'], 'limit_price': leg['limit_price'],
                     'bid': state['quote'].get('bid'), 'ask': state['quote'].get('ask'),
-                    'recovered_stale_exit': bool(state.get('recovery_from'))})
+                    'recovered_stale_exit': bool(state.get('recovery_from')),
+                    'route_reason': state['route_reason'],
+                    'normal_exit_policy': 'LIMIT_ONLY'})
             except Exception as exc:
                 return self._pending_result(state, f'Exit submission uncertain: {type(exc).__name__}')
             if not leg['order_id']:
                 return self._pending_result(state, 'Accepted exit has no order ID; manual reconciliation required')
             self.executor.esperar_estado_orden(account, leg['order_id'], deseados={'FILLED'},
-                fallos=TERMINAL - {'FILLED'}, timeout_s=float(self.config.get('limit_wait_sec', 1.5)) if is_limit else self.executor.fill_timeout_s)
+                fallos=TERMINAL - {'FILLED'}, timeout_s=float(self.config.get('normal_limit_wait_sec', 10)) if is_limit else self.executor.fill_timeout_s)
             terminal = self._refresh(account, leg)
             if not terminal and is_limit:
                 cancel_result = self.executor.cancelar_orden_confirmada(account, leg['order_id'], ticker=ticker)
                 hinted = str((cancel_result or {}).get('broker_status', '') or '').upper()
                 if hinted in TERMINAL:
-                    leg['status'] = hinted
-                    leg['filled'] = float((cancel_result or {}).get('filled', 0) or 0)
-                    terminal = True
+                    # Re-read actual execution prices after cancellation. A
+                    # cancellation acknowledgement alone supplies no fill price.
+                    terminal = self._refresh(account, leg)
+                    if not terminal:
+                        leg['status'] = hinted
+                        leg['filled'] = float((cancel_result or {}).get('filled', 0) or 0)
+                        leg['avg_price'] = 0
+                        terminal = True
                 else:
                     terminal = self._refresh(account, leg)
             self.pending.put(key, state)
@@ -503,10 +721,12 @@ class SmartExit:
                 self.executor.esperar_posicion_plana(account, ticker, timeout_s=self.executor.flat_timeout_s)
 
     def _complete(self, key, state):
-        fills = [leg for leg in state['legs'] if leg['filled'] > 0]
-        if any(leg['avg_price'] <= 0 or not math.isfinite(leg['avg_price']) for leg in fills):
-            return self._pending_result(state, 'Position flat, but actual fill prices are unavailable')
-        avg = sum(leg['filled'] * leg['avg_price'] for leg in fills) / state['quantity']
+        verified = self._verified_fill_legs(state)
+        if verified is None:
+            return self._pending_result(
+                state, 'Position flat, but complete broker fill evidence is unavailable'
+            )
+        avg, last_id = verified
         q = state['quote']
         reference = state.get('reference_price')
         benchmark = q.get('bid') if state['side'] == 'BUY' else q.get('ask')
@@ -518,7 +738,6 @@ class SmartExit:
                  'slippage_usd': sign * (avg - reference) * state['quantity'] if reference else None,
                  'quote_slippage_usd': sign * (avg - benchmark) * state['quantity'] if benchmark else None}
         self.history.append(event)
-        last_id = state['legs'][-1]['order_id'] if state['legs'] else ''
         self.executor._audit('EXIT_FILLED', ticker=state['ticker'], lado=state['side'],
             order_id=last_id, cantidad=state['quantity'], precio=avg, estado='FILLED',
             motivo=state['reason'], detalle={'execution_id': state['execution_id'],
@@ -531,3 +750,4 @@ class SmartExit:
                 'avg_price': avg, 'broker_status': 'FILLED', 'posicion_plana': True,
                 'broker_side': state['side'], 'fill_price_verified': True,
                 'execution_details': event}
+

@@ -13,6 +13,7 @@ aur dashboard par real-time dikhte hain.
 import os
 import sys
 import json
+import csv
 import queue
 import sqlite3
 import yaml
@@ -46,8 +47,16 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() not in ('utf-8', 'utf8'):
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
+try:
+    with open(os.path.join(BASE_DIR, "VERSION"), encoding="utf-8") as _version_handle:
+        _SERVER_VERSION = _version_handle.read().strip()
+except OSError:
+    _SERVER_VERSION = "unknown"
 
 from core.daily_loss_guard import DailyLossGuard
+from core.auto_ai import AutoAIService, policy as auto_ai_policy, update_enabled as update_auto_ai_enabled, training_busy
+from core.runtime_store import path_lock
+from core.signal_execution_evidence import annotate_signals, read_signal_audit
 from core.ticker_execution import TickerExecutionRegistry
 from core.live_capacity import max_real_tickers as real_ticker_limit
 from core.runtime_reliability import (
@@ -500,6 +509,48 @@ def _read_history_rows(*, newest_first: bool = True):
     )
 
 
+_DASHBOARD_HISTORY_CACHE = {}
+_DASHBOARD_HISTORY_LOCK = threading.RLock()
+
+
+def _dashboard_history_rows(*, newest_first=True):
+    """Read-only provenance view, cached until either source ledger changes."""
+    import csv
+    from core.dashboard_evidence import annotate_history
+    from core.trade_history import LEGACY_HISTORY_FIELDS, HISTORY_FIELDS
+
+    history_path, audit_path = _history_path(), _order_audit_path()
+    def signature(path):
+        try:
+            st = os.stat(path)
+            return (path, st.st_mtime_ns, st.st_size, st.st_ino)
+        except FileNotFoundError:
+            return (path, None)
+
+    key = (signature(history_path), signature(audit_path))
+    with _DASHBOARD_HISTORY_LOCK:
+        if _DASHBOARD_HISTORY_CACHE.get("key") != key:
+            rows = []
+            if os.path.exists(history_path):
+                with open(history_path, encoding="utf-8-sig", newline="") as handle:
+                    reader = csv.DictReader(handle)
+                    fields = list(reader.fieldnames or [])
+                    if fields and fields not in (LEGACY_HISTORY_FIELDS, HISTORY_FIELDS):
+                        raise ValueError("Esquema histórico no reconocido; no se calculan resultados")
+                    rows = list(reader)
+                    if fields == LEGACY_HISTORY_FIELDS:
+                        rows = [{**r, "evento": "POSITION_CLOSE"} for r in rows]
+            try:
+                with open(audit_path, encoding="utf-8-sig", newline="") as handle:
+                    annotated = annotate_history(rows, csv.DictReader(handle))
+            except (OSError, csv.Error):
+                annotated = annotate_history(rows)
+            _DASHBOARD_HISTORY_CACHE.clear()
+            _DASHBOARD_HISTORY_CACHE.update(key=key, rows=annotated)
+        rows = _DASHBOARD_HISTORY_CACHE["rows"]
+        return [dict(row) for row in (reversed(rows) if newest_first else rows)]
+
+
 def _closed_history_rows(rows):
     """Only closes affect PnL/counts; v2.9 also stores transparent open rows."""
 
@@ -512,19 +563,23 @@ def _closed_history_rows(rows):
 
 def _history_summary():
     """Persistent closed count/PnL, so dashboard stats survive restarts."""
+    from core.dashboard_evidence import mode_of, session_date
     try:
-        rows = _read_history_rows(newest_first=False)
+        rows = _dashboard_history_rows(newest_first=False)
     except Exception:
         return {
-            "closed_count": int(BOT_STATE["stats"].get("trades_closed", 0) or 0),
-            "pnl_total": round(float(BOT_STATE["stats"].get("pnl_total", 0.0) or 0.0), 2),
-            "paper_pnl": 0.0, "real_pnl": 0.0,
+            "available": False, "excluded_closed_count": 0,
+            "is_broker_reported": False,
+            "pnl_source": "UNAVAILABLE",
+            "closed_count": 0, "pnl_total": None,
+            "paper_pnl": None, "real_pnl": None,
             "paper_closed_count": 0, "real_closed_count": 0,
-            "paper_realized_today": 0.0, "real_realized_today": 0.0,
+            "paper_realized_today": None, "real_realized_today": None,
             "paper_closed_today": 0, "real_closed_today": 0,
         }
-    closed = _closed_history_rows(rows)
-    pnl = 0.0
+    all_closed = _closed_history_rows(rows)
+    excluded = sum(not r.get("performance_verified", False) for r in all_closed)
+    closed = [r for r in all_closed if r.get("performance_verified")]
     by_mode = {"PAPER": 0.0, "REAL": 0.0}
     counts = {"PAPER": 0, "REAL": 0}
     today_pnl = {"PAPER": 0.0, "REAL": 0.0}
@@ -536,22 +591,30 @@ def _history_summary():
             mode = str(row.get("modo", "PAPER") or "PAPER").upper()
             if mode not in by_mode:
                 mode = "PAPER"
-            pnl += value
             by_mode[mode] += value
             counts[mode] += 1
-            if str(row.get("fecha", "") or "") == today_ny:
+            if session_date(row) == today_ny:
                 today_pnl[mode] += value
                 today_counts[mode] += 1
         except (TypeError, ValueError):
             pass
+    incomplete = {mode: any(not r.get("performance_verified") and mode_of(r) == mode
+                            for r in all_closed) for mode in ("PAPER", "REAL")}
+    incomplete_today = {mode: any(not r.get("performance_verified") and mode_of(r) == mode
+                                  and session_date(r) == today_ny for r in all_closed)
+                        for mode in ("PAPER", "REAL")}
     return {
-        "closed_count": len(closed), "pnl_total": round(pnl, 2),
-        "paper_pnl": round(by_mode["PAPER"], 2),
-        "real_pnl": round(by_mode["REAL"], 2),
+        "available": True,
+        "excluded_closed_count": excluded,
+        "pnl_source": "LOCAL_RECORDED_FILLS_AND_PAPER_SIMULATION",
+        "is_broker_reported": False,
+        "closed_count": len(closed), "pnl_total": None,
+        "paper_pnl": None if incomplete["PAPER"] else round(by_mode["PAPER"], 2),
+        "real_pnl": None if incomplete["REAL"] else round(by_mode["REAL"], 2),
         "paper_closed_count": counts["PAPER"],
         "real_closed_count": counts["REAL"],
-        "paper_realized_today": round(today_pnl["PAPER"], 2),
-        "real_realized_today": round(today_pnl["REAL"], 2),
+        "paper_realized_today": None if incomplete_today["PAPER"] else round(today_pnl["PAPER"], 2),
+        "real_realized_today": None if incomplete_today["REAL"] else round(today_pnl["REAL"], 2),
         "paper_closed_today": today_counts["PAPER"],
         "real_closed_today": today_counts["REAL"],
     }
@@ -563,37 +626,57 @@ def _position_pnl_summary(positions):
         "paper_open_count": 0, "real_open_count": 0,
         "paper_unrealized_pnl": 0.0, "real_unrealized_pnl": 0.0,
     }
+    from core.dashboard_evidence import mode_of, number
+    incomplete = set()
     for row in positions or []:
         if not isinstance(row, dict):
             continue
         status = str(row.get("status", "OPEN") or "OPEN").upper()
         if status not in {"OPEN", "PARTIAL"}:
             continue
-        mode = str(row.get("mode", "PAPER") or "PAPER").upper()
+        mode = mode_of(row)
         if mode not in {"PAPER", "REAL"}:
-            mode = "PAPER"
+            continue
         key = mode.lower()
         summary[f"{key}_open_count"] += 1
-        try:
-            summary[f"{key}_unrealized_pnl"] += float(
-                row.get("floating_pnl", 0.0) or 0.0
-            )
-        except (TypeError, ValueError):
-            pass
-    for key in ("paper_unrealized_pnl", "real_unrealized_pnl"):
-        summary[key] = round(summary[key], 2)
+        value = number(row.get("floating_pnl"))
+        if mode == "REAL" or value is None or row.get("valuation_available") is False:
+            incomplete.add(key)
+        else:
+            summary[f"{key}_unrealized_pnl"] += value
+    for mode in ("paper", "real"):
+        key = f"{mode}_unrealized_pnl"
+        summary[key] = None if mode in incomplete else round(summary[key], 2)
     return summary
+
+
+def _pnl_sum(*values):
+    from core.dashboard_evidence import number
+    parsed = [number(v) for v in values]
+    return round(sum(parsed), 2) if all(v is not None for v in parsed) else None
 
 
 def _engine_positions_snapshot():
     """Current positions from the trading engine, never inferred from history."""
+    from core.dashboard_evidence import mode_of, number
     bot = globals().get("_ENGINE")
+    rows = None
     if bot is not None and hasattr(bot, "dashboard_snapshot"):
         try:
-            return bot.dashboard_snapshot()
+            rows = bot.dashboard_snapshot()
         except Exception as exc:
             _log("WARN", f"[Dashboard] No se pudo leer posiciones del motor: {exc}")
-    return list((BOT_STATE.get("active_positions") or {}).values())
+    if rows is None:
+        rows = list((BOT_STATE.get("active_positions") or {}).values())
+    result = []
+    for original in rows:
+        row = dict(original)
+        if mode_of(row) == "REAL":
+            row["local_estimated_floating_pnl"] = number(row.get("floating_pnl"))
+            row["floating_pnl"] = None
+            row["floating_pnl_source"] = "SCHWAB_PNL_NOT_QUERIED"
+        result.append(row)
+    return result
 
 
 def _broker_reconciliation_state_path(cfg: dict = None) -> str:
@@ -743,6 +826,9 @@ def _dashboard_stats():
     live = _position_pnl_summary(positions)
     stats["trades_open"] = len(positions) if positions else len(broker_positions)
     stats["broker_positions_open"] = len(broker_positions)
+    stats["pnl_source"] = history["pnl_source"]
+    stats["is_broker_reported"] = False
+    stats["excluded_closed_count"] = history["excluded_closed_count"]
     stats["trades_closed"] = history["closed_count"]
     stats["pnl_total"] = history["pnl_total"]
     stats["paper_pnl"] = history["paper_pnl"]
@@ -754,11 +840,11 @@ def _dashboard_stats():
     stats["real_realized_today"] = history["real_realized_today"]
     stats["paper_closed_today"] = history["paper_closed_today"]
     stats["real_closed_today"] = history["real_closed_today"]
-    stats["paper_session_pnl"] = round(
-        history["paper_realized_today"] + live["paper_unrealized_pnl"], 2
+    stats["paper_session_pnl"] = _pnl_sum(
+        history["paper_realized_today"], live["paper_unrealized_pnl"]
     )
-    stats["real_session_pnl"] = round(
-        history["real_realized_today"] + live["real_unrealized_pnl"], 2
+    stats["real_session_pnl"] = _pnl_sum(
+        history["real_realized_today"], live["real_unrealized_pnl"]
     )
     return stats
 
@@ -780,7 +866,26 @@ def _engine_daily_risk_snapshot():
             cfg,
             history_path=_history_path(),
         )
-        return guard.snapshot(paper, unrealized_pnl=0.0)
+        snapshot = guard.snapshot(paper, unrealized_pnl=0.0)
+        # The stopped dashboard must expose the same durable REAL accounting
+        # truth as the running engine. Never present an absent field as proof
+        # that the historical guard is cleared.
+        from core.real_accounting import RealAccountingGuard
+        from core.historical_manual_resume import exception_status
+        from core.project_paths import resolve_runtime_path
+        account_path = resolve_runtime_path(
+            (cfg.get("execution_engine") or {}).get(
+                "accounting_state_path", "data/real_accounting_reconciliation.json"),
+            project_root=BASE_DIR)
+        accounting = RealAccountingGuard(account_path).snapshot()
+        accounting["entry_blocked"] = bool(accounting["blocked"])
+        accounting["historical_resume_active"] = False
+        if accounting["blocked"]:
+            account = str(BOT_STATE.get("account_number") or get_env(
+                "SCHWAB_ACCOUNT_NUMBER", "") or "").strip()
+            accounting.update(exception_status(cfg, account_path, account, root=BASE_DIR))
+        snapshot["real_accounting"] = accounting
+        return snapshot
     except Exception:
         return {
             "enabled": False, "blocked": False, "mode": "PAPER",
@@ -1432,11 +1537,11 @@ def _verify_schwab_connection(*, force: bool = False) -> dict:
         return _schwab_auth_snapshot()
 
 def schwab_get_candles(ticker: str, cantidad: int = 200):
-    """Obtiene velas reales de Schwab. Fallback sintetico si mercado cerrado."""
+    """Only Schwab candles. Missing data never becomes fabricated market data."""
     schwab_ensure_token()
     hdrs = schwab_headers()
     if not hdrs:
-        return _synthetic_candles(ticker, cantidad)
+        return None
     try:
         r = guarded_market_get(
             f"{SCHWAB_MKT_URL}/pricehistory",
@@ -1453,7 +1558,7 @@ def schwab_get_candles(ticker: str, cantidad: int = 200):
                 schwab_refresh(refresh)
             hdrs = schwab_headers()
             if not hdrs:
-                return _synthetic_candles(ticker, cantidad)
+                return None
             r = guarded_market_get(
                 f"{SCHWAB_MKT_URL}/pricehistory",
                 params={"symbol": ticker, "periodType": "day", "period": 5,
@@ -1464,39 +1569,17 @@ def schwab_get_candles(ticker: str, cantidad: int = 200):
         r.raise_for_status()
         datos = r.json()
         if "candles" not in datos or not datos["candles"]:
-            return _synthetic_candles(ticker, cantidad)
+            return None
         import pandas as pd
         df = pd.DataFrame(datos["candles"])
-        df["datetime"] = pd.to_datetime(df["datetime"], unit="ms")
+        df["datetime"] = pd.to_datetime(df["datetime"], unit="ms", utc=True)
         df.set_index("datetime", inplace=True)
         df = df[["open", "high", "low", "close", "volume"]].astype(float)
         df.sort_index(inplace=True)
         return df.tail(cantidad)
     except Exception as e:
-        _log("WARN", f"[Schwab] Error velas {ticker}: {e} - usando sinteticos")
-        return _synthetic_candles(ticker, cantidad)
-
-def _synthetic_candles(ticker: str, cantidad: int = 200):
-    """Datos sinteticos realistas para cuando el mercado esta cerrado."""
-    import numpy as np
-    import pandas as pd
-    np.random.seed(hash(ticker) % 9999)
-    fechas = pd.date_range(end=datetime.now(), periods=cantidad, freq="1min")
-    bases  = {"BA":225,"AAPL":313,"TSLA":394,"NVDA":118,"AMD":162,
-              "AMZN":197,"META":523,"RCL":230,"UNH":540}
-    base   = bases.get(ticker, 200.0)
-    pasos  = np.random.choice([-1,1], size=cantidad, p=[0.45,0.55])
-    cambios= pasos*(abs(np.random.randn(cantidad))*0.003+0.001)*base
-    precios= np.maximum(base+np.cumsum(cambios), base*0.8)
-    ruido  = abs(np.random.randn(cantidad))*base*0.001
-    return pd.DataFrame({
-        "open":   precios-ruido*0.5,
-        "high":   precios+ruido*1.5,
-        "low":    precios-ruido*1.5,
-        "close":  precios,
-        "volume": np.random.randint(80000,600000,cantidad).astype(float),
-    }, index=fechas)
-
+        _log("WARN", f"[Schwab] Velas no disponibles para {ticker}: {type(e).__name__}; sin datos de sustitución")
+        return None
 
 def _signal_datetime(signal: dict):
     """Parse new and legacy signal timestamps as timezone-aware NY datetimes."""
@@ -1697,7 +1780,7 @@ def _register_signal(
 
 _restore_signal_history()
 
-def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
+def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0, evidence=None):
     """Register an execution event without confusing it with a live position.
 
     ``OPEN`` is an ENTRY event, not a permanent dashboard status. The current
@@ -1706,6 +1789,13 @@ def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
     """
     estado = str(estado or "OPEN").upper()
     ticker = str(ticker or "").upper()
+    from core.dashboard_evidence import mode_of, number
+    evidence = evidence if isinstance(evidence, dict) else {}
+    mode = mode_of(evidence)
+    price_verified = mode == "PAPER" or evidence.get("price_verified") is True
+    pnl_verified = mode == "PAPER" or (mode == "REAL" and evidence.get("accounting_verified") is True)
+    precio = number(precio) if price_verified else None
+    pnl = number(pnl) if pnl_verified else None
     event_label = {
         "OPEN": "ENTRY",
         "PARTIAL": "TP1_70_PERCENT",
@@ -1714,13 +1804,18 @@ def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
     trade = {
         "tipo": tipo,
         "ticker": ticker,
-        "precio": round(float(precio), 2),
+        "precio": round(float(precio), 6) if precio is not None else None,
         "acciones": int(cantidad),
         "estado": estado,      # backwards compatibility
         "evento": event_label, # unambiguous dashboard label
-        "pnl": round(float(pnl), 2),
+        "pnl": round(float(pnl), 6) if pnl is not None else None,
         "timestamp": _hora_ny(),
         "date": _hora_ny("%Y-%m-%d"),
+        "mode": mode,
+        "pnl_verified": pnl_verified and pnl is not None,
+        "pnl_source": ("PAPER_SIMULATION" if mode == "PAPER" else
+                       "LOCAL_RECORDED_FILLS_GROSS" if pnl_verified else "UNVERIFIED"),
+        "is_broker_reported": False,
     }
     BOT_STATE["trades"].append(trade)
     if len(BOT_STATE["trades"]) > 500:
@@ -1737,7 +1832,7 @@ def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
             "partial_quantity_executed": 0,
             "planned_partial_quantity": 0,
             "planned_remaining_quantity": int(cantidad),
-            "entry_price": round(float(precio), 4),
+            "entry_price": round(float(precio), 6) if precio is not None else None,
             "stop_initial": 0.0,
             "stop_current": 0.0,
             "tp1_price": 0.0,
@@ -1747,7 +1842,7 @@ def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
             "protection_mode": "",
             "realized_pnl": 0.0,
             "opened_at": f"{_hora_ny('%Y-%m-%d')}T{_hora_ny()}",
-            "mode": str(BOT_STATE.get("mode", "paper")).upper(),
+            "mode": mode,
         }
     elif estado == "PARTIAL":
         pos = active.get(ticker)
@@ -1770,7 +1865,10 @@ def _register_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
     elif estado == "CLOSED":
         active.pop(ticker, None)
         BOT_STATE["stats"]["trades_closed"] += 1
-        BOT_STATE["stats"]["pnl_total"] += float(pnl or 0.0)
+        previous_pnl = BOT_STATE["stats"].get("pnl_total")
+        BOT_STATE["stats"]["pnl_total"] = (
+            float(previous_pnl) + float(pnl)
+            if previous_pnl is not None and pnl is not None else None)
 
     BOT_STATE["stats"]["trades_open"] = len(active)
 
@@ -2341,6 +2439,10 @@ def get_config():
 
 @app.route('/api/config', methods=['POST'])
 def save_config():
+    with _ENGINE_CONTROL_LOCK, path_lock(CONFIG_PATH):
+        return _save_config_locked()
+
+def _save_config_locked():
     try:
         nueva = request.get_json() or {}
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
@@ -2551,7 +2653,10 @@ def get_status():
         "status": "ok",
         "bot": {
             "running":          BOT_STATE["running"],
+            "engine_runtime":   _engine_runtime_snapshot(),
+            "server_version":   _SERVER_VERSION,
             "mode":             BOT_STATE["mode"],
+            "mixed_accounting_startup_policy": "REAL_ACCOUNTING_HOLD_PAPER_ONLY_V1",
             "tickers":          BOT_STATE["tickers"],
             "timestamp":        datetime.now().isoformat(),
             "schwab_connected": schwab_ok,
@@ -2596,11 +2701,30 @@ def reconcile_broker_read_only():
 _ENGINE = None
 _engine_thread = None
 _ENGINE_CONTROL_LOCK = threading.RLock()
+_ENGINE_RUNTIME_LOCK = threading.RLock()
+_ENGINE_RUNTIME = {"state": "NOT_STARTED", "thread_started_at_utc": None,
+                   "thread_ended_at_utc": None, "last_error_code": None}
+
+
+def _engine_runtime_snapshot():
+    from zoneinfo import ZoneInfo
+    with _ENGINE_RUNTIME_LOCK:
+        result = dict(_ENGINE_RUNTIME)
+    thread = _engine_thread
+    result['thread_alive'] = bool(thread is not None and thread.is_alive())
+    for name in ('thread_started_at', 'thread_ended_at'):
+        value = result.get(name + '_utc')
+        result[name + '_ny'] = (
+            datetime.fromisoformat(value).astimezone(ZoneInfo('America/New_York')).isoformat()
+            if value else None)
+    result['scope'] = 'Current process thread lifecycle; not proof of submitted/filled orders'
+    return result
 _STARTUP_QUARANTINE = {}
 _SCHEDULER = None
 _AI_STATUS_TRAINER = None
 _AI_STATUS_SIGNATURE = None
 _AI_STATUS_LOCK = threading.RLock()
+_AUTO_AI_SERVICE = None
 _VETO_STATUS_STORE = None
 _LEARNING_STATUS_STORE = None
 
@@ -2623,15 +2747,20 @@ def _hook_candles(ticker, frame):
 def _hook_trade(tipo, ticker, precio, cantidad, estado="OPEN", pnl=0.0):
     _register_trade(tipo, ticker, precio, cantidad, estado, pnl)
 
+def _hook_trade_event(event):
+    _register_trade(event["tipo"], event["ticker"], event["precio"],
+                    event["cantidad"], event["estado"], event["pnl"], evidence=event)
+
 def _hook_log(nivel, mensaje):
     _log(nivel, mensaje)
 
 def _start_engine(mode: str, capital: float):
     """Instancia el motor real y lo arranca en un hilo de background."""
-    global _ENGINE, _engine_thread
+    global _ENGINE, _engine_thread, _ENGINE_RUNTIME
     from engine.bot_engine import ChocoletraBot
 
     bot = ChocoletraBot(CONFIG_PATH)
+    bot.orquestador.entrenador.automatic_training_allowed = _get_auto_ai_service().allowed_now
     bot._ticker_quarantine.update(_STARTUP_QUARANTINE)
 
     # v2.9.2: the persistent per-ticker registry is the execution authority when
@@ -2646,7 +2775,7 @@ def _start_engine(mode: str, capital: float):
     # Reflejar el estado en el Dashboard
     bot.set_hooks(
         on_signal=_hook_signal,
-        on_trade=_hook_trade,
+        on_trade_event=_hook_trade_event,
         on_log=_hook_log,
         on_candles=_hook_candles,
     )
@@ -2666,18 +2795,45 @@ def _start_engine(mode: str, capital: float):
     bot.account_number = BOT_STATE.get("account_number", "") or get_env("SCHWAB_ACCOUNT_NUMBER", "")
     tickers = list(BOT_STATE.get("tickers") or bot.TICKERS_DEFAULT)
 
-    _ENGINE = bot
+    runtime = {'state': 'STARTING', 'thread_started_at_utc': None,
+               'thread_ended_at_utc': None, 'last_error_code': None}
+    with _ENGINE_RUNTIME_LOCK:
+        _ENGINE = bot
+        _ENGINE_RUNTIME = runtime
+        # Publish BEFORE starting the runner. A fast failure must not be
+        # overwritten by the controller after the runner has set False.
+        BOT_STATE['running'] = True
 
     def _runner():
+        failed = False
+        with _ENGINE_RUNTIME_LOCK:
+            runtime['state'] = 'THREAD_RUNNING'
+            runtime['thread_started_at_utc'] = datetime.now(timezone.utc).isoformat()
         try:
+            _log('INFO', f'[Motor] HILO INICIADO (modo: {mode.upper()})')
             bot.iniciar(tickers=tickers, account_number=bot.account_number, capital=capital)
         except Exception as e:
+            failed = True
             _log("ERROR", f"[Motor] Terminó con error: {e}")
         finally:
-            BOT_STATE["running"] = False
+            with _ENGINE_RUNTIME_LOCK:
+                runtime.update(state='FAILED' if failed else 'STOPPED',
+                    thread_ended_at_utc=datetime.now(timezone.utc).isoformat(),
+                    last_error_code='ENGINE_RUNTIME_ERROR' if failed else None)
+                if _ENGINE is bot and _ENGINE_RUNTIME is runtime:
+                    BOT_STATE["running"] = False
+            _log('ERROR' if failed else 'INFO',
+                 '[Motor] HILO TERMINADO: ' + ('FAILED' if failed else 'STOPPED'))
 
     _engine_thread = threading.Thread(target=_runner, daemon=True, name="ChocoletraEngine")
-    _engine_thread.start()
+    try:
+        _engine_thread.start()
+    except Exception:
+        with _ENGINE_RUNTIME_LOCK:
+            runtime.update(state='FAILED', last_error_code='ENGINE_THREAD_START_ERROR',
+                           thread_ended_at_utc=datetime.now(timezone.utc).isoformat())
+            BOT_STATE['running'] = False
+        raise
 
 
 def _read_config_runtime() -> dict:
@@ -2857,6 +3013,8 @@ def _start_engine_controlled(source: str, capital: float = None):
         _log("INFO", f"[Motor] SOLICITUD DE ARRANQUE desde {origen_req}")
         if BOT_STATE["running"] and _ENGINE is not None:
             return True, "El motor ya está en ejecución"
+        if _ai_training_busy():
+            return False, "Espere a que termine la evaluación IA antes de iniciar el motor"
 
         # v3.3.2: a previous stop may have retained a stopped engine because
         # Schwab still showed managed REAL exposure.  Retry that emergency
@@ -2900,7 +3058,44 @@ def _start_engine_controlled(source: str, capital: float = None):
             return False, mensaje
 
         fallback_notes = []
+        accounting_paper_fallback = False
         if real_tickers:
+            # An unresolved REAL accounting guard must not stop the PAPER
+            # universe. Quarantine ALL configured REAL tickers for this engine
+            # lifetime. Do not rewrite their persisted REAL selections and
+            # do not use an operator exception unless it is already valid.
+            from core.mixed_accounting_start import (
+                unresolved_real_accounting, broker_confirmed_flat,
+            )
+            account = str(BOT_STATE.get("account_number") or
+                          get_env("SCHWAB_ACCOUNT_NUMBER", "") or "").strip()
+            accounting_paper_fallback, accounting_reason = (
+                unresolved_real_accounting(cfg, BASE_DIR, account)
+            )
+            if accounting_paper_fallback:
+                # Do not strand real exposure by starting an engine that will
+                # intentionally quarantine its REAL entry universe.
+                if not broker_confirmed_flat(cfg, account):
+                    mensaje = (
+                        "MIXED PAPER START BLOCKED: Schwab account is not "
+                        "freshly verified flat with zero open orders. "
+                        "No REAL accounting bypass is permitted."
+                    )
+                    _log("ERROR", f"[MixedAccounting] {mensaje}")
+                    return False, mensaje
+                for ticker in real_tickers:
+                    _STARTUP_QUARANTINE[ticker] = "REAL_ACCOUNTING_UNRESOLVED"
+                fallback_notes.append(
+                    "REAL entries remain blocked by accounting; "
+                    "PAPER tickers only (saved MIXED routing unchanged)"
+                )
+                _log(
+                    "WARN",
+                    "[MixedAccounting] ALL configured REAL tickers are "
+                    "runtime-quarantined: " + ", ".join(real_tickers)
+                    + " | reason=" + accounting_reason,
+                )
+        if real_tickers and not accounting_paper_fallback:
             live_cfg = cfg.get("live_trading", {}) or {}
             isolate = bool(
                 live_cfg.get("preflight_isolate_ticker_failures", True)
@@ -2972,7 +3167,8 @@ def _start_engine_controlled(source: str, capital: float = None):
         BOT_STATE["mode"] = modo
         BOT_STATE["capital"] = capital_real
         _start_engine(modo, capital_real)
-        BOT_STATE["running"] = True
+        if not BOT_STATE['running']:
+            return False, 'El hilo del motor terminó durante el arranque; revise Logs y estado del motor'
         origen = "horario automático" if source == "scheduler" else "dashboard"
         _log(
             "INFO",
@@ -3109,7 +3305,8 @@ def start_bot():
             }), 400
         return jsonify({
             "status": "ok",
-            "running": True,
+            "running": bool(BOT_STATE['running']),
+            "engine_runtime": _engine_runtime_snapshot(),
             "mode": BOT_STATE["mode"],
             "message": mensaje,
         })
@@ -3144,9 +3341,14 @@ def get_signals():
     if not all_rows and not ticker:
         with _SIGNAL_LOCK:
             all_rows = list(BOT_STATE["signals"])
+    selected = all_rows[-limit:]
+    try:
+        audit, available = read_signal_audit(_order_audit_path(), selected)
+    except (OSError, ValueError, csv.Error):
+        audit, available = [], False
     return jsonify({
         "status":  "ok",
-        "signals": all_rows[-limit:],
+        "signals": annotate_signals(selected, audit, audit_available=available),
         "total": len(all_rows),
         "persistent": True,
         "counts": _signal_counts(all_rows),
@@ -3157,6 +3359,7 @@ def _chart_trade_events(ticker: str, start_ny: datetime, end_ny: datetime):
     """Persistent ENTRY/70%/final markers for a ticker and chart interval."""
 
     from core.order_audit import read_order_audit
+    from core.dashboard_evidence import number
 
     event_map = {
         "ENTRY_FILLED": "ENTRY",
@@ -3193,14 +3396,23 @@ def _chart_trade_events(ticker: str, start_ny: datetime, end_ny: datetime):
                 detail = {}
         except (TypeError, ValueError):
             detail = {}
+        if str(row.get("modo", "")).upper() == "REAL":
+            if kind == "ENTRY" and detail.get("broker_price_verified") is not True:
+                continue
+            if kind == "PARTIAL_70" and not (
+                    str(row.get("estado", "")).upper() == "FILLED"
+                    and detail.get("fill_price_verified") is True):
+                continue
         price = row.get("precio", 0)
         if kind == "FINAL_EXIT":
-            price = detail.get("salida_solicitada", price)
-        try:
-            price = float(price or 0.0)
-        except (TypeError, ValueError):
-            price = 0.0
-        if price <= 0:
+            if str(row.get("modo", "")).upper() == "REAL" and not (
+                detail.get("broker_confirmed") is True
+                and detail.get("fill_price_verified") is True
+            ):
+                continue
+            price = detail.get("salida_real")
+        price = number(price)
+        if price is None or price <= 0:
             continue
         rows.append({
             "event_id": row.get("event_id", ""),
@@ -3209,8 +3421,8 @@ def _chart_trade_events(ticker: str, start_ny: datetime, end_ny: datetime):
             "timestamp_iso": event_dt.isoformat(),
             "price": price,
             "side": str(row.get("lado", "")).upper(),
-            "quantity": int(float(row.get("cantidad", 0) or 0)),
-            "pnl_usd": float(row.get("pnl_usd", 0) or 0),
+            "quantity": number(detail.get("final_quantity", row.get("cantidad"))) if kind == "FINAL_EXIT" else number(row.get("cantidad")),
+            "pnl_usd": number(row.get("pnl_usd")),
             "label": {
                 "ENTRY": "ENTRADA",
                 "PARTIAL_70": "SALIDA 70%",
@@ -3396,16 +3608,6 @@ def get_signal_chart():
         if str(position.get("ticker", "")).upper() == ticker
         and str(position.get("status", "")).upper() in ("OPEN", "PARTIAL")
     ), None)
-    if active_position and candles:
-        last_price = float(candles[-1].get("close", 0.0) or 0.0)
-        entry_price = float(active_position.get("entry_price", 0.0) or 0.0)
-        remaining = int(active_position.get("remaining_quantity", 0) or 0)
-        if str(active_position.get("side", "")).upper() == "BUY":
-            floating = (last_price - entry_price) * remaining
-        else:
-            floating = (entry_price - last_price) * remaining
-        active_position["last_price"] = round(last_price, 4)
-        active_position["floating_pnl"] = round(floating, 2)
     trade_events = _chart_trade_events(ticker, start_ny, end_ny)
     return jsonify({
         "status": "ok",
@@ -3446,6 +3648,48 @@ def add_signal():
 # =============================================================
 # TRADES
 # =============================================================
+@app.route('/api/broker/open-position-pnl')
+def broker_open_position_pnl():
+    """Explicit read-only Schwab P/L lookup; never route orders or simulate data.
+
+    This is not the account-wide P/L Day: closed positions and manual holdings
+    may have different accounting. The operator initiates the API call from
+    Trades; it is not repeated on each dashboard polling cycle.
+    """
+    from core.broker_pnl import open_position_pnl_snapshot
+    bot = globals().get("_ENGINE")
+    account = str(getattr(bot, "account_number", "") or
+                  BOT_STATE.get("account_number", "") or
+                  get_env("SCHWAB_ACCOUNT_NUMBER", "")).strip()
+    try:
+        if not account:
+            raise RuntimeError("Cuenta Schwab no configurada")
+        if bot is not None and getattr(bot, "schwab", None) is not None:
+            positions = bot.schwab.obtener_posiciones(account)
+        else:
+            from api.schwab_client import SchwabClient
+            client = SchwabClient(_read_config_runtime())
+            account_hash = client.obtener_account_hash(account)
+            positions = client.obtener_posiciones(account_hash) if account_hash else None
+    except Exception:
+        positions = None
+    summary = open_position_pnl_snapshot(positions)
+    if not summary["available"]:
+        return jsonify({
+            "status": "unavailable", **summary,
+            "message": "Schwab no confirmó las posiciones; no se calcula P/L",
+        }), 503
+    return jsonify({
+        "status": "ok",
+        **summary,
+        "as_of_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "note": (
+            "P/L Day informado por Schwab para posiciones ABIERTAS disponibles; "
+            "no incluye todos los cierres de hoy y NO equivale al P/L de la estrategia GALA"
+        ),
+    })
+
+
 @app.route('/api/trades')
 def get_trades():
     positions = _engine_positions_snapshot()
@@ -3454,7 +3698,10 @@ def get_trades():
     events = BOT_STATE["trades"][-100:]
     return jsonify({
         "status": "ok",
-        "display_version": 2,
+        "display_version": 3,
+        "pnl_source": history["pnl_source"],
+        "is_broker_reported": False,
+        "excluded_closed_count": history["excluded_closed_count"],
         "positions": positions,
         "events": events,
         # Compatibility for older dashboard builds.
@@ -3469,11 +3716,11 @@ def get_trades():
         "paper_realized_today": history["paper_realized_today"],
         "real_realized_today": history["real_realized_today"],
         **live,
-        "paper_session_pnl": round(
-            history["paper_realized_today"] + live["paper_unrealized_pnl"], 2
+        "paper_session_pnl": _pnl_sum(
+            history["paper_realized_today"], live["paper_unrealized_pnl"]
         ),
-        "real_session_pnl": round(
-            history["real_realized_today"] + live["real_unrealized_pnl"], 2
+        "real_session_pnl": _pnl_sum(
+            history["real_realized_today"], live["real_unrealized_pnl"]
         ),
         "daily_risk": _engine_daily_risk_snapshot(),
     })
@@ -3511,10 +3758,10 @@ def get_ticker_performance():
         signal_rows = [dict(row) for row in BOT_STATE.get("signals", [])]
 
     try:
-        history_rows = _read_history_rows(newest_first=False)
+        history_rows = _dashboard_history_rows(newest_first=False)
     except Exception as exc:
         _log("WARN", f"[Dashboard] Rendimiento por ticker sin historial: {exc}")
-        history_rows = []
+        return jsonify({"status": "unavailable", "message": "Historial no verificable", "rows": []}), 503
 
     positions = _engine_positions_snapshot()
     execution_rows = _ticker_execution_rows(cfg, persist_missing=False)
@@ -3533,11 +3780,21 @@ def get_ticker_performance():
         "date": selected_date,
         "rows": rows,
         "summary": {
-            "signals": sum(int(row.get("signals", 0) or 0) for row in rows),
-            "closed_trades": sum(int(row.get("closed_trades", 0) or 0) for row in rows),
-            "realized_pnl": round(sum(float(row.get("realized_pnl", 0) or 0) for row in rows), 2),
-            "unrealized_pnl": round(sum(float(row.get("unrealized_pnl", 0) or 0) for row in rows), 2),
-            "total_pnl": round(sum(float(row.get("total_pnl", 0) or 0) for row in rows), 2),
+            "signals": sum(int(row.get("signals", 0)) for row in rows),
+            "by_mode": {
+                mode: {
+                    "closed_trades": sum(row["mode_breakdown"][mode]["closed_trades"] for row in rows),
+                    "excluded_closed_trades": sum(row["mode_breakdown"][mode]["excluded_closed_trades"] for row in rows),
+                    **{
+                        field: (
+                            round(sum(row["mode_breakdown"][mode][field] for row in rows), 2)
+                            if all(row["mode_breakdown"][mode][field] is not None for row in rows)
+                            else None
+                        ) for field in ("realized_pnl", "unrealized_pnl", "total_pnl")
+                    },
+                } for mode in ("PAPER", "REAL", "UNKNOWN")
+            },
+            "is_broker_reported": False,
         },
     })
 
@@ -3568,6 +3825,10 @@ def get_ticker_analysis():
         min_closed = 10
     min_closed = max(1, min(10000, min_closed))
 
+    evidence_mode = str(request.args.get("mode", "REAL")).strip().upper()
+    if evidence_mode not in {"PAPER", "REAL"}:
+        return jsonify({"status": "error", "message": "mode debe ser PAPER o REAL"}), 400
+
     as_of = str(
         request.args.get("date")
         or _ahora_ny_datetime().strftime("%Y-%m-%d")
@@ -3577,10 +3838,10 @@ def get_ticker_analysis():
         tickers = list((cfg.get("market", {}) or {}).get("tickers") or [])
 
     try:
-        history_rows = _read_history_rows(newest_first=False)
+        history_rows = _dashboard_history_rows(newest_first=False)
     except Exception as exc:
         _log("WARN", f"[Dashboard] Análisis automático sin historial: {exc}")
-        history_rows = []
+        return jsonify({"status": "unavailable", "message": "Historial no verificable", "rows": []}), 503
 
     execution_rows = _ticker_execution_rows(cfg, persist_missing=False)
     ai_rows = []
@@ -3603,6 +3864,7 @@ def get_ticker_analysis():
         as_of_date=as_of,
         lookback_days=lookback_days,
         min_closed_trades=min_closed,
+        evidence_mode=evidence_mode,
     )
     eligible = [row for row in rows if row.get("sample_eligible")]
     review = [row for row in eligible if row.get("review_candidate")]
@@ -3611,8 +3873,10 @@ def get_ticker_analysis():
         "as_of_date": as_of,
         "lookback_days": lookback_days,
         "min_closed_trades": min_closed,
+        "evidence_mode": evidence_mode,
+        "is_broker_reported": False,
         "ranking_basis": (
-            "cierres ejecutados: Wilson win-rate + retorno normalizado; "
+            "resultados separados por modo: Wilson win-rate + retorno normalizado; "
             "BA del modelo solo contexto"
         ),
         "auto_switch_real": False,
@@ -3646,13 +3910,14 @@ def add_log_api():
 def get_historial():
     """Persistent position lifecycle, newest first; stats count closes only."""
     try:
-        filas = _read_history_rows(newest_first=True)
+        filas = _dashboard_history_rows(newest_first=True)
     except Exception as e:
         return jsonify({"status": "error", "mensaje": str(e), "operaciones": []})
     closed = _closed_history_rows(filas)
     return jsonify({
         "status": "ok",
         "total": len(closed),
+        "excluded_closed_count": sum(not r.get("performance_verified") for r in closed),
         "total_eventos": len(filas),
         "operaciones": filas,
     })
@@ -3836,6 +4101,11 @@ def get_ticker_execution():
     from core.ticker_analysis import partial_share_plan
     for row in rows:
         row["real_allowed"] = (not allowed) or row["ticker"] in allowed
+        row["real_block_reason"] = (
+            "" if row["real_allowed"] else
+            "Fuera de live_trading.allowed_tickers. "
+            "Requiere aprobación explícita en configuración y Live Guard."
+        )
         row["max_real_shares"] = max_real_shares
         row["partial_plan"] = partial_share_plan(
             row.get("shares", 1), partial_pct, partial_enabled
@@ -4294,13 +4564,17 @@ def market_quote():
 # =============================================================
 @app.route('/api/ai/train', methods=['POST'])
 def trigger_training():
+    with _ENGINE_CONTROL_LOCK:
+        return _trigger_training_locked()
+
+def _trigger_training_locked():
     """Manual fallback: retrain only tickers already eligible for x/50.
 
     Heavy XGBoost work is never started while the trading engine is active.
     The manual path consumes the same lifecycle/state as the automatic
     post-session worker; it never resets counters or model history.
     """
-    if BOT_STATE.get("running"):
+    if _ai_engine_busy():
         return jsonify({
             "status": "error",
             "message": (
@@ -4309,6 +4583,8 @@ def trigger_training():
             ),
         }), 409
 
+    if _ai_training_busy():
+        return jsonify({"status": "error", "message": "Ya existe una evaluación IA en curso; no se duplica"}), 409
     trainer = None
     if _ENGINE is not None:
         try:
@@ -4340,12 +4616,12 @@ def trigger_training():
         "[IA] Reentrenamiento manual pending-only: " + ", ".join(eligible),
     )
     programado = trainer.solicitar_reentreno_todos(
-        eligible, solo_elegibles=True
+        eligible, solo_elegibles=True, manual_request=True
     )
     return jsonify({
         "status": "ok" if programado else "error",
         "message": (
-            "Reentrenamiento manual programado: " + ", ".join(eligible)
+            "Evaluación SHADOW manual encolada: " + ", ".join(eligible)
             if programado else
             "No se pudo iniciar el worker de reentrenamiento"
         ),
@@ -4353,6 +4629,78 @@ def trigger_training():
         "preserves_x50": True,
     }), (200 if programado else 500)
 
+
+
+def _known_ai_trainers():
+    trainers = [globals().get("_AI_STATUS_TRAINER")]
+    try:
+        trainers.append(_ENGINE.orquestador.entrenador)
+    except (AttributeError, TypeError):
+        pass
+    return [t for t in trainers if t is not None]
+
+
+def _ai_training_busy():
+    return any(training_busy(t) for t in _known_ai_trainers())
+
+
+def _ai_engine_busy():
+    if BOT_STATE.get("running"):
+        return True
+    thread = globals().get("_engine_thread")
+    if thread is not None and thread.is_alive():
+        return True
+    bot = globals().get("_ENGINE")
+    return bool(getattr(bot, "_activo", False) or getattr(bot, "_posiciones", {}))
+
+
+def _auto_ai_read_config():
+    # Automatic work must not treat an unreadable configuration as enabled.
+    with open(CONFIG_PATH, encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle)
+    if not isinstance(cfg, dict):
+        raise ValueError("config.yaml inválido")
+    return cfg
+
+
+def _get_auto_ai_service():
+    global _AUTO_AI_SERVICE
+    with _AI_STATUS_LOCK:
+        if _AUTO_AI_SERVICE is None:
+            _AUTO_AI_SERVICE = AutoAIService(
+                _auto_ai_read_config, _ai_trainer_for_status, _ai_engine_busy,
+                lambda cfg: list((cfg.get("market") or {}).get("tickers") or BOT_STATE.get("tickers") or []),
+                admission_lock=_ENGINE_CONTROL_LOCK, log=lambda message: _log("INFO", message))
+        return _AUTO_AI_SERVICE
+
+
+@app.route('/api/ai/automatic', methods=['GET', 'POST'])
+def automatic_ai_control():
+    try:
+        if request.method == "POST":
+            body = request.get_json(silent=True)
+            if not isinstance(body, dict) or set(body) != {"enabled"} or type(body["enabled"]) is not bool:
+                return jsonify({"status": "error", "message": "Envíe sólo enabled: true o false"}), 400
+            with _ENGINE_CONTROL_LOCK:
+                settings = update_auto_ai_enabled(CONFIG_PATH, body["enabled"])
+                for trainer in _known_ai_trainers():
+                    trainer.auto_retrain_enabled = body["enabled"]
+                    trainer.auto_retrain_only_after_session = True
+                    trainer.auto_activate_production = False
+                    trainer.automatic_training_allowed = _get_auto_ai_service().allowed_now
+                service = _get_auto_ai_service()
+                service.start()
+                service.wake()
+            _log("INFO", "[IA AUTO] Configuración guardada: " + ("ON" if body["enabled"] else "OFF"))
+        else:
+            settings = auto_ai_policy(_auto_ai_read_config())
+        return jsonify({"status": "ok", "policy": settings,
+                        "service": _get_auto_ai_service().snapshot(), "preserves_x50": True,
+                        "message": "Auto IA guardado; sólo evaluación SHADOW. Producción requiere aprobación manual."})
+    except (ValueError, TypeError) as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
+    except Exception:
+        return jsonify({"status": "error", "message": "No se pudo guardar/verificar Auto IA"}), 503
 
 
 def _ai_trainer_for_status():
@@ -4365,23 +4713,30 @@ def _ai_trainer_for_status():
 
 def _ai_trainer_for_status_locked():
     global _AI_STATUS_TRAINER
+    for trainer in _known_ai_trainers():
+        if training_busy(trainer):
+            return trainer
     if _ENGINE is not None and BOT_STATE.get('running'):
         return _ENGINE.orquestador.entrenador
     from pathlib import Path
+    from core.project_paths import resolve_runtime_path
     cfg = _read_config_runtime()
     ent = cfg.get('agents', {}).get('entrenamiento', {})
     shadow = cfg.get('agents', {}).get('shadow_mode', {})
     signature = []
-    for root in [ent.get('modelos_dir', 'data/modelos'), shadow.get('modelos_dir', 'data/modelos_shadow')]:
-        for path in sorted(Path(root).glob('modelo_*')):
+    for raw_root in [ent.get('modelos_dir', 'data/modelos'), shadow.get('modelos_dir', 'data/modelos_shadow')]:
+        root = Path(resolve_runtime_path(raw_root))
+        for path in sorted(root.glob('modelo_*')):
             if path.is_file() and path.suffix in ('.pkl', '.json'):
                 stat = path.stat()
                 signature.append((str(path), stat.st_mtime_ns, stat.st_size))
-    signature = (str(CONFIG_PATH), tuple(signature))
+    signature = (str(CONFIG_PATH), json.dumps(ent, sort_keys=True, default=str), tuple(signature))
     if _AI_STATUS_TRAINER is None or globals().get('_AI_STATUS_SIGNATURE') != signature:
         from agents.training import EntrenadorAgentes
         _AI_STATUS_TRAINER = EntrenadorAgentes(cfg)
         globals()['_AI_STATUS_SIGNATURE'] = signature
+    if hasattr(_AI_STATUS_TRAINER, "auto_retrain_enabled"):
+        _AI_STATUS_TRAINER.automatic_training_allowed = _get_auto_ai_service().allowed_now
     return _AI_STATUS_TRAINER
 
 
@@ -4423,6 +4778,7 @@ def _learning_summary_rows(tickers):
 def ai_retraining_status():
     """Per-ticker model availability and 30/50 retraining progress."""
     try:
+        auto_policy = auto_ai_policy(_auto_ai_read_config())
         trainer = _ai_trainer_for_status()
         tickers = list(BOT_STATE.get("tickers") or [])
         rows = trainer.retraining_status(tickers)
@@ -4456,6 +4812,20 @@ def ai_retraining_status():
             except Exception:
                 prod_meta = {}
             row["production_model"] = trainer.production_snapshot(ticker) if hasattr(trainer, "production_snapshot") else {}
+            # Explicit, read-only deployment diagnostics. Never mark missing or
+            # incompatible artifacts as approved; REAL remains fail-closed.
+            loaded = bool(row["production_model"].get("loaded"))
+            issues = getattr(trainer, "model_load_errors", {}) or {}
+            row["production_model_issue"] = (
+                "" if loaded else str(issues.get(ticker) or "modelo de producción no encontrado")
+            )
+            model_version = row["production_model"].get("model_version")
+            override = trainer.manual_threshold_overrides.active(ticker, model_version)
+            row["manual_threshold"] = override["threshold"] if override else None
+            row["effective_threshold"] = (
+                row["manual_threshold"] if override else row["production_threshold"]
+            )
+            row["threshold_source"] = "MANUAL" if override else "MODEL"
             shadow_model = trainer.shadow_snapshot(ticker) if hasattr(trainer, "shadow_snapshot") else {}
             row["shadow_model"] = shadow_model
             # v3.3.4: historical score of the SHADOW artifact that is currently
@@ -4494,6 +4864,8 @@ def ai_retraining_status():
         summary = {
             "eligible_closed_real": sum(int(r.get("eligible_closed_real", 0) or 0) for r in rows),
             "eligible_closed_paper": sum(int(r.get("eligible_closed_paper", 0) or 0) for r in rows),
+            "quarantined_closed_real": sum(int(r.get("quarantined_closed_real", 0) or 0) for r in rows),
+            "quarantined_closed_paper": sum(int(r.get("quarantined_closed_paper", 0) or 0) for r in rows),
             "eligible_closed_legacy": sum(int(r.get("eligible_closed_legacy", 0) or 0) for r in rows),
             "training_ready": sum(bool((r.get("training_readiness") or {}).get("ready")) for r in rows),
             "collecting": sum(r.get("status") == "COLLECTING" for r in rows),
@@ -4527,9 +4899,11 @@ def ai_retraining_status():
         }
         return jsonify({
             "status": "ok",
-            "automatic_retraining": bool(trainer.auto_retrain_enabled),
-            "only_after_session": bool(trainer.auto_retrain_only_after_session),
-            "auto_activate_production": bool(trainer.auto_activate_production),
+            "automatic_retraining": auto_policy["enabled"],
+            "only_after_session": True,
+            "auto_activate_production": False,
+            "auto_ai_policy": auto_policy,
+            "auto_ai_service": _get_auto_ai_service().snapshot(),
             "warning_samples": int(trainer.retrain_warning_samples),
             "retrain_samples": int(trainer.retrain_trigger_samples),
             "learning_policy": {
@@ -4574,6 +4948,8 @@ if __name__ == '__main__':
     # New York times. Automatic REAL is blocked inside _start_engine_controlled.
     _configure_scheduler_service()
 
+    _get_auto_ai_service().start()
+
     user = get_dashboard_user()
     pwd  = get_dashboard_password()
 
@@ -4597,3 +4973,4 @@ if __name__ == '__main__':
 
     app.run(host=dashboard_host, port=dashboard_port, debug=False, use_reloader=False,
             threaded=True)
+

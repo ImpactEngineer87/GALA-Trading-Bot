@@ -26,6 +26,7 @@ DESCRIPCIÓN:
 """
 
 import os
+import time
 import pickle
 import shutil
 import threading
@@ -46,6 +47,8 @@ from agents.learning_economics import (
 )
 from agents.retraining_lifecycle import RetrainingLifecycle
 from agents.volume_features import VOLUME_FEATURE_NAMES
+from core.project_paths import resolve_runtime_path
+from core.memory_diagnostics import memory_usage_mib
 
 
 # AI v4: only causal, non-constant model inputs.  GSCO has no aligned
@@ -82,18 +85,22 @@ class EntrenadorAgentes:
 
     def __init__(self, config: dict):
         from core.model_identity import ManualRealAuthorization
+        from core.ai_threshold_override import AIThresholdOverrides
         self.manual_real_authorization = ManualRealAuthorization(
             (config.get('live_trading', {}) or {}).get('manual_authorization', {}) or {})
+        self.manual_threshold_overrides = AIThresholdOverrides(
+            (config.get('agents', {}) or {}).get('entrenamiento', {}).get(
+                'manual_threshold_overrides', {}) or {})
         self._production_snapshots = {}
         self._shadow_snapshots = {}
         agents_cfg = config.get("agents", {})
         cfg = agents_cfg.get("entrenamiento", {})
-        self.reportes_dir = cfg.get('reportes_dir', 'data/reportes')
+        self.reportes_dir = resolve_runtime_path(cfg.get('reportes_dir', 'data/reportes'))
         shadow_cfg = agents_cfg.get("shadow_mode", {})
         self.activo: bool = cfg.get("activo", True)
         self.shadow_enabled: bool = bool(shadow_cfg.get("enabled", False))
-        self.shadow_models_dir: str = shadow_cfg.get(
-            "modelos_dir", "data/modelos_shadow")
+        self.shadow_models_dir: str = resolve_runtime_path(shadow_cfg.get(
+            "modelos_dir", "data/modelos_shadow"))
         self.shadow_tickers = {
             str(t).upper() for t in shadow_cfg.get("tickers", []) if str(t).strip()
         }
@@ -108,8 +115,8 @@ class EntrenadorAgentes:
         self.shadow_min_improvement: float = float(
             shadow_cfg.get("min_improvement_pp", 0.0)) / 100.0
         # Carpeta para los modelos por ticker (uno por acción).
-        self.modelos_dir: str = cfg.get("modelos_dir", "data/modelos")
-        self.feedback_path: str = cfg.get("feedback_path", "data/agentes_feedback.csv")
+        self.modelos_dir: str = resolve_runtime_path(cfg.get("modelos_dir", "data/modelos"))
+        self.feedback_path: str = resolve_runtime_path(cfg.get("feedback_path", "data/agentes_feedback.csv"))
         # v3.3.7: supplemental signal familiarization.  x/50 and all
         # validation/test metrics remain based on execution-valid CLOSED trades.
         # Resolved non-executed signals may augment FIT only with a lower weight.
@@ -118,7 +125,7 @@ class EntrenadorAgentes:
         self.signal_learning_training_enabled: bool = bool(
             learning_cfg.get("use_for_training", True)
         )
-        self.signal_learning_path: str = str(
+        self.signal_learning_path: str = resolve_runtime_path(
             learning_cfg.get("path", "data/signal_learning_observations.csv")
         )
         self.signal_learning_weight: float = min(1.0, max(0.0, float(
@@ -131,15 +138,15 @@ class EntrenadorAgentes:
         self.reentrenar_cada_n: int = int(cfg.get("reentrenar_cada_n", 50))
         self.auto_retrain_enabled: bool = bool(
             auto_cfg.get("enabled", self.activo))
-        self.auto_retrain_only_after_session: bool = bool(
-            auto_cfg.get("only_after_session", False))
-        self.auto_activate_production: bool = bool(
-            auto_cfg.get("auto_activate_production", False))
+        self.auto_retrain_only_after_session: bool = True
+        self.auto_activate_production: bool = False
+        self._automatic_training_config = config
+        self._eligible_batch_running = False
         self.retrain_warning_samples: int = int(
             auto_cfg.get("warning_samples", 30))
         self.retrain_trigger_samples: int = int(
             auto_cfg.get("retrain_samples", self.reentrenar_cada_n))
-        self.retrain_state_path: str = str(
+        self.retrain_state_path: str = resolve_runtime_path(
             auto_cfg.get("state_path", "data/retraining_state.json"))
         self.min_muestras: int = cfg.get("min_muestras", 40)
         self.umbral_meta: float = cfg.get("umbral_meta_filtro", 0.50)
@@ -186,7 +193,12 @@ class EntrenadorAgentes:
         self._lock = threading.Lock()
         self._status_feedback_signature = None
         self._status_feedback_rows = pd.DataFrame()
+        # Only one dashboard request may parse/prepare the full feedback CSV
+        # after it changes. Other requests wait for the refreshed cache.
+        self._status_feedback_load_lock = threading.Lock()
+        self._last_status_memory_log = 0.0
         self._modelos: Dict[str, object] = {}     # approved production models
+        self.model_load_errors: Dict[str, str] = {}
         self._umbrales: Dict[str, float] = {}
         self._modelos_shadow: Dict[str, object] = {}
         self._umbrales_shadow: Dict[str, float] = {}
@@ -231,6 +243,26 @@ class EntrenadorAgentes:
         if modelo is None:
             # Sin artefacto aprobado no hay inferencia válida. En PAPER se deja
             # pasar para seguir recolectando ejemplos; en REAL se falla cerrado.
+            return (None, False) if requerir_modelo else (None, True)
+
+        # Manual policy affects only future decisions for this exact loaded
+        # model version. Read every time so the running engine sees changes.
+        try:
+            saved_override = self.manual_threshold_overrides.active(
+                ticker, decision.ai_model_snapshot.get('model_version'))
+            if saved_override:
+                model_threshold = umbral
+                umbral = float(saved_override['threshold'])
+                decision.ai_model_snapshot.update(
+                    model_threshold=model_threshold, threshold=umbral,
+                    threshold_source='MANUAL')
+            else:
+                decision.ai_model_snapshot.update(
+                    threshold=umbral, threshold_source='MODEL')
+        except Exception:
+            # Invalid or unreadable persisted override: block REAL, never
+            # silently fall back to a potentially weaker unknown policy.
+            decision.ai_inference_error = True
             return (None, False) if requerir_modelo else (None, True)
 
         if not self.activo and not requerir_modelo:
@@ -341,12 +373,26 @@ class EntrenadorAgentes:
     # ENTRENAMIENTO (por ticker)
     # =========================================================
 
+    def _automatic_training_allowed(self):
+        if not self.auto_retrain_enabled:
+            return False
+        callback = getattr(self, "automatic_training_allowed", None)
+        try:
+            if callable(callback):
+                return bool(callback())
+            config = getattr(self, "_automatic_training_config", None)
+            if config is not None:
+                from core.auto_ai import window
+                return window(config, datetime.now(timezone.utc))[0]
+            return True
+        except Exception:
+            return False
+
     def quizas_reentrenar_ticker(self, ticker: str, total_cerradas_ticker: int) -> Optional[dict]:
         """Update the per-ticker counter and schedule only when policy permits.
 
-        In v2.1 the default deployment is end-of-session only.  Legacy configs
-        without ``automatic_retraining.only_after_session`` retain the former
-        background behavior for backwards compatibility.
+        Automatic training is post-session SHADOW evaluation. Production
+        activation remains an explicit, separate approval operation.
         """
         ticker = str(ticker or "").upper()
         if not ticker:
@@ -387,11 +433,13 @@ class EntrenadorAgentes:
         metricas = None
         
         try:
+            if not self._automatic_training_allowed():
+                return
             self.retraining.mark_training(ticker, total_count)
 
             metricas = self.entrenar_ticker(
                 ticker,
-                allow_production_activation=self.auto_activate_production,
+                allow_production_activation=False,
                 automatic=True,
             )
             accepted = bool(metricas and metricas.get("shadow_candidate_accepted"))
@@ -596,13 +644,15 @@ class EntrenadorAgentes:
         self,
         ticker: str,
         *,
-        allow_production_activation: bool = True,
+        allow_production_activation: bool = False,
         automatic: bool = False,
     ) -> Optional[dict]:
         """
         Entrena el modelo XGBoost de UN ticker con SOLO sus filas del CSV de
-        feedback y lo activa en caliente. Devuelve métricas o None.
+        feedback y evalúa un candidato SHADOW. Devuelve métricas o None.
         """
+        if automatic:
+            allow_production_activation = False
         if not ticker or not os.path.exists(self.feedback_path):
             return None
         try:
@@ -1015,7 +1065,7 @@ class EntrenadorAgentes:
     ) -> dict:
         """Train all requested tickers while preserving the production safety gate."""
         if allow_production_activation is None:
-            allow_production_activation = bool(self.activo and self.umbral_meta > 0)
+            allow_production_activation = False
         res = {}
         diagnostico = {}
         esquema_features = False
@@ -1092,35 +1142,68 @@ class EntrenadorAgentes:
         tickers,
         *,
         solo_elegibles: bool = False,
+        manual_request: bool = False,
     ) -> bool:
-        """Schedule retraining without blocking the trading engine.
+        """Schedule strictly eligible SHADOW training without enabling auto AI.
 
-        ``solo_elegibles=True`` is used by the end-of-session workflow and
-        trains only tickers that accumulated the configured 50 new observations.
-        The manual dashboard action keeps the explicit all-ticker behavior.
+        The scheduler must honor automatic_retraining.enabled. A deliberate
+        dashboard manual request may run while Auto IA is OFF, but STILL uses
+        eligible_tickers/x50 and the normal FIT/VALIDATION/TEST gates.
+        API /api/ai/train checks that the REAL engine is stopped first.
         """
         lista = list(dict.fromkeys(str(t).upper() for t in (tickers or []) if str(t).strip()))
         if solo_elegibles:
-            if not self.auto_retrain_enabled:
+            # Auto IA OFF disables unattended scheduled retraining, NOT the
+            # operator's explicit manual "Reentrenar pendientes" action.
+            if not manual_request and not self._automatic_training_allowed():
                 return False
             lista = self.retraining.eligible_tickers(lista)
         elif not self.activo and not self.shadow_enabled:
             return False
         if not lista:
             return False
-        target = self._retrain_eligible_batch if solo_elegibles else self.entrenar_todos
-        threading.Thread(
-            target=target,
-            args=(lista,),
-            name="retrain-fin-sesion" if solo_elegibles else "retrain-manual",
-            daemon=not solo_elegibles,
-        ).start()
+        target = self._retrain_eligible_batch if solo_elegibles else self._retrain_all_batch
+        # The explicit manual review path is SHADOW-only regardless of any
+        # unattended production-activation configuration.
+        worker_args = (lista, True) if solo_elegibles and manual_request else (lista,)
+        with self._lock:
+            if getattr(self, "_eligible_batch_running", False) or self._entrenando:
+                return False
+            self._eligible_batch_running = True
+        try:
+            threading.Thread(
+                target=target,
+                args=worker_args,
+                name=("retrain-manual-shadow" if manual_request else
+                      "retrain-fin-sesion" if solo_elegibles else "retrain-manual"),
+                daemon=not solo_elegibles,
+            ).start()
+        except Exception:
+            with self._lock:
+                self._eligible_batch_running = False
+            return False
         return True
 
-    def _retrain_eligible_batch(self, tickers) -> dict:
+    def _retrain_eligible_batch(self, tickers, manual_request: bool = False) -> dict:
+        try:
+            return self._retrain_eligible_batch_impl(tickers, manual_request)
+        finally:
+            with self._lock:
+                self._eligible_batch_running = False
+
+    def _retrain_all_batch(self, tickers):
+        try:
+            return self.entrenar_todos(tickers, allow_production_activation=False)
+        finally:
+            with self._lock:
+                self._eligible_batch_running = False
+
+    def _retrain_eligible_batch_impl(self, tickers, manual_request: bool = False) -> dict:
         results = {}
 
         for ticker in tickers:
+            if not manual_request and not self._automatic_training_allowed():
+                break
             ticker = str(ticker or "").upper()
             if not ticker:
                 continue
@@ -1158,7 +1241,7 @@ class EntrenadorAgentes:
 
                 metrics = self.entrenar_ticker(
                     ticker,
-                    allow_production_activation=self.auto_activate_production,
+                    allow_production_activation=False,
                     automatic=True,
                 )
 
@@ -1281,16 +1364,41 @@ class EntrenadorAgentes:
         with self._lock:
             if current == self._status_feedback_signature:
                 return self._status_feedback_rows
-        try:
-            prepared = self._prepare_training_rows(pd.read_csv(self.feedback_path))
-        except Exception:
-            # Never cache a transient partial append or read error.
-            return pd.DataFrame()
-        if signature() == current:
+
+        # Serialize expensive cache misses across concurrent /api/ai/status and
+        # /api/ticker-analysis calls. Recheck after acquiring the load lock:
+        # another request may have completed the refresh while we waited.
+        with self._status_feedback_load_lock:
+            current = signature()
             with self._lock:
-                self._status_feedback_rows = prepared
-                self._status_feedback_signature = current
-        return prepared
+                if current == self._status_feedback_signature:
+                    return self._status_feedback_rows
+            started = time.monotonic()
+            before_mib, _ = memory_usage_mib()
+            try:
+                raw = pd.read_csv(self.feedback_path)
+                parsed_mib, _ = memory_usage_mib()
+                prepared = self._prepare_training_rows(raw)
+                del raw
+            except Exception:
+                # Never cache a transient partial append or read error.
+                return pd.DataFrame()
+            after_mib, _ = memory_usage_mib()
+            if time.monotonic() - getattr(self, "_last_status_memory_log", 0.0) >= 120:
+                self._last_status_memory_log = time.monotonic()
+                print(
+                    "[AI-MEMORY] feedback_status_refresh "
+                    f"rss_before={float(before_mib or 0):.0f}MiB "
+                    f"rss_after_csv={float(parsed_mib or 0):.0f}MiB "
+                    f"rss_after_prepare={float(after_mib or 0):.0f}MiB "
+                    f"eligible_rows={len(prepared)} "
+                    f"elapsed_sec={time.monotonic()-started:.1f}"
+                )
+            if signature() == current:
+                with self._lock:
+                    self._status_feedback_rows = prepared
+                    self._status_feedback_signature = current
+            return prepared
 
     # =========================================================
     # PERSISTENCIA (un archivo por ticker)
@@ -1452,66 +1560,66 @@ class EntrenadorAgentes:
         return os.path.join(self.shadow_models_dir, f"modelo_{ticker}.meta.json")
 
     def _archivar_modelo_incompatible(self, ticker: str, motivo: str):
-        """Move an obsolete/corrupt artifact away from the active model path."""
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        movidos = []
-        for path in (self._ruta_modelo(ticker), self._ruta_meta(ticker)):
-            if not os.path.exists(path):
-                continue
-            destino = f"{path}.incompatible_{stamp}"
-            try:
-                os.replace(path, destino)
-                movidos.append(destino)
-            except OSError:
-                pass
-        if movidos:
-            print(
-                f"[Agentes] Artefacto {ticker} archivado por incompatibilidad "
-                f"({motivo}); no se cargará en vivo."
-            )
+        """Fail closed WITHOUT renaming operator-owned production artifacts.
+
+        Prior versions moved a model and its metadata away on any load error.
+        That can make an otherwise recoverable deployment issue look like a
+        missing model. Preservation is mandatory: diagnosis is read-only.
+        """
+        self.model_load_errors[ticker] = str(motivo)
+        print(
+            f"[Agentes] PRODUCTION {ticker}: no cargable ({motivo}). "
+            "Artefactos conservados en su ruta original; REAL bloqueado."
+        )
 
     def _cargar_si_existe(self):
         try:
             if not os.path.isdir(self.modelos_dir):
+                print(f"[Agentes] Directorio de modelos PRODUCTION ausente: {self.modelos_dir}")
                 return
-            for nombre in os.listdir(self.modelos_dir):
-                if nombre.startswith("modelo_") and nombre.endswith(".pkl"):
-                    ticker = nombre[len("modelo_"):-len(".pkl")]
-                    try:
-                        meta_path = self._ruta_meta(ticker)
-                        if not os.path.exists(meta_path):
-                            # Artefacto legado sin esquema de volumen validado.
-                            self._archivar_modelo_incompatible(
-                                ticker, "sin metadata")
-                            continue
-                        with open(meta_path, "r", encoding="utf-8") as f:
-                            meta = json.load(f)
-                        if meta.get("feature_version") != FEATURE_VERSION \
-                           or meta.get("features") != FEATURES \
-                           or meta.get("training_policy_version") != TRAINING_POLICY_VERSION:
-                            self._archivar_modelo_incompatible(
-                                ticker, "versión/esquema distinto")
-                            continue
-                        with open(os.path.join(self.modelos_dir, nombre), "rb") as f:
-                            modelo = pickle.load(f)
-                        if int(getattr(modelo, "n_features_in_", -1)) != len(FEATURES):
-                            self._archivar_modelo_incompatible(
-                                ticker, "número de features distinto")
-                            continue
-                        self._modelos[ticker] = modelo
-                        from core.model_identity import model_snapshot
-                        self._production_snapshots[ticker] = model_snapshot(meta, self._ruta_modelo(ticker), True)
-                        self._umbrales[ticker] = float(
-                            meta.get("decision_threshold", self.umbral_meta))
-                        self._ultimo_reentreno[ticker] = int(meta.get("muestras", 0))
-                    except Exception:
-                        self._archivar_modelo_incompatible(
-                            ticker, "archivo ilegible")
+            for nombre in sorted(os.listdir(self.modelos_dir)):
+                if not (nombre.startswith("modelo_") and nombre.endswith(".pkl")):
+                    continue
+                ticker = nombre[len("modelo_"):-len(".pkl")].upper()
+                try:
+                    meta_path = self._ruta_meta(ticker)
+                    if not os.path.isfile(meta_path):
+                        self._archivar_modelo_incompatible(ticker, "metadata faltante")
                         continue
+                    with open(meta_path, "r", encoding="utf-8") as handle:
+                        meta = json.load(handle)
+                    if (
+                        meta.get("feature_version") != FEATURE_VERSION
+                        or meta.get("features") != FEATURES
+                        or meta.get("training_policy_version") != TRAINING_POLICY_VERSION
+                    ):
+                        self._archivar_modelo_incompatible(
+                            ticker, "versión/esquema de modelo incompatible"
+                        )
+                        continue
+                    with open(self._ruta_modelo(ticker), "rb") as handle:
+                        modelo = pickle.load(handle)
+                    if int(getattr(modelo, "n_features_in_", -1)) != len(FEATURES):
+                        self._archivar_modelo_incompatible(ticker, "número de features distinto")
+                        continue
+                    self._modelos[ticker] = modelo
+                    from core.model_identity import model_snapshot
+                    self._production_snapshots[ticker] = model_snapshot(
+                        meta, self._ruta_modelo(ticker), True
+                    )
+                    self._umbrales[ticker] = float(
+                        meta.get("decision_threshold", self.umbral_meta)
+                    )
+                    self._ultimo_reentreno[ticker] = int(meta.get("muestras", 0))
+                except Exception as exc:
+                    self._archivar_modelo_incompatible(
+                        ticker, f"error de lectura: {type(exc).__name__}"
+                    )
+                    continue
             if self._modelos:
                 print(f"[Agentes] Modelos por ticker cargados: {sorted(self._modelos.keys())}")
-        except Exception as e:
-            print(f"[Agentes] No se pudieron cargar los modelos por ticker: {e}")
+        except Exception as exc:
+            print(f"[Agentes] No se pudieron listar los modelos por ticker: {exc}")
 
     def _cargar_shadow_si_existe(self):
         if not self.shadow_enabled or not os.path.isdir(self.shadow_models_dir):
@@ -1689,3 +1797,4 @@ class EntrenadorAgentes:
         except Exception as e:
             print(f"[Agentes] Error guardando el modelo de {ticker}: {e}")
             return False
+

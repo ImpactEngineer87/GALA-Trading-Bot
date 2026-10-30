@@ -30,6 +30,7 @@ DESCRIPCIÓN:
 =============================================================
 """
 
+import math
 import os
 import re
 import time
@@ -105,8 +106,11 @@ def _err_detalle(e) -> str:
 # 'tipo'/'tipo_entrada' del bot: "BUY" = largo, "SELL" = corto.
 
 def _instruccion_apertura(tipo: str) -> str:
-    """Instrucción Schwab para ABRIR una posición."""
-    return "BUY" if tipo == "BUY" else "SELL_SHORT"
+    """Never confuse a short entry with a long close (SELL)."""
+    side = str(tipo or "").upper().strip()
+    if side not in {"BUY", "SELL"}:
+        raise ValueError("Opening signal must be BUY or SELL")
+    return "BUY" if side == "BUY" else "SELL_SHORT"
 
 
 def _instruccion_cierre(tipo_entrada: str) -> str:
@@ -470,8 +474,6 @@ class EjecutorHibridoDeOrdenes:
         No broker request that can mutate the account is sent here.  The caller
         is responsible for proving there is no position and no WORKING order.
         """
-        if not self.execution_v2_config.get('enabled', False):
-            return False
         from core.execution_v2 import SmartExit
         with self.secuencia_simbolo(str(ticker).upper()):
             if self._smart_exit is None:
@@ -481,8 +483,6 @@ class EjecutorHibridoDeOrdenes:
             )
 
     def has_pending_exit(self, account, ticker):
-        if not self.execution_v2_config.get('enabled', False):
-            return False
         import hashlib
         from core.runtime_store import JsonState
         key = hashlib.sha256(str(account).encode()).hexdigest()[:16] + ':' + ticker
@@ -712,7 +712,23 @@ class EjecutorHibridoDeOrdenes:
         """Return the actual LIMIT sent to Schwab, including the buffer cap."""
 
         if tipo_orden == "LIMIT":
-            return round(float(orden.precio_limite), 4)
+            # Opt-in bounded tolerance for fast markets. A SELL_SHORT LIMIT
+            # may improve fill likelihood by crossing *down* up to 10 cents;
+            # BUY moves *up*. This is a cap, not a guaranteed execution price.
+            # No unbounded MARKET fallback and no change to PAPER orders.
+            price = float(orden.precio_limite)
+            if self.paper_trading or not self.execution_v2_config.get("enabled", False):
+                return round(price, 4)
+            tolerance = float(self.execution_v2_config.get(
+                "entry_limit_tolerance_usd", 0.0
+            ) or 0.0)
+            if not math.isfinite(tolerance) or not (0.0 <= tolerance <= 0.10):
+                raise ValueError("entry_limit_tolerance_usd must be 0.00–0.10")
+            if tolerance > 0:
+                price = price + tolerance if orden.tipo == "BUY" else price - tolerance
+            if not math.isfinite(price) or price <= 0:
+                raise ValueError("Invalid broker entry LIMIT after tolerance")
+            return round(price, 2) if tolerance else round(price, 4)
         if self.max_slippage_pct > 0:
             cap = orden.precio_limite * (self.max_slippage_pct / 100.0)
             price = (
@@ -1246,22 +1262,55 @@ class EjecutorHibridoDeOrdenes:
         # parcial, pero las patas SÍ registran la ejecución: se toma el MÁXIMO
         # entre ambas fuentes para no ignorar acciones ya adquiridas.
         precios, cantidades = [], []
+        valid_prices = True
+        seen_executions = set()
         for act in (d.get("orderActivityCollection", []) or []):
+            if not isinstance(act, dict):
+                valid_prices = False
+                continue
+            execution_id = act.get("executionId")
+            if execution_id is not None:
+                if str(execution_id) in seen_executions:
+                    valid_prices = False
+                    continue
+                seen_executions.add(str(execution_id))
+            if (act.get("activityType") not in (None, "EXECUTION")
+                    or act.get("executionType") not in (None, "FILL")):
+                valid_prices = False
+                continue
             for leg in (act.get("executionLegs", []) or []):
-                precios.append(float(leg.get("price", 0) or 0))
-                cantidades.append(float(leg.get("quantity", 0) or 0))
-        filled_field = float(d.get("filledQuantity", 0) or 0)
+                try:
+                    price, qty = float(leg.get("price", 0) or 0), float(leg.get("quantity", 0) or 0)
+                    if not math.isfinite(qty) or qty <= 0:
+                        raise ValueError("Invalid fill quantity")
+                    cantidades.append(qty)
+                    precios.append(price)
+                    valid_prices = valid_prices and math.isfinite(price) and price > 0
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    valid_prices = False
+        try:
+            filled_field = float(d.get("filledQuantity", 0) or 0)
+            if not math.isfinite(filled_field) or filled_field < 0:
+                raise ValueError("Invalid broker quantity")
+        except (TypeError, ValueError, OverflowError):
+            filled_field = 0.0
+            valid_prices = False
         filled_legs = sum(cantidades)
         filled = max(filled_field, filled_legs)
-        if filled_legs > 0:
+        valid_prices = bool(valid_prices and filled_legs > 0
+                            and math.isfinite(filled)
+                            and abs(filled - filled_legs) <= 1e-6
+                            and len(d.get("orderLegCollection") or []) <= 1)
+        if valid_prices:
             avg = sum(p * q for p, q in zip(precios, cantidades)) / filled_legs
+            valid_prices = math.isfinite(avg) and avg > 0
+            if not valid_prices:
+                avg = 0.0
         else:
-            # Sin patas pero con llenado (filledQuantity>0): usa el precio de la
-            # orden (límite) como aproximación en vez de 0.0, para no mal-calcular
-            # SL/TP/PnL de una posición realmente llenada.
             # A limit is an instruction, never evidence of an execution price.
             avg = 0.0
-        return {"status": status, "filled": filled, "avg_price": avg}
+        return {"status": status, "filled": filled, "avg_price": avg,
+                "fill_price_verified": bool(valid_prices)}
 
     def esperar_estado_orden(self, account_number: str, order_id: str,
                              deseados, fallos=(), timeout_s: Optional[float] = None) -> dict:
@@ -1418,10 +1467,14 @@ class EjecutorHibridoDeOrdenes:
     def montar_proteccion_parcial(self, orden: OrdenTradingCalculada,
                                   account_number: str) -> dict:
         """
-        Tras el llenado de la entrada, monta la protección 70/30:
-          - TP1: LIMIT de salida del 70% en take_profit_parcial
-          - SL : STOP de salida del 100% en stop_loss
-        Devuelve los ids para que el motor gestione el breakeven al saltar TP1.
+        Following a confirmed entry fill, place a full-quantity STOP first.
+
+        LIVE SAFETY: The former independent STOP 100% + TP1 LIMIT 70% created
+        overlapping closing orders rejected by Schwab. REAL execution retains
+        only its verified STOP; the 70/30 TP1 is suspended until a linked,
+        quantity-safe strategy is implemented and broker-verified. The engine
+        separately blocks new REAL entries that require this partial plan.
+        PAPER retains its existing simulated 70/30 workflow.
         """
         # STOP PRIMERO: si el segundo POST falla, la posición sigue protegida.
         # Colocar TP1 antes del stop dejaba una ventana de exposición desnuda.
@@ -1429,6 +1482,23 @@ class EjecutorHibridoDeOrdenes:
                                  orden.stop_loss, "STOP", account_number)
         if sl.get("status") != "OK":
             return {"tp1": {}, "sl": sl}
+        if not self.paper_trading:
+            # Last-resort guard for an already-filled REAL position. Schwab
+            # rejected TSLA's unlinked BUY_TO_COVER TP1 2 while its full STOP 3
+            # was WORKING. Keep the acknowledged full STOP and never send a
+            # second closing order exceeding broker exposure. New partial REAL
+            # entries are blocked in the engine until a linked exit is verified.
+            self._audit(
+                "TP1_SUSPENDED_CONFLICT",
+                ticker=orden.ticker, lado=orden.tipo,
+                estado="NO_ORDER_SENT",
+                parent_order_id=str(sl.get("order_id") or ""),
+                cantidad=orden.cantidad_parcial,
+                precio=orden.take_profit_parcial,
+                motivo="Standalone TP1 conflicts with a full-position STOP; "
+                       "Schwab oversold/overbought rejection",
+            )
+            return {"tp1": {}, "sl": sl, "partial_exit_suspended": True}
         tp1 = self.colocar_salida(orden.ticker, orden.tipo, orden.cantidad_parcial,
                                   orden.take_profit_parcial, "LIMIT", account_number)
         return {"tp1": tp1, "sl": sl}
@@ -1524,18 +1594,31 @@ class EjecutorHibridoDeOrdenes:
     # LIQUIDACIÓN (REVERSIÓN + KILL SWITCH)
     # =========================================================
 
+    def preparar_cierre(self, ticker: str, motivo: str = "") -> dict:
+        """Read-only preflight BEFORE the engine cancels protective orders."""
+        from core.execution_v2 import SmartExit
+        if self.paper_trading or SmartExit._is_emergency(motivo):
+            return {'ready': True}
+        if self._smart_exit is None:
+            self._smart_exit = SmartExit(self, self.execution_v2_config)
+        return {'ready': bool(self._smart_exit._quote(ticker)),
+                'policy': 'LIMIT_ONLY',
+                'reason': 'Se requiere bid/ask reciente para cierre LIMIT; protecciones conservadas'}
+
     def liquidar_posicion(self, ticker: str, tipo_entrada: str, cantidad: int,
                           account_number: str, motivo: str = "") -> dict:
-        if self.paper_trading or not self.execution_v2_config.get('enabled', False):
-            return self._liquidar_market_legacy(ticker, tipo_entrada, cantidad, account_number, motivo)
         from core.execution_v2 import SmartExit
+        if self.paper_trading or (not self.execution_v2_config.get('enabled', False)
+                                 and SmartExit._is_emergency(motivo)):
+            return self._liquidar_market_legacy(ticker, tipo_entrada, cantidad, account_number, motivo)
         with self.secuencia_simbolo(ticker):
             if self._smart_exit is None:
                 self._smart_exit = SmartExit(self, self.execution_v2_config)
             context = getattr(self._lifecycle_local, 'fields', None) or {}
             try:
                 return self._smart_exit.close(ticker, tipo_entrada, cantidad, account_number, motivo,
-                                              context.get('exit_signal_price'))
+                                              context.get('exit_signal_price'),
+                                              position_id=context.get('position_id'))
             except Exception as exc:
                 return {'status': 'RECONCILIAR', 'posicion_plana': False,
                         'mensaje': f'Execution recovery required: {type(exc).__name__}'}
@@ -1678,20 +1761,29 @@ class EjecutorHibridoDeOrdenes:
                 avg_price = float(detalle_fill.get("avg_price", 0.0) or 0.0)
                 _ps(f"[LIQUIDAR] {ticker} confirmado PLANO en "
                     f"{llenado['latency_ms'] + plano['latency_ms']}ms | ID {order_id} | {motivo}")
+                price_verified = bool(
+                    avg_price > 0 and str(llenado.get("broker_status", "")).upper() == "FILLED"
+                )
                 result = {
                     "status": "OK", "order_id": order_id, "cantidad": broker_qty,
                     "broker_status": llenado["broker_status"],
                     "latency_ms": llenado["latency_ms"] + plano["latency_ms"],
                     "posicion_plana": True, "avg_price": avg_price,
                     "broker_side": broker_tipo,
+                    "fill_price_verified": price_verified,
                 }
                 self._audit(
-                    "EXIT_FILLED", ticker=ticker, lado=broker_tipo,
-                    estado=llenado.get("broker_status", "FILLED"),
+                    "EXIT_FILLED" if price_verified else "EXIT_FLAT_PRICE_UNVERIFIED",
+                    ticker=ticker, lado=broker_tipo,
+                    estado=llenado.get("broker_status", "DESCONOCIDO"),
                     order_id=order_id, cantidad=broker_qty,
                     latency_ms=result["latency_ms"], motivo=motivo,
-                    precio=avg_price,
-                    detalle={"posicion_plana": True, "avg_price": avg_price},
+                    precio=avg_price if price_verified else "",
+                    detalle={
+                        "posicion_plana": True,
+                        "avg_price": avg_price if price_verified else None,
+                        "fill_price_verified": price_verified,
+                    },
                 )
                 return result
             status = "ERROR" if (
@@ -2088,3 +2180,4 @@ class EjecutorHibridoDeOrdenes:
     def cancelar_orden(self, account_number: str, order_id: str) -> bool:
         """Compatibilidad: True únicamente tras confirmación terminal real."""
         return bool(self.cancelar_orden_confirmada(account_number, order_id).get("confirmado"))
+
