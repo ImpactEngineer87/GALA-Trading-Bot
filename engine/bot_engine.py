@@ -805,9 +805,31 @@ class ChocoletraBot:
     def _real_accounting_status(self):
         guard = getattr(self, "real_accounting_guard", None)
         if guard is None:
-            return {"blocked": True, "unresolved": 0,
+            return {"blocked": True, "entry_blocked": True, "unresolved": 0,
                     "reasons": ["REAL accounting guard unavailable"]}
-        return guard.snapshot()
+        snapshot = guard.snapshot()
+        # Reporting remains honest: the historical records stay unresolved and
+        # daily P/L remains unknown. Only the NEW ENTRY gate can be scoped to an
+        # explicitly reviewed prior-session manual intervention. Re-evaluate the
+        # immutable approval against guard bytes at each decision.
+        snapshot["entry_blocked"] = bool(snapshot["blocked"])
+        snapshot["historical_resume_active"] = False
+        # In-process accounting read/write failure always blocks new REAL
+        # orders, even if the saved file still exactly matches an old grant.
+        # A prior-session exception only applies to sound, readable accounting.
+        if snapshot["blocked"] and not getattr(guard, "_failure", ""):
+            from core.historical_manual_resume import exception_status
+            approval = exception_status(
+                getattr(self, "config", {}) or {}, guard.store.path,
+                # The approval is bound to the plain account identity. Trading
+                # preparation replaces account_number with Schwab's broker hash;
+                # never use that API routing token to validate an operator grant.
+                (getattr(self, "_account_plain", "") or
+                 getattr(self, "account_number", "")),
+                now=self._ahora_et() if callable(getattr(self, "_ahora_et", None)) else None,
+            )
+            snapshot.update(approval)
+        return snapshot
 
     def _require_real_accounting(self, ticker, pos, reason, **evidence):
         # Latch before releasing exposure/history: an unknown outcome must not
@@ -936,7 +958,10 @@ class ChocoletraBot:
         snapshot["valuation_source"] = "trusted_market_data"
         accounting = self._real_accounting_status()
         snapshot["real_accounting"] = accounting
-        if not guard_paper and accounting["blocked"]:
+        if not guard_paper and accounting["entry_blocked"]:
+            # Past-day records under an exact operator-approved exception remain
+            # unresolved, but they must not make today's verified risk totals
+            # appear unknown. A NEW discrepancy immediately masks totals again.
             # The numeric known component can still trigger the existing loss
             # guard conservatively; never display it as a complete daily total.
             snapshot["known_net_pnl"] = snapshot["net_pnl"]
@@ -2733,7 +2758,7 @@ class ChocoletraBot:
         ticker = prop.ticker
         paper_ticker = self._is_paper_ticker(ticker)
         execution_mode = "PAPER" if paper_ticker else "REAL"
-        if not paper_ticker and self._real_accounting_status()["blocked"]:
+        if not paper_ticker and self._real_accounting_status()["entry_blocked"]:
             decision.execution_skip_reason = "REAL_ACCOUNTING_UNRESOLVED"
             self._audit_event("ENTRY_BLOCKED", ticker=ticker, lado=prop.tipo,
                               estado="REAL_ACCOUNTING_UNRESOLVED",
@@ -2878,6 +2903,15 @@ class ChocoletraBot:
         if self._daily_blocked():
             decision.execution_skip_reason = "DAILY_LOSS_BLOCK"
             self._emit_log("WARN", f"[{ticker}] Entrada no enviada: límite diario activo")
+            return False
+        # Recheck the immutable historical scope immediately before reserving and
+        # submitting: another worker or manual close may have raised a new guard
+        # record since the first eligibility check.
+        if self._real_accounting_status()["entry_blocked"]:
+            decision.execution_skip_reason = "REAL_ACCOUNTING_CHANGED"
+            self._audit_event("ENTRY_BLOCKED", ticker=ticker, lado=prop.tipo,
+                              estado="REAL_ACCOUNTING_CHANGED",
+                              motivo="Nueva discrepancia o autorización histórica caducada")
             return False
         if not self._reserve_real_capacity(ticker, orden):
             decision.execution_skip_reason = "REAL_CAPACITY_BLOCK"
@@ -5049,6 +5083,55 @@ class ChocoletraBot:
                 )
                 return
 
+        # SL/remanente llenado → finalizar.  A terminal STOP that did NOT fill
+        # cannot be treated as ongoing protection.  This used to leave local
+        # positions stale when Schwab had already flattened the ticker, as seen
+        # in the BA/META incidents.  Do not guess the exit order or fill price.
+        if pos["sl_order_id"]:
+            stop_id = str(pos["sl_order_id"])
+            stop_status = str(
+                self.ejecutor_hibrido._estado_orden(self.account_number, stop_id)
+                or "DESCONOCIDO"
+            ).upper()
+            if stop_status == "FILLED":
+                self._cerrar_posicion(ticker, pos["sl_actual"], motivo="SL(real)")
+                return
+            if stop_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "REPLACED"}:
+                remaining = self._cantidad_real_broker(ticker, pos["tipo"])
+                if remaining is None:
+                    # Unknown broker exposure: do not clear the STOP identifier,
+                    # invent a close, or submit another protective order.
+                    return
+                if remaining == 0:
+                    self._audit_event(
+                        "STOP_TERMINAL_BROKER_FLAT",
+                        ticker=ticker, lado=pos["tipo"], estado=stop_status,
+                        order_id=stop_id,
+                        motivo="Schwab reports flat; exit identity requires independent evidence",
+                    )
+                    # The existing close path quarantines unknown REAL P/L and
+                    # blocks further entries instead of inventing broker fills.
+                    self._cerrar_posicion(
+                        ticker, precio_actual,
+                        motivo="reconciliacion: STOP terminal, broker plano",
+                    )
+                    return
+                # Exposure persists with a terminal old STOP.  On the next
+                # monitor tick use the EXISTING guarded stale-STOP route, which
+                # rechecks exact order visibility and broker exposure before
+                # replacing protection. Never place an order directly here.
+                with self._lock:
+                    if self._posiciones.get(ticker) is not pos:
+                        return
+                    pos["sl_reconcile_pending"] = True
+                self._audit_event(
+                    "STOP_TERMINAL_RECONCILE_REQUIRED",
+                    ticker=ticker, lado=pos["tipo"], estado=stop_status,
+                    order_id=stop_id,
+                    motivo="STOP terminal with broker exposure; verify working orders before protection",
+                )
+                return
+
         # If a 3-share partial plan was deferred because the STOP had not become
         # visible yet, place TP1 only after the STOP is confirmed WORKING.
         if (
@@ -5080,12 +5163,6 @@ class ChocoletraBot:
             if self.ejecutor_hibrido._estado_orden(self.account_number, pos["tp1_order_id"]) == "FILLED":
                 self._ejecutar_parcial(ticker, pos)
                 return
-        # SL/remanente llenado → finalizar
-        if pos["sl_order_id"]:
-            if self.ejecutor_hibrido._estado_orden(self.account_number, pos["sl_order_id"]) == "FILLED":
-                self._cerrar_posicion(ticker, pos["sl_actual"], motivo="SL(real)")
-                return
-
         progress = pos.get('normal_exit_progress') or {}
         if (progress and progress.get('attempts', 0) < 3
                 and time.time() >= progress.get('retry_after', float('inf'))
