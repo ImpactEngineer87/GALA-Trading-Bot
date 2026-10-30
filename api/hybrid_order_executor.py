@@ -338,7 +338,6 @@ class EjecutorHibridoDeOrdenes:
         if access_token:
             self._session.headers.update({
                 "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
                 "Accept": "application/json"
             })
 
@@ -559,10 +558,14 @@ class EjecutorHibridoDeOrdenes:
 
     @staticmethod
     def _aplicar_token_sesion(session, access_token: str):
+        # GET order reads have no entity. Schwab rejects them with HTTP 400
+        # when Content-Type is inherited from the session, hiding real fills
+        # and aborting reversals. requests supplies JSON Content-Type only on
+        # POSTs that actually pass json=, including entries and protective STOPs.
+        session.headers.pop("Content-Type", None)
         if access_token:
             session.headers.update({
                 "Authorization": f"Bearer {access_token}",
-                "Content-Type": "application/json",
                 "Accept": "application/json",
             })
         else:

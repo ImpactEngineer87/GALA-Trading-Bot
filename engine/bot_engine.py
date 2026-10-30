@@ -2970,8 +2970,12 @@ class ChocoletraBot:
             )
             return False
         if res.get("status") == "RECONCILIAR":
-            # La orden pudo enviarse pero no tenemos id: se reconciliará por posiciones
-            self._emit_log("WARN", f"[{ticker}] Entrada enviada SIN id de orden — se verificará por posiciones")
+            if res.get("order_id"):
+                self._emit_log("WARN", f"[{ticker}] Entrada enviada con id de orden; "
+                               "confirmación de Schwab pendiente")
+            else:
+                self._emit_log("WARN", f"[{ticker}] Entrada enviada SIN id de orden "
+                               "— se verificará por posiciones")
         orden_aj = res.get("orden_ajustada", orden)
         with self._lock:
             # Reemplaza la reserva por una ENTRADA PENDIENTE (aún no es posición)
