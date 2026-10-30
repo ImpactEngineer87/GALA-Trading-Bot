@@ -147,6 +147,17 @@ class ShadowDecisionStore:
             if opened is None:
                 return None
 
+            if precio_salida is None:
+                # Broker-flat with unknown execution price is no win/loss label,
+                # including in SHADOW evaluation. Close the observation honestly.
+                row = {**opened, "event": "CLOSE", "timestamp": self._timestamp(None)}
+                for key in ("precio_salida", "r_multiple", "ganadora", "shadow_correct",
+                            "veto_would_help", "regime_correct", "regime_veto_would_help",
+                            "regime_false_block"):
+                    row[key] = ""
+                self._append(row)
+                return row
+
             entrada = float(opened["precio_entrada"])
             salida = float(precio_salida)
             stop_raw = opened.get("stop_loss")
@@ -276,3 +287,4 @@ class ShadowDecisionStore:
                 return dt.isoformat(sep=" ")
             return dt.astimezone(timezone.utc).isoformat()
         return datetime.now(timezone.utc).isoformat()
+

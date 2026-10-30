@@ -33,6 +33,7 @@ import sys
 import time
 import os
 import json
+import math
 import yaml
 import threading
 import uuid
@@ -49,6 +50,8 @@ from core.time_logic import MotorTemporal, CruceMACD
 from core.order_audit import OrderAuditLedger
 from core.execution_quality import ExecutionQualityLedger
 from core.daily_loss_guard import DailyLossGuard
+from core.real_accounting import RealAccountingGuard
+from core.project_paths import resolve_runtime_path
 from core.memory_diagnostics import memory_usage_mib
 from core.ticker_execution import TickerExecutionRegistry
 from core.live_capacity import RealCapacityManager, max_real_tickers
@@ -267,6 +270,15 @@ class ChocoletraBot:
         self.reversion_activa = rev.get("activo", True)
         self.breakeven_offset_pct = self.config.get("salida_parcial", {}).get("breakeven_offset_pct", 0.0)
         self.entrada_timeout_seg = self.config.get("ejecucion", {}).get("entrada_timeout_seg", 180)
+        # REAL LIMIT entries have their own timeout: the order monitor already
+        # polls independently of one-minute strategy candles. Keep the broker
+        # slot reserved until cancellation and exposure checks confirm it safe.
+        # Existing MARKET/PAPER entry handling keeps its previous timeout.
+        self.entrada_limit_timeout_seg = max(1.0, min(300.0, float(
+            (self.config.get("execution_engine", {}) or {}).get(
+                "entry_limit_timeout_sec", 20
+            )
+        )))
         ks = self.config.get("kill_switch", {})
         self.ks_liquidar_apagar = ks.get("liquidar_al_apagar", True)
         self.ks_liquidar_cierre = ks.get("liquidar_al_cierre_mercado", True)
@@ -346,6 +358,11 @@ class ChocoletraBot:
         self.daily_loss_guard = DailyLossGuard(
             self.config, history_path=history_path, now_provider=self._ahora_et
         )
+        self.real_accounting_guard = RealAccountingGuard(resolve_runtime_path(
+            (self.config.get("execution_engine") or {}).get(
+                "accounting_state_path", "data/real_accounting_reconciliation.json")))
+        self.real_accounting_guard.inspect_session(
+            history_path, audit_path, self._ahora_et().strftime("%Y-%m-%d"))
         self._daily_kill_lock = threading.RLock()
         self._daily_kill_in_progress = False
         self._daily_liquidation_attempted = False
@@ -460,7 +477,8 @@ class ChocoletraBot:
     # ==========================================================
 
     def set_hooks(self, on_signal: Callable = None, on_trade: Callable = None,
-                  on_log: Callable = None, on_candles: Callable = None):
+                  on_log: Callable = None, on_candles: Callable = None,
+                  on_trade_event: Callable = None):
         """server.py inyecta callbacks para reflejar el estado en el Dashboard."""
         if on_signal:
             self._hooks["signal"] = on_signal
@@ -470,6 +488,8 @@ class ChocoletraBot:
             self._hooks["log"] = on_log
         if on_candles:
             self._hooks["candles"] = on_candles
+        if on_trade_event:
+            self._hooks["trade_event"] = on_trade_event
 
     def _emit_log(self, nivel: str, mensaje: str):
         if nivel in ("ERROR",):
@@ -527,7 +547,20 @@ class ChocoletraBot:
                 pass
 
     def _emit_trade(self, tipo: str, ticker: str, precio: float, cantidad: int,
-                    estado: str = "OPEN", pnl: float = 0.0):
+                    estado: str = "OPEN", pnl: float = 0.0, *,
+                    execution_mode: str = "UNKNOWN", price_verified: bool = False,
+                    accounting_verified: bool = False):
+        event_cb = self._hooks.get("trade_event")
+        if event_cb:
+            try:
+                event_cb({"tipo": tipo, "ticker": ticker, "precio": precio,
+                          "cantidad": cantidad, "estado": estado, "pnl": pnl,
+                          "mode": execution_mode, "price_verified": price_verified,
+                          "accounting_verified": accounting_verified})
+            except Exception:
+                pass
+            return
+        # Existing integrations may continue to consume the six-argument hook.
         cb = self._hooks.get("trade")
         if cb:
             try:
@@ -769,6 +802,48 @@ class ChocoletraBot:
         """Devuelve el guard diario cuando el objeto fue inicializado completo."""
         return getattr(self, "daily_loss_guard", None)
 
+    def _real_accounting_status(self):
+        guard = getattr(self, "real_accounting_guard", None)
+        if guard is None:
+            return {"blocked": True, "entry_blocked": True, "unresolved": 0,
+                    "reasons": ["REAL accounting guard unavailable"]}
+        snapshot = guard.snapshot()
+        # Reporting remains honest: the historical records stay unresolved and
+        # daily P/L remains unknown. Only the NEW ENTRY gate can be scoped to an
+        # explicitly reviewed prior-session manual intervention. Re-evaluate the
+        # immutable approval against guard bytes at each decision.
+        snapshot["entry_blocked"] = bool(snapshot["blocked"])
+        snapshot["historical_resume_active"] = False
+        # In-process accounting read/write failure always blocks new REAL
+        # orders, even if the saved file still exactly matches an old grant.
+        # A prior-session exception only applies to sound, readable accounting.
+        if snapshot["blocked"] and not getattr(guard, "_failure", ""):
+            from core.historical_manual_resume import exception_status
+            approval = exception_status(
+                getattr(self, "config", {}) or {}, guard.store.path,
+                # The approval is bound to the plain account identity. Trading
+                # preparation replaces account_number with Schwab's broker hash;
+                # never use that API routing token to validate an operator grant.
+                (getattr(self, "_account_plain", "") or
+                 getattr(self, "account_number", "")),
+                now=self._ahora_et() if callable(getattr(self, "_ahora_et", None)) else None,
+            )
+            snapshot.update(approval)
+        return snapshot
+
+    def _require_real_accounting(self, ticker, pos, reason, **evidence):
+        # Latch before releasing exposure/history: an unknown outcome must not
+        # become zero realized loss or be forgotten by a same-cycle reversal.
+        guard = getattr(self, "real_accounting_guard", None)
+        if guard is not None:
+            guard.require_reconciliation(
+                str(pos.get("position_id") or pos.get("execution_id") or ticker),
+                ticker=ticker, reason=reason,
+                entry_order_id=pos.get("entry_order_id", ""), **evidence)
+        self._audit_event("REAL_ACCOUNTING_RECONCILIATION_REQUIRED", ticker=ticker,
+                          estado="REAL_ENTRIES_BLOCKED", motivo=reason, detalle=evidence)
+        self._emit_log("ERROR", f"[{ticker}] Contabilidad REAL pendiente: {reason}; nuevas entradas REAL bloqueadas")
+
     def _daily_blocked(self) -> bool:
         guard = self._daily_guard()
         if guard is None or not guard.enabled:
@@ -783,10 +858,10 @@ class ChocoletraBot:
 
     def _registrar_pnl_realizado_diario(
         self, amount: float, ticker: str = "", motivo: str = ""
-    ) -> None:
+    ) -> bool:
         guard = self._daily_guard()
         if guard is None or not guard.enabled:
-            return
+            return False
         try:
             paper_mode = self._is_paper_ticker(ticker)
             total = guard.add_realized(paper_mode, float(amount or 0.0))
@@ -798,8 +873,10 @@ class ChocoletraBot:
                 motivo=motivo,
                 detalle={"realized_session_total": round(total, 2)},
             )
+            return True
         except Exception as exc:
             self._emit_log("ERROR", f"No se pudo persistir el PnL diario: {exc}")
+            return False
 
     def daily_risk_snapshot(self) -> dict:
         """Estado JSON-safe del límite diario para el dashboard y las pruebas."""
@@ -816,6 +893,7 @@ class ChocoletraBot:
         # PAPER PnL keeps accumulating separately but cannot trip the REAL guard.
         guard_paper = not self._has_real_tickers()
         unrealized = 0.0
+        unbooked_realized = 0.0
         priced = 0
         unpriced = 0
         with getattr(self, "_lock", threading.RLock()):
@@ -833,6 +911,11 @@ class ChocoletraBot:
                 order = pos.get("orden")
                 initial = int(pos.get("cantidad") or getattr(order, "cantidad", 0) or 0)
                 qty = int(pos.get("cantidad_resto", initial) if pos.get("tp1_hit") else initial)
+                progress = pos.get("normal_exit_progress") or {}
+                qty = int(progress.get('remaining_quantity', qty))
+                # These confirmed partial fills are not yet booked to the daily
+                # ledger. Include their P/L exactly once in the risk valuation.
+                unbooked_realized += float(progress.get("verified_gross_pnl", 0) or 0)
                 if entry <= 0 or qty <= 0:
                     continue
                 price = prices.get(ticker)
@@ -861,8 +944,31 @@ class ChocoletraBot:
             priced_positions=priced,
             unpriced_positions=unpriced,
         )
+        if unbooked_realized:
+            # Partial execution P/L is realized risk even when the operator
+            # excludes unrealized market valuations from the daily limit.
+            for key in ('current_realized_pnl', 'current_net_pnl'):
+                snapshot[key] = round(snapshot[key] + unbooked_realized, 2)
+            if not snapshot.get('blocked'):
+                for key in ('realized_pnl', 'net_pnl'):
+                    snapshot[key] = round(snapshot[key] + unbooked_realized, 2)
+                snapshot['remaining_to_limit_usd'] = round(max(0.0,
+                    snapshot['net_pnl'] - snapshot['limit_usd']), 2)
         snapshot["pricing_complete"] = unpriced == 0
         snapshot["valuation_source"] = "trusted_market_data"
+        accounting = self._real_accounting_status()
+        snapshot["real_accounting"] = accounting
+        if not guard_paper and accounting["entry_blocked"]:
+            # Past-day records under an exact operator-approved exception remain
+            # unresolved, but they must not make today's verified risk totals
+            # appear unknown. A NEW discrepancy immediately masks totals again.
+            # The numeric known component can still trigger the existing loss
+            # guard conservatively; never display it as a complete daily total.
+            snapshot["known_net_pnl"] = snapshot["net_pnl"]
+            snapshot["known_realized_pnl"] = snapshot["realized_pnl"]
+            for key in ("realized_pnl", "net_pnl", "remaining_to_limit_usd",
+                        "current_realized_pnl", "current_net_pnl"):
+                snapshot[key] = None
         return snapshot
 
     def _evaluar_limite_perdida_diaria(self) -> bool:
@@ -873,6 +979,8 @@ class ChocoletraBot:
         if guard.is_blocked():
             return True
         status = self.daily_risk_snapshot()
+        if status.get("net_pnl") is None:
+            status = {**status, "net_pnl": status.get("known_net_pnl", 0.0)}
         if float(status.get("net_pnl", 0.0)) > float(status.get("limit_usd", 0.0)):
             return False
         self._activar_kill_switch_diario(status)
@@ -1525,6 +1633,9 @@ class ChocoletraBot:
         with self._lock:
             self._last_prices[ticker] = precio_actual
             self._last_price_times[ticker] = time.time()
+            if not hasattr(self, "_last_bar_times"):
+                self._last_bar_times = {}
+            self._last_bar_times[ticker] = str(df_micro.index[-1])
         self._recover_ticker_quarantine(ticker, 'market_data')
         paper_ticker = self._is_paper_ticker(ticker)
 
@@ -2391,6 +2502,21 @@ class ChocoletraBot:
                 if manager:
                     manager.release(ticker)
 
+    def _audit_approved_signal_skip(self, decision, reason, position_status=""):
+        """Explain approved signals that did not submit a broker order.
+
+        Audit-only, no broker requests and no extra AI-training observations.
+        """
+        self._audit_event(
+            "SIGNAL_EXECUTION_SKIPPED",
+            ticker=str(getattr(decision, "ticker", "") or "").upper(),
+            lado=str(getattr(decision, "tipo", "") or "").upper(),
+            signal_id=str(getattr(decision, "signal_id", "") or ""),
+            estado="NO_ORDER_SENT",
+            motivo=str(reason or "UNKNOWN")[:75],
+            detalle={"local_position_status": str(position_status or "")[:32]},
+        )
+
     def _abrir_o_revertir(self, decision, precio_actual: float, df_micro):
         ticker = decision.ticker
         tipo = decision.tipo
@@ -2410,19 +2536,28 @@ class ChocoletraBot:
         # explícita conserva solo OUT/LONG/SHORT; una orden pendiente sigue OUT.
         with self._lock:
             if not self._activo:
+                self._audit_approved_signal_skip(decision, "ENGINE_STOPPED")
                 return
             pos = self._posiciones.get(ticker)
             reverse = False
             cancelar_pend = False
             if pos is not None:
                 if pos.get("reservado"):
-                    # Otra hebra ya está abriendo este ticker → no duplicar
+                    # Never submit a second order for an in-flight reservation.
+                    self._audit_approved_signal_skip(
+                        decision, "TICKER_ENTRY_RESERVED", "RESERVED"
+                    )
                     return
                 if pos["tipo"] == tipo:
                     self._emit_log("INFO", f"[{ticker}] Señal {tipo} repetida — se mantiene (sin adicionar)")
+                    self._audit_approved_signal_skip(
+                        decision, "ALREADY_SAME_SIDE",
+                        "PENDING" if pos.get("pendiente") else "OPEN"
+                    )
                     return
                 if not self.reversion_activa:
                     self._emit_log("INFO", f"[{ticker}] Reversión desactivada — se ignora giro de señal")
+                    self._audit_approved_signal_skip(decision, "REVERSAL_DISABLED")
                     self._registrar_senal_no_ejecutada(
                         decision, reason="REVERSAL_DISABLED",
                         source_kind="POLICY_BLOCK", training_candidate=False,
@@ -2446,6 +2581,7 @@ class ChocoletraBot:
                 state_after=state_before.state.value, signal_side=tipo,
                 motivo="Estado activo sin posición local",
             )
+            self._audit_approved_signal_skip(decision, "POSITION_STATE_MISMATCH")
             return
 
         if cancelar_pend:
@@ -2456,6 +2592,7 @@ class ChocoletraBot:
                 # normal (con verificación de cierre).
                 self._emit_log("INFO", f"[{ticker}] Giro pospuesto: la entrada pendiente ya estaba "
                                        f"llenada; se cerrará y volteará el próximo ciclo")
+                self._audit_approved_signal_skip(decision, "PENDING_ENTRY_NOT_CLEARED")
                 return
         elif reverse:
             prior_state = state_before.state
@@ -2565,6 +2702,7 @@ class ChocoletraBot:
 
         # Reservar hueco de forma atómica antes de ejecutar la apertura
         if not self._reservar_slot(ticker, tipo):
+            self._audit_approved_signal_skip(decision, "ENTRY_SLOT_NOT_AVAILABLE")
             # Same-side repeats are intentionally not new learning samples. If
             # there was no active position before the attempt, this was a real
             # missed opportunity (capacity/quarantine/risk gate).
@@ -2592,6 +2730,7 @@ class ChocoletraBot:
                 getattr(decision, "execution_skip_reason", "")
                 or "ENTRY_NOT_EXECUTED"
             )
+            self._audit_approved_signal_skip(decision, miss_reason)
             policy_only = miss_reason in {
                 "DAILY_LOSS_BLOCK", "ATR_INVALID", "RISK_ORDER_REJECTED"
             }
@@ -2619,6 +2758,12 @@ class ChocoletraBot:
         ticker = prop.ticker
         paper_ticker = self._is_paper_ticker(ticker)
         execution_mode = "PAPER" if paper_ticker else "REAL"
+        if not paper_ticker and self._real_accounting_status()["entry_blocked"]:
+            decision.execution_skip_reason = "REAL_ACCOUNTING_UNRESOLVED"
+            self._audit_event("ENTRY_BLOCKED", ticker=ticker, lado=prop.tipo,
+                              estado="REAL_ACCOUNTING_UNRESOLVED",
+                              motivo="Contabilidad de ejecuciones REAL pendiente de reconciliación")
+            return False
         if self._daily_blocked():
             decision.execution_skip_reason = "DAILY_LOSS_BLOCK"
             self._emit_log("WARN", f"[{ticker}] Apertura abortada: límite diario activo")
@@ -2759,6 +2904,15 @@ class ChocoletraBot:
             decision.execution_skip_reason = "DAILY_LOSS_BLOCK"
             self._emit_log("WARN", f"[{ticker}] Entrada no enviada: límite diario activo")
             return False
+        # Recheck the immutable historical scope immediately before reserving and
+        # submitting: another worker or manual close may have raised a new guard
+        # record since the first eligibility check.
+        if self._real_accounting_status()["entry_blocked"]:
+            decision.execution_skip_reason = "REAL_ACCOUNTING_CHANGED"
+            self._audit_event("ENTRY_BLOCKED", ticker=ticker, lado=prop.tipo,
+                              estado="REAL_ACCOUNTING_CHANGED",
+                              motivo="Nueva discrepancia o autorización histórica caducada")
+            return False
         if not self._reserve_real_capacity(ticker, orden):
             decision.execution_skip_reason = "REAL_CAPACITY_BLOCK"
             return False
@@ -2814,6 +2968,10 @@ class ChocoletraBot:
                 res.get("avg_price") or orden_aj.precio_limite,
                 parcial=(filled_now < orden_aj.cantidad),
                 oid=res.get("order_id", ""),
+                broker_price_verified=bool(
+                    res.get("order_id")
+                    and self._positive_broker_fill_price(res.get("avg_price"))
+                ),
             )
         self._emit_log("INFO", f"[{ticker}] Entrada REAL colocada, esperando llenado | {orden_aj}")
         return True
@@ -2833,6 +2991,17 @@ class ChocoletraBot:
         if order_id and status in {"OK", "RECONCILIAR", "SIMULADA"}:
             return order_id
         return ""
+
+    @staticmethod
+    def _verified_entry_confirmation(transition_ok, paper_ticker, order_id, context):
+        """Protect all REAL fills; train only when broker execution price is real."""
+        return bool(
+            transition_ok and (
+                paper_ticker or (
+                    bool(order_id) and (context or {}).get("broker_price_verified") is True
+                )
+            )
+        )
 
     def _registrar_posicion_abierta(
         self, ticker: str, orden, decision, entry_order_id: str = "",
@@ -3014,7 +3183,12 @@ class ChocoletraBot:
             **lifecycle,
             "modo": execution_mode,
             "entry_order_id": entry_order_id,
-            "entry_confirmed": bool(transition_ok),
+            # A local state-machine transition does NOT independently prove a
+            # REAL Schwab entry fill price. Continue tracking/protecting a
+            # price-unverified position but quarantine it from AI labels.
+            "entry_confirmed": self._verified_entry_confirmation(
+                transition_ok, paper_ticker, entry_order_id, execution_context
+            ),
             "state_before": PositionState.OUT.value,
             "state_after": target_state.value,
             "position_side": target_state.value,
@@ -3094,6 +3268,11 @@ class ChocoletraBot:
                     "submitted_limit_price", entrada
                 ),
                 "fill_price": entrada,
+                "broker_price_verified": bool(
+                    paper_ticker or (execution_context or {}).get(
+                        "broker_price_verified"
+                    )
+                ),
             },
         )
         history_row = self._history_event(
@@ -3138,7 +3317,9 @@ class ChocoletraBot:
                 order_action=entry_action_for_state(target_state),
                 **lifecycle,
             )
-        self._emit_trade(orden.tipo, ticker, entrada, orden.cantidad, "OPEN", 0.0)
+        self._emit_trade(orden.tipo, ticker, entrada, orden.cantidad, "OPEN", 0.0,
+                         execution_mode=execution_mode,
+                         price_verified=entry_context["entry_confirmed"])
         self._emit_log("INFO", f"[ENTRADA] {orden}")
         try:
             self.telegram.enviar_alerta_temporal(
@@ -3148,6 +3329,17 @@ class ChocoletraBot:
         except Exception:
             pass
         return True
+
+    def _pending_entry_timeout(self, ticker: str, pos: dict) -> float:
+        """Only REAL LIMIT submissions use the short broker-order monitor TTL."""
+        order_type = str((pos.get("execution_context") or {}).get(
+            "submitted_order_type", ""
+        )).upper()
+        if (not self._is_paper_ticker(ticker, pos=pos)
+                and order_type in ("LIMIT", "MARKETABLE_LIMIT")
+                and (self.config.get("execution_engine", {}) or {}).get("enabled", False)):
+            return self.entrada_limit_timeout_seg
+        return self.entrada_timeout_seg
 
     def _gestionar_entrada_pendiente(self, ticker: str, pos: dict, precio_actual: float):
         """
@@ -3185,7 +3377,11 @@ class ChocoletraBot:
             self._abrir_desde_llenado(
                 ticker, pos, filled,
                 det.get("avg_price") or pos["orden"].precio_limite,
-                parcial=(filled < pos["orden"].cantidad), oid=oid)
+                parcial=(filled < pos["orden"].cantidad), oid=oid,
+                broker_price_verified=bool(
+                    oid and self._positive_broker_fill_price(det.get("avg_price"))
+                ),
+            )
             return
 
         if status in ("CANCELED", "REJECTED", "EXPIRED", "REPLACED"):
@@ -3194,6 +3390,7 @@ class ChocoletraBot:
             self._emit_log("INFO", f"[{ticker}] Entrada {status} — hueco liberado")
             self._audit_event(
                 "ENTRY_TERMINATED", ticker=ticker, lado=pos.get("tipo", ""),
+                signal_id=str(getattr(pos.get("decision"), "signal_id", "") or ""),
                 estado=status, order_id=oid,
                 cantidad=pos.get("orden").cantidad if pos.get("orden") else "",
                 motivo="Entrada finalizada sin posición",
@@ -3207,7 +3404,8 @@ class ChocoletraBot:
 
         # Timeout: cancelar y decidir según el estado FINAL real.
         edad = (datetime.now() - pos["ts_pendiente"]).total_seconds()
-        if edad > self.entrada_timeout_seg:
+        timeout_sec = self._pending_entry_timeout(ticker, pos)
+        if edad > timeout_sec:
             with self._lock:
                 if time.monotonic() < pos.get("next_cancel_retry_monotonic", 0.0):
                     return
@@ -3262,6 +3460,7 @@ class ChocoletraBot:
             self._emit_log("INFO", f"[{ticker}] Entrada no llenada en {int(edad)}s — cancelada")
             self._audit_event(
                 "ENTRY_TIMEOUT_CANCELED", ticker=ticker, lado=pos.get("tipo", ""),
+                signal_id=str(getattr(pos.get("decision"), "signal_id", "") or ""),
                 estado=(cancelacion or {}).get("broker_status", "SIN_ORDER_ID"),
                 order_id=oid,
                 cantidad=pos.get("orden").cantidad if pos.get("orden") else "",
@@ -3269,8 +3468,17 @@ class ChocoletraBot:
                 motivo=f"Entrada no llenada en {int(edad)}s",
             )
 
+    @staticmethod
+    def _positive_broker_fill_price(value) -> bool:
+        try:
+            price = float(value)
+            return math.isfinite(price) and price > 0.0
+        except (TypeError, ValueError, OverflowError):
+            return False
+
     def _abrir_desde_llenado(self, ticker: str, pos: dict, filled: int, avg_price: float,
-                             parcial: bool, oid: str) -> bool:
+                             parcial: bool, oid: str,
+                             broker_price_verified: bool = False) -> bool:
         """Abre la posición con la cantidad y el precio REALES del llenado. Si el
         llenado fue parcial, cancela el remanente y RE-LEE la cantidad definitiva
         (pudieron ejecutarse más acciones entre la lectura y la cancelación) para
@@ -3296,7 +3504,18 @@ class ChocoletraBot:
             filled_final = int(det.get("filled", 0) or 0)
             if filled_final > filled:
                 filled = filled_final
-                avg_price = det.get("avg_price") or avg_price
+                if self._positive_broker_fill_price(det.get("avg_price")):
+                    avg_price = det["avg_price"]
+                    broker_price_verified = bool(oid)
+                else:
+                    # We know more shares executed, but do not know the
+                    # weighted price for ALL of them; keep AI entry quarantined.
+                    broker_price_verified = False
+            elif filled_final == filled and self._positive_broker_fill_price(
+                det.get("avg_price")
+            ):
+                avg_price = det["avg_price"]
+                broker_price_verified = bool(oid)
             elif cancelacion.get("terminal_by_absence"):
                 # NOT_WORKING may mean the remainder filled while cancellation
                 # raced.  Re-read the authoritative broker position before sizing
@@ -3322,10 +3541,18 @@ class ChocoletraBot:
                         if broker_qty > filled:
                             filled = broker_qty
                             avg_price = broker_pos.get("precio") or avg_price
+                            # Schwab position average cost is NOT an
+                            # order execution-leg fill. Protect exposure,
+                            # but do not create a verified AI entry label.
+                            broker_price_verified = False
                         break
         orden_fill = self._ajustar_orden_llenada(orden, filled, avg_price)
         execution_context = dict(pos.get("execution_context") or {})
         execution_context["fill_price"] = float(avg_price)
+        execution_context["broker_price_verified"] = bool(
+            broker_price_verified and oid
+            and self._positive_broker_fill_price(avg_price)
+        )
         ok = self._registrar_posicion_abierta(
             ticker, orden_fill, pos["decision"], entry_order_id=oid,
             execution_context=execution_context,
@@ -3356,6 +3583,9 @@ class ChocoletraBot:
                         **dict(pos.get("execution_context") or {}),
                         "fill_price": p.get("precio")
                         or pos["orden"].precio_limite,
+                        # Position average cost may include previous lots;
+                        # it is not authoritative evidence of this order fill.
+                        "broker_price_verified": False,
                     },
                 )
                 if ok:
@@ -3709,7 +3939,9 @@ class ChocoletraBot:
             resto = filled - parcial
         else:
             parcial, resto = 0, filled
-        avg = round(float(avg_price), 2)
+        # Fill accounting keeps Schwab's sub-cent precision. Broker STOP/LIMIT
+        # instructions below continue to use their existing tick rounding.
+        avg = float(avg_price)
         ent0 = float(orden.precio_limite)
         d_sl = abs(ent0 - float(orden.stop_loss))
         d_tp = abs(float(orden.take_profit) - ent0)
@@ -3765,6 +3997,7 @@ class ChocoletraBot:
                 self._audit_event(
                     "PENDING_ENTRY_CANCEL_FAILED", ticker=ticker,
                     lado=pos.get("tipo", ""),
+                    signal_id=str(getattr(pos.get("decision"), "signal_id", "") or ""),
                     estado=(cancelacion or {}).get("broker_status", "DESCONOCIDO"),
                     order_id=oid,
                     latency_ms=(cancelacion or {}).get("latency_ms"),
@@ -3784,6 +4017,7 @@ class ChocoletraBot:
         self._emit_log("INFO", f"[{ticker}] Entrada pendiente cancelada")
         self._audit_event(
             "PENDING_ENTRY_CANCELED", ticker=ticker, lado=pos.get("tipo", ""),
+            signal_id=str(getattr(pos.get("decision"), "signal_id", "") or ""),
             estado=(cancelacion or {}).get("broker_status", "CANCELED")
             if not paper_ticker else "SIMULADA",
             order_id=oid,
@@ -3996,7 +4230,7 @@ class ChocoletraBot:
         orden = pos["orden"]
         tp1 = pos["tp1"]
         tp1_target = tp1
-        actual_tp1_price = None
+        actual_tp1_price = None if paper_ticker else 0.0
         entrada = pos["entrada"]
         cant_parcial = orden.cantidad_parcial
 
@@ -4019,8 +4253,10 @@ class ChocoletraBot:
                 fill = detail_reader(self.account_number, pos['tp1_order_id'])
                 if str(fill.get('status', '')).upper() != 'FILLED':
                     return
-                actual_tp1_price = float(fill.get('avg_price', 0) or 0)
-                if actual_tp1_price > 0:
+                actual_tp1_price = (float(fill.get('avg_price', 0) or 0)
+                                    if fill.get('fill_price_verified') is True
+                                    and float(fill.get('filled', 0) or 0) == cant_parcial else 0.0)
+                if self._positive_broker_fill_price(actual_tp1_price):
                     tp1 = actual_tp1_price
             # El TP1 (LIMIT) ya cerró el 70% en el broker. Reemplazar el STOP del
             # 100% por uno del 30% (cancela el viejo y coloca el nuevo).
@@ -4044,7 +4280,9 @@ class ChocoletraBot:
                     # Reintentar en el siguiente poll; no enviar otra orden encima.
                     return
 
-        if not paper_ticker and actual_tp1_price is not None and actual_tp1_price <= 0:
+        if not paper_ticker and (
+                not self._positive_broker_fill_price(actual_tp1_price)
+                or (pos.get("entry_integrity") or {}).get("entry_confirmed") is not True):
             # Protect the remainder immediately, but do not fabricate realized PnL
             # from the requested limit while execution prices are unavailable.
             with self._lock:
@@ -4054,6 +4292,8 @@ class ChocoletraBot:
             self._audit_event('TP1_PRICE_RECONCILIATION_REQUIRED', ticker=ticker,
                 estado='ACTUAL_FILL_PRICE_UNKNOWN', order_id=pos.get('tp1_order_id', ''),
                 motivo='Remainder protection updated; TP1 accounting awaits actual execution price')
+            self._require_real_accounting(ticker, pos,
+                "TP1 sin precios de entrada/salida verificables", partial_order_id=pos.get('tp1_order_id', ''))
             if not reproteccion_ok:
                 self._cerrar_posicion(ticker, entrada, motivo='sin proteccion tras TP1')
             return
@@ -4063,6 +4303,7 @@ class ChocoletraBot:
 
         with self._lock:
             pos["tp1_hit"] = True
+            pos["partial_price_pending"] = False
             pos["pnl_realizado"] += pnl_parcial
             pos["sl_actual"] = nuevo_sl_price
             pos["sl_order_id"] = nuevo_sl_id if reproteccion_ok else ""
@@ -4073,7 +4314,9 @@ class ChocoletraBot:
         self._registrar_pnl_realizado_diario(
             pnl_parcial, ticker=ticker, motivo="TP1 70%"
         )
-        self._emit_trade(pos["tipo"], ticker, tp1, cant_parcial, "PARTIAL", pnl_parcial)
+        self._emit_trade(pos["tipo"], ticker, tp1, cant_parcial, "PARTIAL", pnl_parcial,
+                         execution_mode="PAPER" if paper_ticker else "REAL",
+                         price_verified=True, accounting_verified=True)
         self._audit_event(
             "TP1_FILLED_70_PERCENT",
             ticker=ticker, lado=pos["tipo"],
@@ -4084,6 +4327,7 @@ class ChocoletraBot:
                 "cantidad_resto": pos["cantidad_resto"],
                 "target_price": tp1_target,
                 "fill_price": tp1,
+                "fill_price_verified": True,
                 "nuevo_stop": nuevo_sl_price,
                 "nuevo_sl_order_id": nuevo_sl_id if reproteccion_ok else "",
                 "reprotegido": reproteccion_ok,
@@ -4162,11 +4406,12 @@ class ChocoletraBot:
                 detail_avg = 0.0
             if detail_status:
                 status = detail_status
-            filled = max(filled, detail_filled)
-            if detail_avg > 0:
+            filled = detail_filled
+            if (detail.get("fill_price_verified") is True
+                    and self._positive_broker_fill_price(detail_avg)):
                 avg_price = detail_avg
 
-        if status != "FILLED" or filled < expected or avg_price <= 0:
+        if status != "FILLED" or filled != expected or avg_price <= 0:
             # Do not make the row trainable unless both broker identity and the
             # actual fill price are available. Otherwise PnL/labels could be wrong.
             return {}
@@ -4212,6 +4457,74 @@ class ChocoletraBot:
                     with self._lock:
                         self._cerrando.discard(ticker)
 
+    def _protect_deferred_limit(self, ticker, pos, result, reason='cierre LIMIT pendiente'):
+        """Replace ONE protective STOP only after fresh, conflict-free truth."""
+        if result.get('safe_to_reprotect') is not True:
+            return False
+        executor = self.ejecutor_hibrido
+        working = executor.ordenes_trabajando_ticker(self.account_number, ticker)
+        remaining = self._cantidad_real_broker(ticker, pos['tipo'])
+        if (working != [] or remaining is None or remaining <= 0
+                or remaining != result.get('remaining_quantity')):
+            self._require_real_accounting(ticker, pos,
+                'No se pudo verificar protección tras cierre LIMIT diferido')
+            return False
+        details = result.get('execution_details') or {}
+        initial_quantity = int(getattr(pos.get('orden'), 'cantidad', 0) or 0)
+        expected_quantity = int(pos.get('cantidad_resto', initial_quantity)
+                                if pos.get('tp1_hit') else initial_quantity)
+        if details.get('quantity') != expected_quantity:
+            self._require_real_accounting(ticker, pos,
+                'Cantidad de cierre LIMIT difiere del remanente local; fills previos sin reconciliar')
+        filled = float(result.get('filled_quantity', 0) or 0)
+        progress = {'filled_quantity': filled, 'remaining_quantity': remaining,
+                    'execution_details': details, 'reason': reason,
+                    'attempts': int((pos.get('normal_exit_progress') or {}).get('attempts', 0)) + 1,
+                    'retry_after': time.time() + 10}
+        if (filled and result.get('partial_price_verified') is True
+                and (pos.get('entry_integrity') or {}).get('entry_confirmed') is True):
+            direction = 1 if pos['tipo'] == 'BUY' else -1
+            progress['verified_gross_pnl'] = (
+                (float(result['partial_avg_price']) - pos['entrada']) * filled * direction)
+        if filled:
+            guard = getattr(self, 'real_accounting_guard', None)
+            key = 'pending_exit:' + str(details.get('execution_id') or '')
+            if guard is not None:
+                guard.require_reconciliation(key, kind='NORMAL_EXIT_PROGRESS',
+                    position_id=str(pos.get('position_id') or ''), ticker=ticker,
+                    exit_execution_id=details.get('execution_id'),
+                    quantity=details.get('quantity'), legs=details.get('legs', []),
+                    reason='Cierre LIMIT parcial pendiente de ejecución completa')
+                progress['accounting_key'] = key
+        # TP1 is not recreated during a deferred full-position closing intent.
+        with self._lock:
+            pos['normal_exit_progress'] = progress
+            pos['tp1_order_id'] = ''
+            pos['sl_order_id'] = ''
+        stop_price = pos.get('sl_actual')
+        if not self._positive_broker_fill_price(stop_price):
+            self._require_real_accounting(ticker, pos,
+                'Cierre LIMIT diferido sin precio STOP válido; revisión urgente')
+            return False
+        stop = executor.colocar_salida(ticker, pos['tipo'], int(remaining),
+                                      stop_price, 'STOP', self.account_number)
+        stop_id = self._submitted_exit_order_id(stop)
+        with self._lock:
+            if stop_id:
+                pos['sl_order_id'] = stop_id
+                pos['sl_reconcile_pending'] = str(stop.get('status')).upper() == 'RECONCILIAR'
+        self._audit_event('EXIT_LIMIT_PROTECTION_RESTORED' if stop_id else 'EXIT_LIMIT_PROTECTION_UNRESOLVED',
+            ticker=ticker, lado=pos['tipo'], order_id=stop_id, cantidad=remaining,
+            precio=stop_price, estado='ACKNOWLEDGED' if stop_id else 'RECONCILIAR',
+            motivo='LIMIT diferido; no MARKET ordinario',
+            detalle={'exit_execution_id': details.get('execution_id'), 'partial_filled': filled})
+        if not stop_id:
+            self._require_real_accounting(ticker, pos,
+                'STOP tras LIMIT diferido sin identidad confirmada; reconciliar antes de reintentar')
+        elif progress['attempts'] >= 3:
+            self._emit_log('WARN', f'[{ticker}] Tres cierres LIMIT sin completar; STOP identificado, requiere revisión. No se envía MARKET ordinario.')
+        return bool(stop_id)
+
     def _cerrar_posicion_impl(self, ticker: str, precio_salida: float, motivo: str = "") -> bool:
         """
         Cierra el remanente de la posición, registra PnL y alimenta el aprendizaje.
@@ -4249,7 +4562,7 @@ class ChocoletraBot:
             key: value for key, value in lifecycle.items() if key != "ticker"
         }
         close_order_id = ""
-        actual_exit_price = float(precio_salida)
+        actual_exit_price = float(precio_salida) if paper_ticker else None
         exit_confirmed = bool(paper_ticker)
         # Broker-flat and price-verified are separate facts. Emergency recovery
         # may safely flatten an account even when historical fill price evidence
@@ -4259,6 +4572,7 @@ class ChocoletraBot:
         # If the STOP fills before/while we cancel it, Schwab may already be flat
         # by the time the local close path checks the position.
         sl_cancel_result = None
+        exit_execution = {}
         # v2.9.8: cualquier cierre REAL que NO sea la confirmación de un STOP
         # ya llenado debe cerrar la posición REAL en Schwab.  Antes se dependía de
         # textos concretos de ``motivo`` (reversión/kill switch/TP); una salida
@@ -4275,6 +4589,14 @@ class ChocoletraBot:
 
         if not paper_ticker:
             if not self._asegurar_token_trading():
+                return False
+            preflight = getattr(self.ejecutor_hibrido, 'preparar_cierre', None)
+            prepared = preflight(ticker, motivo) if callable(preflight) else None
+            if (isinstance(prepared, dict) and prepared.get('ready') is False
+                    and self._cantidad_real_broker(ticker, tipo) != 0):
+                self._audit_event('POSITION_CLOSE_DEFERRED', ticker=ticker, lado=tipo,
+                    estado='QUOTE_UNAVAILABLE', motivo=prepared.get('reason', ''))
+                self._emit_log('WARN', f'[{ticker}] Cierre LIMIT pospuesto: bid/ask no verificable; STOP conservado')
                 return False
             # 1) Cancelar SIEMPRE las protecciones que sigan vivas (TP1 y/o SL).
             #    El DELETE no basta: cada orden debe quedar terminal/no visible como
@@ -4332,7 +4654,6 @@ class ChocoletraBot:
                         # Without a broker-linked exit order we preserve the old
                         # fail-closed behavior: the close can release local exposure,
                         # but the observation remains quarantined from x/50.
-                        cant_rest = 0
                         self._emit_log(
                             "WARN",
                             f"[{ticker}] Broker ya plano al procesar cierre ({motivo}); "
@@ -4349,6 +4670,10 @@ class ChocoletraBot:
                         self.account_number, motivo,
                     )
                     if res.get("status") not in ("OK", "SIMULADA"):
+                        if pos.get('sl_order_id'):
+                            pos['sl_reconcile_pending'] = True
+                        if res.get('status') == 'LIMIT_DEFERRED':
+                            self._protect_deferred_limit(ticker, pos, res, motivo)
                         # RECONCILIAR is a fail-closed state, not a broken
                         # trading signal. Show the actual broker reconciliation
                         # blocker in the operator log instead of only its status.
@@ -4372,10 +4697,14 @@ class ChocoletraBot:
                         )
                         return False
                     close_order_id = str(res.get("order_id", "") or "")
-                    broker_qty = int(res.get("cantidad", 0) or 0)
+                    exit_execution = res.get('execution_details') or {}
+                    broker_qty = float(res.get("cantidad", 0) or 0)
                     if broker_qty > 0:
                         cant_rest = min(cant_rest, broker_qty)
-                    if float(res.get("avg_price", 0.0) or 0.0) > 0:
+                    if (res.get("fill_price_verified") is True
+                            and close_order_id
+                            and self._positive_broker_fill_price(res.get("avg_price"))
+                            and broker_qty == cant_rest):
                         actual_exit_price = float(res["avg_price"])
                         exit_price_verified = True
                     elif res.get("fill_price_verified") is False:
@@ -4419,7 +4748,9 @@ class ChocoletraBot:
                     detail = self.ejecutor_hibrido.detalle_orden(
                         self.account_number, close_order_id
                     )
-                    if float(detail.get("avg_price", 0.0) or 0.0) > 0:
+                    if (self._positive_broker_fill_price(detail.get("avg_price"))
+                            and detail.get("fill_price_verified") is True
+                            and float(detail.get("filled", 0) or 0) == cant_rest):
                         actual_exit_price = float(detail["avg_price"])
                         exit_price_verified = True
                     filled = str(detail.get("status", "")).upper() == "FILLED"
@@ -4462,12 +4793,31 @@ class ChocoletraBot:
 
         # PnL del remanente. El parcial 70% ya fue agregado al acumulado diario
         # cuando se ejecutó TP1; aquí se suma SOLO el remanente para no duplicarlo.
-        pnl_resto = (actual_exit_price - entrada) * cant_rest if tipo == "BUY" \
-            else (entrada - actual_exit_price) * cant_rest
-        pnl_total = pos["pnl_realizado"] + pnl_resto
-        self._registrar_pnl_realizado_diario(
-            pnl_resto, ticker=ticker, motivo=motivo or "cierre"
-        )
+        accounting_verified = bool(paper_ticker or (
+            exit_price_verified and close_order_id
+            and self._positive_broker_fill_price(entrada)
+            and self._positive_broker_fill_price(actual_exit_price)
+            and (pos.get("entry_integrity") or {}).get("entry_confirmed") is True
+            and not pos.get("partial_price_pending")
+            and cant_rest == (pos["cantidad_resto"] if pos["tp1_hit"] else cantidad_total)))
+        if accounting_verified:
+            pnl_resto = (actual_exit_price - entrada) * cant_rest if tipo == "BUY" \
+                else (entrada - actual_exit_price) * cant_rest
+            pnl_total = pos["pnl_realizado"] + pnl_resto
+            pnl_persisted = self._registrar_pnl_realizado_diario(
+                pnl_resto, ticker=ticker, motivo=motivo or "cierre")
+            progress = pos.get('normal_exit_progress') or {}
+            if progress.get('accounting_key') and pnl_persisted is True:
+                guard = getattr(self, 'real_accounting_guard', None)
+                if guard is not None:
+                    guard.complete_exit_progress(progress['accounting_key'],
+                        position_id=str(pos.get('position_id') or ''), execution=exit_execution)
+        else:
+            pnl_resto = pnl_total = None
+            self._require_real_accounting(ticker, pos,
+                "Precio/identidad/cantidad de ejecución incompletos; P/L desconocido",
+                exit_order_id=close_order_id, requested_exit_price=precio_salida,
+                broker_exit_price=actual_exit_price, broker_flat=bool(exit_confirmed))
 
         # Confirmado (o cierre natural por SL/TP, o modo paper): transición
         # explícita LONG/SHORT -> OUT. Un desfase nunca se oculta a la IA.
@@ -4504,7 +4854,9 @@ class ChocoletraBot:
             self._posiciones.pop(ticker, None)
 
         # Salida efectiva (para el R-múltiple del aprendizaje, refleja el 70/30)
-        if cantidad_total > 0:
+        if pnl_total is None:
+            eff_exit = None
+        elif cantidad_total > 0:
             eff_exit = entrada + (pnl_total / cantidad_total) if tipo == "BUY" \
                 else entrada - (pnl_total / cantidad_total)
         else:
@@ -4549,9 +4901,12 @@ class ChocoletraBot:
                 "entrada": entrada,
                 "salida_solicitada": precio_salida,
                 "salida_real": actual_exit_price,
+                "final_quantity": cant_rest,
                 "tp1_ejecutado": bool(pos.get("tp1_hit")),
                 "broker_confirmed": bool(exit_confirmed),
                 "fill_price_verified": bool(exit_price_verified),
+                "accounting_verified": accounting_verified,
+                "exit_execution": exit_execution,
             },
         )
         close_integrity = {
@@ -4562,7 +4917,7 @@ class ChocoletraBot:
             "exit_order_id": close_order_id,
             "exit_confirmed": bool(
                 exit_confirmed and transition_ok
-                and (paper_ticker or exit_price_verified)
+                and accounting_verified
             ),
             "fill_price_verified": bool(exit_price_verified),
             "audit_linked": bool(audit_row),
@@ -4579,11 +4934,15 @@ class ChocoletraBot:
         except Exception as e:
             self._emit_log("WARN", f"[{ticker}] Aprendizaje: {e}")
 
-        self._emit_trade(tipo, ticker, actual_exit_price, cant_rest, "CLOSED", pnl_total)
+        self._emit_trade(tipo, ticker, actual_exit_price, cant_rest, "CLOSED", pnl_total,
+                         execution_mode=execution_mode, price_verified=exit_price_verified,
+                         accounting_verified=accounting_verified)
+        exit_text = f"${actual_exit_price:.6f}" if actual_exit_price is not None else "N/D"
+        pnl_text = f"${pnl_total:.6f}" if pnl_total is not None else "N/D (reconciliación pendiente)"
         self._emit_log(
             "INFO",
-            f"[CIERRE {motivo}] {ticker} @ ${actual_exit_price:.2f} | "
-            f"PnL total ${pnl_total:.2f} | estado {position_state.value}->OUT",
+            f"[CIERRE {motivo}] {ticker} @ {exit_text} | "
+            f"PnL total {pnl_text} | estado {position_state.value}->OUT",
         )
         # Una pérdida realizada puede tocar el límite aunque ya no haya posición
         # en este ticker. La activación liquidará de inmediato los demás símbolos.
@@ -4724,10 +5083,60 @@ class ChocoletraBot:
                 )
                 return
 
+        # SL/remanente llenado → finalizar.  A terminal STOP that did NOT fill
+        # cannot be treated as ongoing protection.  This used to leave local
+        # positions stale when Schwab had already flattened the ticker, as seen
+        # in the BA/META incidents.  Do not guess the exit order or fill price.
+        if pos["sl_order_id"]:
+            stop_id = str(pos["sl_order_id"])
+            stop_status = str(
+                self.ejecutor_hibrido._estado_orden(self.account_number, stop_id)
+                or "DESCONOCIDO"
+            ).upper()
+            if stop_status == "FILLED":
+                self._cerrar_posicion(ticker, pos["sl_actual"], motivo="SL(real)")
+                return
+            if stop_status in {"CANCELED", "CANCELLED", "EXPIRED", "REJECTED", "REPLACED"}:
+                remaining = self._cantidad_real_broker(ticker, pos["tipo"])
+                if remaining is None:
+                    # Unknown broker exposure: do not clear the STOP identifier,
+                    # invent a close, or submit another protective order.
+                    return
+                if remaining == 0:
+                    self._audit_event(
+                        "STOP_TERMINAL_BROKER_FLAT",
+                        ticker=ticker, lado=pos["tipo"], estado=stop_status,
+                        order_id=stop_id,
+                        motivo="Schwab reports flat; exit identity requires independent evidence",
+                    )
+                    # The existing close path quarantines unknown REAL P/L and
+                    # blocks further entries instead of inventing broker fills.
+                    self._cerrar_posicion(
+                        ticker, precio_actual,
+                        motivo="reconciliacion: STOP terminal, broker plano",
+                    )
+                    return
+                # Exposure persists with a terminal old STOP.  On the next
+                # monitor tick use the EXISTING guarded stale-STOP route, which
+                # rechecks exact order visibility and broker exposure before
+                # replacing protection. Never place an order directly here.
+                with self._lock:
+                    if self._posiciones.get(ticker) is not pos:
+                        return
+                    pos["sl_reconcile_pending"] = True
+                self._audit_event(
+                    "STOP_TERMINAL_RECONCILE_REQUIRED",
+                    ticker=ticker, lado=pos["tipo"], estado=stop_status,
+                    order_id=stop_id,
+                    motivo="STOP terminal with broker exposure; verify working orders before protection",
+                )
+                return
+
         # If a 3-share partial plan was deferred because the STOP had not become
         # visible yet, place TP1 only after the STOP is confirmed WORKING.
         if (
             pos.get("salida_parcial")
+            and not pos.get('normal_exit_progress')
             and not pos.get("tp1_hit")
             and not pos.get("tp1_order_id")
             and pos.get("sl_order_id")
@@ -4754,15 +5163,22 @@ class ChocoletraBot:
             if self.ejecutor_hibrido._estado_orden(self.account_number, pos["tp1_order_id"]) == "FILLED":
                 self._ejecutar_parcial(ticker, pos)
                 return
-        # SL/remanente llenado → finalizar
-        if pos["sl_order_id"]:
-            if self.ejecutor_hibrido._estado_orden(self.account_number, pos["sl_order_id"]) == "FILLED":
-                self._cerrar_posicion(ticker, pos["sl_actual"], motivo="SL(real)")
-                return
+        progress = pos.get('normal_exit_progress') or {}
+        if (progress and progress.get('attempts', 0) < 3
+                and time.time() >= progress.get('retry_after', float('inf'))
+                and pos.get('sl_order_id') and not pos.get('sl_reconcile_pending')):
+            progress['retry_after'] = time.time() + 10
+            self._cerrar_posicion(ticker, precio_actual,
+                motivo=progress.get('reason') or 'cierre LIMIT pendiente')
+            return
+        if progress:
+            # Three unsuccessful normal LIMIT attempts retain protection and
+            # require another explicit exit request; they never become MARKET.
+            return
 
         # Tras TP1 el 30% restante conserva el STOP de breakeven, pero el objetivo
         # final se ejecuta desde el motor al observar el precio. El cierre usa la
-        # misma secuencia estricta: cancelar stop -> confirmar -> MARKET -> plano.
+        # misma secuencia estricta: cancelar stop -> confirmar -> LIMIT -> plano.
         objetivo = float(pos.get("tp_final", 0) or 0)
         if pos.get("tp1_hit") and objetivo > 0 and precio_actual > 0:
             alcanzado = (
@@ -5532,6 +5948,7 @@ class ChocoletraBot:
         with self._lock:
             items = list(self._posiciones.items())
             last_prices = dict(getattr(self, "_last_prices", {}))
+            bar_times = dict(getattr(self, "_last_bar_times", {}))
 
         for ticker, pos in items:
             if not isinstance(pos, dict) or pos.get("reservado"):
@@ -5567,8 +5984,9 @@ class ChocoletraBot:
                     pos.get("cantidad_resto", initial_qty)
                     if tp1_hit else initial_qty
                 )
+                remaining_qty = int((pos.get('normal_exit_progress') or {}).get('remaining_quantity', remaining_qty))
                 executed_partial = max(0, initial_qty - remaining_qty)
-                lifecycle = "PARTIAL" if tp1_hit else "OPEN"
+                lifecycle = "PARTIAL" if tp1_hit or executed_partial else "OPEN"
                 entry = float(pos.get("entrada", 0.0) or 0.0)
                 stop_initial = float(pos.get("sl", 0.0) or 0.0)
                 stop_current = float(pos.get("sl_actual", stop_initial) or 0.0)
@@ -5595,12 +6013,25 @@ class ChocoletraBot:
                     partial_exit_at = str(partial_at)
 
             last_price = float(last_prices.get(ticker, 0.0) or 0.0)
-            if pending or entry <= 0 or last_price <= 0:
-                floating_pnl = 0.0
-            elif str(pos.get("tipo") or getattr(order, "tipo", "")) == "BUY":
-                floating_pnl = (last_price - entry) * remaining_qty
-            else:
-                floating_pnl = (entry - last_price) * remaining_qty
+            paper = self._is_paper_ticker(ticker, pos=pos)
+            entry_verified = paper or (pos.get("entry_integrity") or {}).get("entry_confirmed") is True
+            bar_at = str(bar_times.get(ticker, ""))
+            age = None
+            try:
+                bar = pd.Timestamp(bar_at)
+                if bar.tzinfo is not None:
+                    age = time.time() - bar.timestamp()
+            except (TypeError, ValueError):
+                pass
+            valuation_available = bool(
+                not pending and entry_verified and entry > 0
+                and math.isfinite(last_price) and last_price > 0
+                and age is not None and 0 <= age <= 120
+            )
+            floating_pnl = None
+            if valuation_available:
+                direction = 1 if str(pos.get("tipo") or getattr(order, "tipo", "")) == "BUY" else -1
+                floating_pnl = round((last_price - entry) * remaining_qty * direction, 2)
 
             rows.append({
                 "ticker": str(ticker),
@@ -5622,7 +6053,13 @@ class ChocoletraBot:
                 "partial_quantity_executed": executed_partial,
                 "planned_partial_quantity": planned_partial,
                 "planned_remaining_quantity": planned_remaining,
-                "entry_price": round(entry, 4),
+                "entry_price": round(entry, 4) if (entry_verified or pending) and math.isfinite(entry) and entry > 0 else None,
+                "entry_price_source": "ORDER_LIMIT" if pending else "PAPER_SIMULATION" if paper else "RECORDED_BROKER_FILL" if entry_verified else "UNVERIFIED",
+                "valuation_available": valuation_available,
+                "floating_pnl_source": "LOCAL_CANDLE_ESTIMATE",
+                "is_broker_reported": False,
+                "market_bar_at": bar_at,
+                "price_age_sec": round(age, 1) if age is not None else None,
                 "stop_initial": round(stop_initial, 4),
                 "stop_current": round(stop_current, 4),
                 "tp1_price": round(tp1, 4),
@@ -5632,9 +6069,15 @@ class ChocoletraBot:
                     tp1_hit and str(pos.get("modo_resto", "")).lower() == "breakeven"
                 ),
                 "protection_mode": str(pos.get("modo_resto", "")),
-                "realized_pnl": round(float(pos.get("pnl_realizado", 0.0) or 0.0), 2),
-                "floating_pnl": round(floating_pnl, 2),
-                "last_price": round(last_price, 4),
+                "normal_exit_pending": bool(pos.get('normal_exit_progress')),
+                "realized_pnl": (round(float(pos.get("pnl_realizado", 0.0) or 0.0)
+                    + float((pos.get('normal_exit_progress') or {}).get('verified_gross_pnl', 0) or 0), 2)
+                    if entry_verified and not pos.get("partial_price_pending")
+                    and (not pos.get('normal_exit_progress')
+                         or not pos['normal_exit_progress'].get('filled_quantity')
+                         or 'verified_gross_pnl' in pos['normal_exit_progress']) else None),
+                "floating_pnl": floating_pnl,
+                "last_price": round(last_price, 4) if math.isfinite(last_price) and last_price > 0 else None,
                 "last_price_at": datetime.fromtimestamp(
                     float(getattr(self, "_last_price_times", {}).get(ticker, 0.0) or 0.0)
                 ).isoformat(timespec="seconds") if float(
@@ -5730,3 +6173,4 @@ class ChocoletraBot:
         for tipo, cantidad in conteo.items():
             log_info(f"  {tipo}: {cantidad}")
         return df_resultado
+

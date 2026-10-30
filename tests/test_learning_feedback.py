@@ -125,6 +125,19 @@ class FeedbackDurabilityTests(unittest.TestCase):
         self.assertEqual(restarted.total_cerradas_ticker("AAPL"), 1)
         self.assertFalse(restarted.tiene_abierta("AAPL"))
 
+    def test_unknown_real_exit_is_saved_without_price_win_or_r_label(self):
+        self.open()
+        closing = {**close_context(), "exit_confirmed": False}
+        result = self.store.cerrar("AAPL", None, lifecycle=closing)
+        self.assertEqual(result["execution_valid"], 0)
+        for key in ("precio_salida", "r_multiple", "ganadora"):
+            self.assertEqual(result[key], "")
+        self.assertEqual(self.store.total_cerradas_ticker("AAPL"), 0)
+        restarted = FeedbackStore(str(self.csv_path))
+        self.assertEqual(restarted.total_cerradas_ticker("AAPL"), 0)
+        self.assertEqual(self.rows()[-1]["precio_salida"], "")
+        self.assertFalse(restarted.tiene_abierta("AAPL"))
+
     def test_failed_append_preserves_persistent_open_for_retry(self):
         self.open()
         with patch.object(self.store, "_persistir", side_effect=OSError("disk unavailable")):
@@ -381,3 +394,4 @@ class LearningLifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

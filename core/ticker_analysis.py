@@ -11,6 +11,7 @@ size, model artifacts, retraining state, or broker orders.
 from __future__ import annotations
 
 from collections import defaultdict
+from core.dashboard_evidence import mode_of, number, session_date
 from datetime import date, datetime, timedelta
 from math import sqrt
 from typing import Iterable, Mapping, Sequence
@@ -21,31 +22,20 @@ def _ticker(value) -> str:
 
 
 def _number(value, default=0.0) -> float:
-    try:
-        return float(value or 0.0)
-    except (TypeError, ValueError):
-        return float(default)
+    parsed = number(value)
+    return float(default) if parsed is None else parsed
 
 
 def _integer(value, default=0) -> int:
     try:
         return int(float(value or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return int(default)
 
 
 def _row_date(row: Mapping):
-    raw = str(
-        row.get("fecha")
-        or row.get("date")
-        or row.get("timestamp_utc")
-        or row.get("timestamp_iso")
-        or ""
-    ).strip()
-    if len(raw) < 10:
-        return None
     try:
-        return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+        return date.fromisoformat(session_date(row))
     except ValueError:
         return None
 
@@ -107,6 +97,7 @@ def build_ticker_accuracy_analysis(
     as_of_date: str = "",
     lookback_days: int = 30,
     min_closed_trades: int = 10,
+    evidence_mode: str = "REAL",
 ):
     """Rank tickers from recent *executed and closed* trade evidence.
 
@@ -120,6 +111,10 @@ def build_ticker_accuracy_analysis(
     the ranking.  This avoids confusing historical model-validation accuracy with
     real/paper execution performance.
     """
+    evidence_mode = str(evidence_mode).upper()
+    if evidence_mode not in {"PAPER", "REAL"}:
+        raise ValueError("evidence_mode must be PAPER or REAL")
+    excluded = defaultdict(int)
     try:
         end_date = datetime.strptime(str(as_of_date)[:10], "%Y-%m-%d").date()
     except (TypeError, ValueError):
@@ -175,7 +170,14 @@ def build_ticker_accuracy_analysis(
         t = _ticker(row.get("ticker"))
         if not t:
             continue
-        pnl = _number(row.get("pnl_usd"), 0.0)
+        mode = mode_of(row)
+        if mode != evidence_mode:
+            continue
+        pnl = number(row.get("pnl_usd"))
+        valid = row.get("performance_verified", mode == "PAPER") is True
+        if not valid or pnl is None:
+            excluded[t] += 1
+            continue
         qty = max(0, _integer(row.get("cantidad"), 0))
         entry = abs(_number(row.get("entrada"), 0.0))
         mode = str(row.get("modo") or "PAPER").upper()
@@ -199,7 +201,7 @@ def build_ticker_accuracy_analysis(
             s["paper_closed"] += 1
             s["paper_pnl"] += pnl
 
-    discovered = set(stats) | set(mode_by_ticker) | set(ai_by_ticker) | set(veto_by_ticker)
+    discovered = set(excluded) | set(stats) | set(mode_by_ticker) | set(ai_by_ticker) | set(veto_by_ticker)
     for t in sorted(discovered):
         if t not in seen:
             seen.add(t)
@@ -222,12 +224,16 @@ def build_ticker_accuracy_analysis(
             (s["net_pnl"] / s["entry_notional"]) * 100.0
             if s["entry_notional"] > 0 else 0.0
         )
-        eligible = s["closed_trades"] >= min_closed_trades and decisive >= min_closed_trades
+        eligible = s["closed_trades"] >= min_closed_trades and decisive >= min_closed_trades and not excluded[t]
         ai = ai_by_ticker.get(t, {}) or {}
         veto = veto_by_ticker.get(t, {}) or {}
         row = {
             "ticker": t,
-            "mode": mode_by_ticker.get(t, "PAPER"),
+            "mode": evidence_mode,
+            "configured_mode": mode_by_ticker.get(t, "UNKNOWN"),
+            "excluded_closed_trades": excluded[t],
+            "pnl_source": "PAPER_SIMULATION" if evidence_mode == "PAPER" else "LOCAL_RECORDED_FILLS_GROSS",
+            "is_broker_reported": False,
             "configured_shares": shares_by_ticker.get(t, 1),
             "closed_trades": int(s["closed_trades"]),
             "wins": int(s["wins"]),
@@ -235,21 +241,21 @@ def build_ticker_accuracy_analysis(
             "neutral": int(s["neutral"]),
             "decisive_trades": int(decisive),
             "win_rate_pct": round(win_rate * 100.0, 2) if win_rate is not None else None,
-            "win_rate_wilson_lb_pct": round(wilson * 100.0, 2),
+            "win_rate_wilson_lb_pct": round(wilson * 100.0, 2) if decisive else None,
             "gross_profit": round(s["gross_profit"], 2),
             "gross_loss": round(s["gross_loss"], 2),
             "profit_factor": round(profit_factor, 3) if profit_factor is not None else None,
-            "net_pnl": round(s["net_pnl"], 2),
+            "net_pnl": round(s["net_pnl"], 2) if not excluded[t] else None,
             "avg_pnl": round(avg_pnl, 2),
             "pnl_per_share": round(pnl_per_share, 4),
-            "net_return_pct": round(net_return_pct, 4),
+            "net_return_pct": round(net_return_pct, 4) if s["entry_notional"] > 0 and not excluded[t] else None,
             "shares_closed": int(s["shares_closed"]),
             "paper_closed": int(s["paper_closed"]),
             "real_closed": int(s["real_closed"]),
             "paper_pnl": round(s["paper_pnl"], 2),
             "real_pnl": round(s["real_pnl"], 2),
             "sample_eligible": bool(eligible),
-            "sample_status": "ELEGIBLE" if eligible else "MUESTRA_BAJA",
+            "sample_status": "EVIDENCIA_INCOMPLETA" if excluded[t] else "ELEGIBLE" if eligible else "MUESTRA_BAJA",
             "min_closed_trades": min_closed_trades,
             "model_candidate_ba_pct": (
                 round(_number(ai.get("last_balanced_accuracy")) * 100.0, 2)
@@ -296,3 +302,4 @@ def build_ticker_accuracy_analysis(
             r["ticker"],
         ),
     )
+
