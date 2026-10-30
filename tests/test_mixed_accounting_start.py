@@ -72,9 +72,19 @@ class MixedAccountingStartupTests(unittest.TestCase):
         self.assertEqual(reason, "EXACT_HISTORICAL_EXCEPTION_APPROVED")
 
     def test_broker_flat_requires_zero_positions_and_orders(self):
+        class Response:
+            status_code = 200
+
+            def __init__(self, orders):
+                self.orders = orders
+
+            def json(self):
+                return self.orders
+
         class Broker:
             positions = []
             orders = []
+            all_orders = [{"status": "FILLED"}]
 
             def __init__(self, config):
                 pass
@@ -91,6 +101,9 @@ class MixedAccountingStartupTests(unittest.TestCase):
             def obtener_ordenes_abiertas(self, account_hash):
                 return self.orders
 
+            def _get_autorizado(self, url, params=None, timeout=None):
+                return Response(self.all_orders)
+
         self.assertTrue(broker_confirmed_flat(
             self.config, "EXAMPLE_ACCOUNT", Broker))
         Broker.positions = [{"symbol": "BA"}]
@@ -98,6 +111,17 @@ class MixedAccountingStartupTests(unittest.TestCase):
             self.config, "EXAMPLE_ACCOUNT", Broker))
         Broker.positions = []
         Broker.orders = [{"status": "WORKING"}]
+        self.assertFalse(broker_confirmed_flat(
+            self.config, "EXAMPLE_ACCOUNT", Broker))
+        Broker.orders = []
+        Broker.all_orders = [{"status": "PENDING_ACTIVATION"}]
+        self.assertFalse(broker_confirmed_flat(
+            self.config, "EXAMPLE_ACCOUNT", Broker))
+        Broker.all_orders = [{"status": "FILLED", "childOrderStrategies": [
+            {"status": "WORKING"}]}]
+        self.assertFalse(broker_confirmed_flat(
+            self.config, "EXAMPLE_ACCOUNT", Broker))
+        Broker.all_orders = [{"status": "FILLED"}] * 500
         self.assertFalse(broker_confirmed_flat(
             self.config, "EXAMPLE_ACCOUNT", Broker))
         Broker.orders = None
