@@ -5,7 +5,7 @@ set -Eeuo pipefail
 umask 077
 cd /opt/gala/GALA-Trading-Bot
 BASE=050a1a8efdd7e35a733a2199db596410b7827779
-FILES=(server.py core/mixed_accounting_start.py tests/test_mixed_accounting_start.py scripts/start_mixed_paper_fallback.py)
+FILES=(server.py engine/bot_engine.py core/mixed_accounting_start.py tests/test_mixed_accounting_start.py scripts/start_mixed_paper_fallback.py)
 if [[ "$(git rev-parse HEAD)" != "$BASE" ]]; then
   echo "REFUSED: VPS git HEAD differs from reviewed baseline; no changes" >&2
   exit 2
@@ -21,6 +21,7 @@ fi
 mkdir -p /opt/gala/backups
 backup=$(mktemp -d /opt/gala/backups/gala-mixed-safety-20261030-XXXXXXXX)
 cp -p server.py "$backup/server_before_mixed.py"
+cp -p engine/bot_engine.py "$backup/engine_before_mixed.py"
 patch="$backup/mixed_safe.patch"
 git diff --binary "$BASE" FETCH_HEAD -- "${FILES[@]}" > "$patch"
 [[ -s "$patch" ]] || { echo "REFUSED: empty deployment patch" >&2; exit 2; }
@@ -41,7 +42,7 @@ trap cleanup EXIT
 
 git apply "$patch"
 applied=1
-.venv/bin/python -m py_compile server.py core/mixed_accounting_start.py scripts/start_mixed_paper_fallback.py
+.venv/bin/python -m py_compile server.py engine/bot_engine.py core/mixed_accounting_start.py scripts/start_mixed_paper_fallback.py
 .venv/bin/python -m unittest discover -s tests -p test_mixed_accounting_start.py -v
 
 echo "=== PRE-RESTART SAFETY CHECK ==="
