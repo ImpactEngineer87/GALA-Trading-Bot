@@ -78,6 +78,8 @@ def inspect(packet, root, day):
         raise ValueError("Saved accounting snapshot invalid")
     runtime_keys = {key for key, row in unresolved.items()
                     if not str(key).startswith("history:") and row.get("ticker") in TARGETS}
+    history_keys = {key for key, row in unresolved.items()
+                    if str(key).startswith("history:") and row.get("ticker") in TARGETS}
     cfg = yaml.safe_load((root / "config.yaml").read_text(encoding="utf-8")) or {}
     log = cfg.get("logging") or {}
     def path(value):
@@ -132,8 +134,10 @@ def inspect(packet, root, day):
     history = []
     with history_path.open(encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
-            if (mode_of(row) != "REAL" or session_date(row) != day
-                    or row.get("position_id") not in runtime_keys):
+            if mode_of(row) != "REAL" or session_date(row) != day:
+                continue
+            history_key = "history:" + day + ":" + str(row.get("history_id") or row.get("position_id") or "")
+            if row.get("position_id") not in runtime_keys and history_key not in history_keys:
                 continue
             history.append({"ticker": row.get("ticker"), "position_ref": ref(row.get("position_id")),
                             "execution_ref": ref(row.get("execution_id")),
