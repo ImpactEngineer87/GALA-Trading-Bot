@@ -25,7 +25,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -237,6 +237,42 @@ def service_stopped():
     require(fields.get("ActiveState") == "inactive" and fields.get("MainPID") == "0", "SERVICE_MUST_BE_STOPPED")
 
 
+def verify_broker_flat(client, account, account_hash):
+    """Fail closed using exact account-hash GETs, not account-number endpoints."""
+    base = client.TRADER_URL + "/accounts/" + quote(str(account_hash), safe="")
+    positions_response = client._get_autorizado(
+        base, params={"fields": "positions"}, timeout=15)
+    require(positions_response is not None and positions_response.status_code == 200,
+            "BROKER_POSITIONS_GET_FAILED")
+    try:
+        data = positions_response.json()
+        security = data.get("securitiesAccount") if isinstance(data, dict) else None
+        require(isinstance(security, dict) and
+                str(security.get("accountNumber", "")) == str(account) and
+                bool(security.get("type")), "BROKER_POSITIONS_ACCOUNT_INVALID")
+        # Schwab omits the positions key for a genuinely empty account.
+        require(security.get("positions", []) == [], "BROKER_MUST_CONFIRM_ZERO_POSITIONS_AND_ORDERS")
+    except (TypeError, ValueError, AttributeError):
+        raise Refused("BROKER_POSITIONS_RESPONSE_INVALID")
+    now = datetime.now(timezone.utc)
+    fmt = "%Y-%m-%dT%H:%M:%S.000Z"
+    orders_response = client._get_autorizado(
+        base + "/orders",
+        params={"status": "WORKING",
+                "fromEnteredTime": (now - timedelta(days=7)).strftime(fmt),
+                "toEnteredTime": (now + timedelta(days=1)).strftime(fmt),
+                "maxResults": 500},
+        timeout=15)
+    require(orders_response is not None and orders_response.status_code == 200,
+            "BROKER_OPEN_ORDERS_GET_FAILED")
+    try:
+        orders = orders_response.json()
+        require(isinstance(orders, list), "BROKER_OPEN_ORDERS_RESPONSE_INVALID")
+        require(orders == [], "BROKER_MUST_CONFIRM_ZERO_POSITIONS_AND_ORDERS")
+    except (TypeError, ValueError, AttributeError):
+        raise Refused("BROKER_OPEN_ORDERS_RESPONSE_INVALID")
+
+
 def apply_plan(root, plan, client, account, account_hash, backup_root, *, check_service=service_stopped, now=None):
     import fcntl
     require(plan.get("root") == str(root) and plan.get("format") == 1, "PLAN_SCOPE_INVALID")
@@ -252,7 +288,7 @@ def apply_plan(root, plan, client, account, account_hash, backup_root, *, check_
         fcntl.flock(lock, fcntl.LOCK_EX)
         scope = scope_for(root, plan["position_ref"], plan["session_ny"], now,
                           history_only=plan.get("history_only", False))
-        require(client.obtener_posiciones(account) == [] and client.obtener_ordenes_abiertas(account) == [], "BROKER_MUST_CONFIRM_ZERO_POSITIONS_AND_ORDERS")
+        verify_broker_flat(client, account, account_hash)
         proof = proof_for(scope, client, account, account_hash)
         require(plan_for(scope, proof) == plan, "PLAN_STALE_OR_BROKER_EVIDENCE_CHANGED")
         check_service()
