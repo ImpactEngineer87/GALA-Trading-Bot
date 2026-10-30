@@ -7,6 +7,7 @@ itself. The dashboard engine may later submit simulated PAPER orders.
 """
 from __future__ import annotations
 
+import argparse
 import getpass
 import json
 import os
@@ -36,6 +37,10 @@ def require(condition, label):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check-stopped", action="store_true",
+                        help="Read-only dashboard/broker safety check before service restart")
+    args = parser.parse_args()
     load_dotenv(PROJECT / ".env")
     cfg = yaml.safe_load((PROJECT / "config.yaml").read_text()) or {}
     live = cfg.get("live_trading") or {}
@@ -85,13 +90,17 @@ def main():
         require(status.get("status") == "ok"
                 and isinstance(status.get("bot"), dict),
                 "Dashboard status invalid")
+        require(status["bot"].get("running") is False,
+                "Engine already running; refusing to restart or alter it")
+        if args.check_stopped:
+            print("RESULT: PRE_RESTART_SAFE_ENGINE_STOPPED_BROKER_FLAT")
+            print("NO SERVICE OR ENGINE CHANGES")
+            return
         require(
             status["bot"].get("mixed_accounting_startup_policy")
             == "REAL_ACCOUNTING_HOLD_PAPER_ONLY_V1",
             "Dashboard process is not running the patched mixed startup code"
         )
-        require(status["bot"].get("running") is False,
-                "Engine already running; refusing to restart or alter it")
 
         # The POST uses the official controller and CSRF guard. The server-side
         # accounting quarantine is verified again at engine startup.
