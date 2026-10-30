@@ -117,6 +117,46 @@ class VerifiedHistoricalReconciliationTests(unittest.TestCase):
     def apply(self, plan, checker=lambda: None):
         return repair.apply_plan(self.root, plan, self.client, "123456789", "account-private", self.backups, check_service=checker, now=NOW)
 
+    def test_history_only_reconciliation_preserves_other_guards(self):
+        # The runtime position guard was not created, but exactly one history
+        # guard and independently recorded entry/exit IDs still exist.
+        del self.state["unresolved"]["position-private"]
+        self.write_state()
+        self.history.insert(0, {
+            **self.history[0], "evento": "POSITION_OPEN",
+            "order_id": "entry-private", "parent_order_id": "",
+        })
+        self.write_ledgers()
+        before = self.guard.read_bytes()
+        with self.assertRaisesRegex(repair.Refused, "EXACT_RUNTIME_POSITION_REQUIRED"):
+            self.scope()
+        scope = repair.scope_for(
+            self.root, repair.reference("position-private"), "2026-10-23",
+            NOW, history_only=True)
+        self.assertEqual(scope["keys"], ["history:2026-10-23:position-private"])
+        self.assertEqual(before, self.guard.read_bytes())
+        result = self.apply(repair.plan_for(scope, self.proof(scope)))
+        self.assertEqual(result["status"], "APPLIED")
+        self.assertEqual(result["unresolved"], 3)
+        state = json.loads(self.guard.read_text())
+        self.assertNotIn("history:2026-10-23:position-private", state["unresolved"])
+        self.assertIn("ba-private", state["unresolved"])
+        self.assertIn("meta-private", state["unresolved"])
+        self.assertEqual(
+            state["verified_historical_reconciliations"]["position-private"]
+                 ["original_unresolved_records"],
+            {"history:2026-10-23:position-private":
+             self.state["unresolved"]["history:2026-10-23:position-private"]})
+
+    def test_history_only_requires_unique_entry_and_rejects_runtime_guard(self):
+        ref = repair.reference("position-private")
+        with self.assertRaisesRegex(repair.Refused, "RUNTIME_GUARD_REQUIRES_STANDARD_MODE"):
+            repair.scope_for(self.root, ref, "2026-10-23", NOW, history_only=True)
+        del self.state["unresolved"]["position-private"]
+        self.write_state()
+        with self.assertRaisesRegex(repair.Refused, "ONE_EXACT_HISTORY_OPEN_REQUIRED"):
+            repair.scope_for(self.root, ref, "2026-10-23", NOW, history_only=True)
+
     def test_prepare_does_not_modify_runtime_or_expose_private_ids(self):
         before = {str(p): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
         out = io.StringIO()
