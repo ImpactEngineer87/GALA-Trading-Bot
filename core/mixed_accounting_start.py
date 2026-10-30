@@ -60,6 +60,10 @@ def broker_confirmed_flat(config, account_number, client_factory=None):
     if client_factory is None:
         from api.schwab_client import SchwabClient
         client_factory = SchwabClient
+    from datetime import datetime, timedelta, timezone
+    from urllib.parse import quote
+    from api.schwab_client import TRADER_URL
+
     try:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             broker = client_factory(config)
@@ -69,8 +73,37 @@ def broker_confirmed_flat(config, account_number, client_factory=None):
             if not account_hash:
                 return False
             positions = broker.obtener_posiciones(account_hash)
-            orders = broker.obtener_ordenes_abiertas(account_hash)
-        return (isinstance(positions, list) and len(positions) == 0
-                and isinstance(orders, list) and len(orders) == 0)
+            working_orders = broker.obtener_ordenes_abiertas(account_hash)
+            # WORKING-only endpoints can miss PENDING_ACTIVATION and other
+            # pending statuses. Require a second unfiltered snapshot.
+            now = datetime.now(timezone.utc)
+            fmt = "%Y-%m-%dT%H:%M:%S.000Z"
+            response = broker._get_autorizado(
+                TRADER_URL + "/accounts/" + quote(str(account_hash), safe="") + "/orders",
+                params={
+                    "fromEnteredTime": (now - timedelta(days=59)).strftime(fmt),
+                    "toEnteredTime": (now + timedelta(days=1)).strftime(fmt),
+                    "maxResults": 500,
+                },
+                timeout=20,
+            )
+        if (not isinstance(positions, list) or positions
+                or not isinstance(working_orders, list) or working_orders
+                or response is None or response.status_code != 200):
+            return False
+        orders = response.json()
+        if not isinstance(orders, list) or len(orders) >= 500:
+            return False  # Truncated order list is not proof of flatness.
+        terminal = {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "REPLACED"}
+        pending = list(orders)
+        while pending:
+            order = pending.pop()
+            if not isinstance(order, dict) or order.get("status") not in terminal:
+                return False
+            children = order.get("childOrderStrategies") or []
+            if not isinstance(children, list):
+                return False
+            pending.extend(children)
+        return True
     except Exception:
         return False
