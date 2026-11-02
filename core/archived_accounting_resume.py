@@ -9,7 +9,7 @@ import hashlib
 import json
 import stat
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -134,6 +134,7 @@ def _trusted_approval_file(path):
 def exception_status(config, path, account, *, now=None, root=None):
     reply = {"entry_blocked": True, "historical_resume_active": False,
              "archived_resume_active": False,
+             "archived_approval_expired": False,
              "historical_resume_reason": "ARCHIVED_HOLD_NOT_AUTHORIZED"}
     if (config.get("live_trading") or {}).get("archived_accounting_resume") is not True:
         return reply
@@ -150,8 +151,13 @@ def exception_status(config, path, account, *, now=None, root=None):
         if not _trusted_approval_file(grant_path):
             raise ValueError("APPROVAL_PERMISSION_INVALID")
         _, grant = read_json(grant_path)
+        approved_session = grant.get("session_ny")
+        if (not isinstance(approved_session, str)
+                or date.fromisoformat(approved_session).isoformat() != approved_session
+                or approved_session <= "2026-10-29" or approved_session > day):
+            raise ValueError("APPROVAL_SESSION_INVALID")
         archive_digest = grant.get("original_archive_sha256")
-        if (grant.get("kind") != APPROVAL_KIND or grant.get("session_ny") != day
+        if (grant.get("kind") != APPROVAL_KIND
                 or grant.get("guard_sha256") != digest or grant.get("keys") != keys
                 or grant.get("account_fingerprint") != fingerprint(account)
                 or grant.get("archive_path") != hold["archive_path"]
@@ -163,6 +169,11 @@ def exception_status(config, path, account, *, now=None, root=None):
                 or grant.get("historical_pnl_verified") is not False
                 or grant.get("accounting_records_modified") is not False):
             raise ValueError("APPROVAL_MISMATCH")
+        reply.update(authorization_session_ny=approved_session, current_session_ny=day)
+        if approved_session < day:
+            reply.update(archived_approval_expired=True,
+                         historical_resume_reason="ARCHIVED_APPROVAL_EXPIRED")
+            return reply
         reply.update(entry_blocked=False, historical_resume_active=True,
                      archived_resume_active=True,
                      historical_resume_reason="EXACT_ARCHIVED_HOLD_SESSION_APPROVED")

@@ -94,6 +94,37 @@ class ArchivedAccountingResumeTests(unittest.TestCase):
         # UTC midnight is still the same New York session.
         self.assertFalse(self.status(now=datetime(2026, 10, 31, 1, tzinfo=timezone.utc))["entry_blocked"])
 
+    def test_expired_approval_reports_its_date_after_the_november_dst_change(self):
+        before = {p: p.read_bytes() for p in (self.guard, self.archive, self.approval)}
+        state = self.status(now=datetime(2026, 11, 2, 13, tzinfo=timezone.utc))
+        self.assertTrue(state["entry_blocked"])
+        self.assertFalse(state["archived_resume_active"])
+        self.assertTrue(state["archived_approval_expired"])
+        self.assertEqual(state["historical_resume_reason"], "ARCHIVED_APPROVAL_EXPIRED")
+        self.assertEqual(state["authorization_session_ny"], "2026-10-30")
+        self.assertEqual(state["current_session_ny"], "2026-11-02")
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+
+    def test_other_account_or_changed_guard_is_not_mislabeled_as_an_expired_approval(self):
+        monday = datetime(2026, 11, 2, 13, tzinfo=timezone.utc)
+        state = self.status(account="another-account", now=monday)
+        self.assertTrue(state["entry_blocked"])
+        self.assertFalse(state["archived_approval_expired"])
+        self.state["unresolved"]["new-issue"] = {"ticker": "NVDA", "reason": "Missing fill"}
+        self.guard.write_text(json.dumps(self.state))
+        state = self.status(now=monday)
+        self.assertTrue(state["entry_blocked"])
+        self.assertFalse(state["archived_approval_expired"])
+
+    def test_invalid_and_future_session_dates_cannot_authorize_or_claim_expiry(self):
+        for day in (None, 20261030, "2026-10-3", "20261030", "2026-02-30", "2026-11-03"):
+            with self.subTest(day=day):
+                self.grant["session_ny"] = day
+                self.write_grant()
+                state = self.status()
+                self.assertTrue(state["entry_blocked"])
+                self.assertFalse(state["archived_approval_expired"])
+
     def test_missing_root_trust_and_pnl_claims_cannot_authorize(self):
         with patch.object(resume, "_trusted_approval_file", return_value=False):
             self.assertTrue(resume.exception_status(
@@ -244,13 +275,14 @@ class AuthorizationPublicationTests(unittest.TestCase):
         self.backups = self.root / "backups"
         self.backups.mkdir()
 
-    def issue(self, *, check_service=lambda: None, broker=None):
+    def issue(self, *, check_service=lambda: None, broker=None, now=NOW, renew_expired=False):
         with ExitStack() as stack:
             stack.enter_context(patch.object(issuer.os, "geteuid", return_value=0, create=True))
             stack.enter_context(patch.object(issuer.os, "fchown", create=True))
             stack.enter_context(patch.object(issuer.os, "fchmod", create=True))
             stack.enter_context(patch.object(issuer.os, "fsync"))
             stack.enter_context(patch.object(issuer.os, "O_DIRECTORY", 0, create=True))
+            stack.enter_context(patch.object(issuer, "_trusted_approval_file", return_value=True))
             stack.enter_context(patch.dict("sys.modules", {
                 "grp": SimpleNamespace(getgrnam=lambda name: SimpleNamespace(gr_gid=1))}))
             # Windows cannot open directories with os.open; avoid only those
@@ -263,9 +295,10 @@ class AuthorizationPublicationTests(unittest.TestCase):
             stack.enter_context(patch.object(issuer.os, "open", side_effect=portable_open))
             stack.enter_context(patch.object(issuer, "verify_broker_flat", side_effect=broker or (
                 lambda *args, **kwargs: {"positions": 0, "pending_orders": 0,
-                                        "checked_utc": NOW.isoformat()})))
+                                        "checked_utc": kwargs.get("now", NOW).isoformat()})))
             return issuer.authorize(self.root, self.config, "offline-account", "offline-reviewer",
-                                    ack=resume.ACK, backup_root=self.backups, now=NOW,
+                                    ack=resume.ACK, backup_root=self.backups, now=now,
+                                    renew_expired=renew_expired,
                                     check_service=check_service, client=object())
 
     def test_publishes_only_grant_and_private_backups_leaving_runtime_evidence_unchanged(self):
@@ -300,6 +333,26 @@ class AuthorizationPublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "PRIOR_GRANT_REVIEW_REQUIRED"):
             self.issue()
         self.assertEqual(self.approval.read_text(), "existing grant")
+
+    def test_reviewed_renewal_preserves_old_grant_and_accounting_for_new_ny_session(self):
+        self.issue()
+        previous = self.approval.read_bytes()
+        evidence = {p: p.read_bytes() for p in (
+            self.archive, self.guard, self.history, self.audit, self.config_file)}
+        monday = datetime(2026, 11, 2, 13, tzinfo=timezone.utc)
+        result = self.issue(now=monday, renew_expired=True)
+        self.assertEqual(result["session_ny"], "2026-11-02")
+        self.assertEqual((Path(result["review_backup"]) / "prior_authorization.json").read_bytes(), previous)
+        self.assertEqual(evidence, {p: p.read_bytes() for p in evidence})
+        self.assertFalse(self.status(now=monday)["entry_blocked"])
+        self.assertTrue(self.status(now=datetime(2026, 11, 3, 5, tzinfo=timezone.utc))["entry_blocked"])
+
+    def test_same_day_renewal_is_refused_without_replacing_the_grant(self):
+        self.issue()
+        previous = self.approval.read_bytes()
+        with self.assertRaisesRegex(ValueError, "ONLY_EXPIRED_GRANT_MAY_BE_RENEWED"):
+            self.issue(renew_expired=True)
+        self.assertEqual(self.approval.read_bytes(), previous)
 
 
 if __name__ == "__main__":

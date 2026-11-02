@@ -4130,7 +4130,10 @@ def get_ticker_execution():
             if not accounting_known:
                 blockers.append({"code": "REAL_ACCOUNTING_UNAVAILABLE", "message": "Estado de contabilidad REAL no verificable"})
             elif accounting_blocked:
-                blockers.append({"code": "REAL_ACCOUNTING_UNRESOLVED", "message": "Contabilidad REAL pendiente de reconciliación"})
+                if accounting.get("historical_resume_reason") == "ARCHIVED_APPROVAL_EXPIRED":
+                    blockers.append({"code": "REAL_ACCOUNTING_APPROVAL_EXPIRED", "message": "Autorización de sesión NY vencida; requiere nueva revisión"})
+                else:
+                    blockers.append({"code": "REAL_ACCOUNTING_UNRESOLVED", "message": "Contabilidad REAL pendiente de reconciliación"})
             if row["ticker"] in quarantine:
                 blockers.append({"code": "REAL_STARTUP_QUARANTINE", "message": str(quarantine[row["ticker"]])})
             if _unsupported_real_partial_exit(cfg, row.get("shares", 1)):

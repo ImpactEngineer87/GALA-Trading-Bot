@@ -60,6 +60,13 @@ class TickerExecutionReportingTests(unittest.TestCase):
         self.assertFalse(real["entry_blocked"])
         self.assertEqual(real["entry_status"], "NO_KNOWN_BLOCK")
 
+    def test_expired_session_approval_is_distinct_from_a_new_accounting_issue(self):
+        self.risk["real_accounting"]["historical_resume_reason"] = "ARCHIVED_APPROVAL_EXPIRED"
+        real, paper = self.report()["tickers"]
+        self.assertTrue(real["entry_blocked"])
+        self.assertEqual(real["entry_blockers"][0]["code"], "REAL_ACCOUNTING_APPROVAL_EXPIRED")
+        self.assertFalse(paper["entry_blocked"])
+
     def test_partial_exit_policy_is_exposed_before_real_order_submission(self):
         self.risk["real_accounting"].update(blocked=False, entry_blocked=False)
         self.rows[0]["shares"] = 3
@@ -123,14 +130,24 @@ load('function partialPlanForShares(','function renderExecPartialPlan(');
 load('function tickerEntryStatus(row){','function renderTickerExecution(');
 load('function updateBotUI(running,runtime){','async function fetchStatus(){');
 context.el('botToggle');context.el('botStatus');
-const risk={real_accounting:{blocked:true,entry_blocked:false,historical_resume_active:true}};
+const risk={real_accounting:{blocked:true,entry_blocked:false,historical_resume_active:true,authorization_session_ny:'2026-11-02'}};
 context.updateDailyRisk(risk);
 assert.match(elements.dailyRiskState.textContent,/HISTÓRICA PENDIENTE/);
 assert.doesNotMatch(elements.dailyRiskState.textContent,/REAL BLOQUEADAS/);
 assert.match(elements.dailyRiskDetail.textContent,/sin resolver/);
+assert.match(elements.dailyRiskDetail.textContent,/únicamente para 2026-11-02 \(NY\)/);
 risk.real_accounting.entry_blocked=true;
 context.updateDailyRisk(risk);
 assert.match(elements.dailyRiskState.textContent,/REAL BLOQUEADAS/);
+risk.real_accounting.historical_resume_reason='ARCHIVED_APPROVAL_EXPIRED';
+risk.real_accounting.authorization_session_ny='2026-10-30';
+risk.real_accounting.current_session_ny='2026-11-02';
+context.updateDailyRisk(risk);
+assert.match(elements.dailyRiskState.textContent,/AUTORIZACIÓN DE SESIÓN VENCIDA/);
+assert.match(elements.dailyRiskDetail.textContent,/2026-10-30/);
+assert.match(elements.dailyRiskDetail.textContent,/2026-11-02/);
+assert.doesNotMatch(elements.dailyRiskDetail.textContent,/Reconciliar ejecuciones/);
+delete risk.real_accounting.historical_resume_reason;
 delete risk.real_accounting.entry_blocked;
 context.updateDailyRisk(risk);
 assert.match(elements.dailyRiskState.textContent,/REAL BLOQUEADAS/);

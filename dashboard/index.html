@@ -1671,6 +1671,7 @@ function updateDailyRisk(risk){
   const blocked = !!risk.blocked;
   const accounting = risk.real_accounting || {};
   const accountingBlocked = !!(accounting.entry_blocked ?? accounting.blocked);
+  const approvalExpired = accountingBlocked && accounting.historical_resume_reason === 'ARCHIVED_APPROVAL_EXPIRED';
   const historicalPending = !!accounting.blocked && !accountingBlocked;
   const net = risk.net_pnl == null ? null : Number(risk.net_pnl);
   const limit = Number(risk.limit_usd || 0);
@@ -1679,7 +1680,9 @@ function updateDailyRisk(risk){
   el('dailyRiskNet').style.color = net == null ? 'var(--muted)' : net >= 0 ? 'var(--green)' : 'var(--red)';
   el('dailyRiskLimit').textContent = money(limit);
   el('dailyRiskRoom').textContent = money(room);
-  el('dailyRiskState').textContent = accountingBlocked
+  el('dailyRiskState').textContent = approvalExpired
+    ? '⛔ NUEVAS ENTRADAS REAL BLOQUEADAS: AUTORIZACIÓN DE SESIÓN VENCIDA'
+    : accountingBlocked
     ? '⛔ NUEVAS ENTRADAS REAL BLOQUEADAS: CONTABILIDAD PENDIENTE'
     : blocked
     ? '⛔ BLOQUEADO POR PÉRDIDA DIARIA'
@@ -1688,12 +1691,14 @@ function updateDailyRisk(risk){
     : (enabled ? '🛡️ Kill Switch diario preparado' : '⚠️ Kill Switch diario desactivado');
   const realized = risk.realized_pnl == null ? null : Number(risk.realized_pnl);
   const unrealized = Number(risk.unrealized_pnl || 0);
-  el('dailyRiskDetail').textContent = accountingBlocked
+  el('dailyRiskDetail').textContent = approvalExpired
+    ? `La autorización del ${accounting.authorization_session_ny} (NY) venció. Se requiere una nueva revisión para ${accounting.current_session_ny} (NY). Los registros históricos se conservan sin verificar.`
+    : accountingBlocked
     ? `Reconciliar ejecuciones Schwab · ${(risk.real_accounting.reasons || []).join('; ')} · protecciones existentes siguen activas`
     : blocked
     ? `${risk.trigger_mode || risk.mode || 'PAPER'} · ${risk.reason || ''} · reinicio ${risk.next_reset_at_ny || 'próxima sesión NY'}`
     : historicalPending
-    ? 'Registros históricos sin resolver. La excepción permite evaluar nuevas entradas; los controles de riesgo, modelo y broker siguen activos.'
+    ? `Registros históricos sin resolver. Autorización válida únicamente para ${accounting.authorization_session_ny || 'esta sesión'} (NY). Los controles de riesgo, modelo y broker siguen activos.`
     : `${risk.mode || 'PAPER'} · Realizado ${money(realized)} · No realizado ${money(unrealized)}${risk.pricing_complete === false ? ' · valoración incompleta' : ''}`;
   card.classList.toggle('blocked', blocked || accountingBlocked);
 }
