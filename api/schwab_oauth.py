@@ -56,11 +56,14 @@ def _check_oauth_refresh_cooldown():
         raise SchwabOAuthCooldown(remaining, _OAUTH_RETRY_STATUS)
 
 
-def _record_oauth_refresh_rejection(status):
+def _record_oauth_refresh_rejection(status, recommended_action=None):
     global _OAUTH_RETRY_NOT_BEFORE, _OAUTH_RETRY_STATUS
     # Unspecified 403 is not automatically a rate limit; a long cooldown
     # prevents credential-retry storms while the operator reviews app access.
-    delay = 900.0 if status == 403 else (120.0 if status == 429 else 0.0)
+    delay = (900.0 if status == 403 else
+             120.0 if status == 429 else
+             300.0 if status == 400 and recommended_action == "NEW_AUTHORIZATION_CODE" else
+             0.0)
     if delay:
         _OAUTH_RETRY_NOT_BEFORE = max(
             _OAUTH_RETRY_NOT_BEFORE, time.monotonic() + delay
@@ -206,9 +209,15 @@ def build_safe_diagnostic(
             "connectivity/intermediary filtering and Schwab app access/status."
         )
 
+    nested_invalid_grant = (
+        phase == "refresh_token_exchange"
+        and oauth_error == "unsupported_token_type"
+        and status == 400
+        and "invalid_grant" in description.lower()
+    )
     if oauth_error == "invalid_client":
         action = "CHECK_CLIENT_CREDENTIALS"
-    elif oauth_error == "invalid_grant":
+    elif oauth_error == "invalid_grant" or nested_invalid_grant:
         action = "NEW_AUTHORIZATION_CODE"
     elif oauth_error in {"access_denied", "unauthorized_client"}:
         action = "CHECK_APP_AUTHORIZATION"
@@ -352,8 +361,10 @@ def refresh_oauth_token(
                 secrets_to_redact=(secret, refresh),
             )
         except SchwabOAuthFailure as exc:
+            diagnostic = exc.diagnostic or {}
             _record_oauth_refresh_rejection(
-                int((exc.diagnostic or {}).get("http_status") or 0)
+                int(diagnostic.get("http_status") or 0),
+                diagnostic.get("recommended_action"),
             )
             raise
         payload = response.json()

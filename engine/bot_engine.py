@@ -29,6 +29,7 @@ DESCRIPCIÓN:
 =============================================================
 """
 
+import csv
 import sys
 import time
 import os
@@ -829,6 +830,13 @@ class ChocoletraBot:
                 now=self._ahora_et() if callable(getattr(self, "_ahora_et", None)) else None,
             )
             snapshot.update(approval)
+        if any(reason == "EXTERNAL_BROKER_POSITION" for reason in
+               getattr(self, "_ticker_quarantine", {}).values()):
+            snapshot["blocked"] = True
+            snapshot["entry_blocked"] = True
+            snapshot["external_exposure_blocked"] = True
+            snapshot.setdefault("reasons", []).append(
+                "External broker position in a REAL ticker; account risk not attributable")
         return snapshot
 
     def _require_real_accounting(self, ticker, pos, reason, **evidence):
@@ -1087,6 +1095,14 @@ class ChocoletraBot:
                 continue
             visited.add(oid)
             cancel_ticker = sorted(symbols & managed)[0]
+            known_ids = self._owned_working_ids(cancel_ticker, orders)
+            subtree_ids = {str(node.get("orderId") or "") for node in subtree
+                           if node.get("orderId")}
+            if not subtree_ids or not subtree_ids <= known_ids:
+                all_confirmed = False
+                self._emit_log("ERROR", f"[{cancel_ticker}] Kill switch: orden "
+                               "externa/no auditada; cancelación automática omitida")
+                continue
             try:
                 result = cancelar_orden_compatible(
                     self.ejecutor_hibrido, self.account_number, oid, ticker=cancel_ticker)
@@ -3663,6 +3679,8 @@ class ChocoletraBot:
             )
             return False
         seen = set()
+        known = self._owned_working_ids(ticker, ordenes)
+        cancel_ids = []
         for o in self._iter_broker_orders(ordenes):
             try:
                 sym = self._symbol_from_broker_order(o)
@@ -3671,8 +3689,52 @@ class ChocoletraBot:
                 continue
             if sym == ticker and oid and oid not in seen:
                 seen.add(oid)
-                self.ejecutor_hibrido.cancelar_orden(self.account_number, oid)
+                if oid not in known:
+                    self._emit_log("WARN", f"[{ticker}] Orden {oid} no vinculada a GALA; "
+                                   "no se cancela ni se modifica la posición externa")
+                    return False
+                cancel_ids.append(oid)
+        for oid in cancel_ids:
+            self.ejecutor_hibrido.cancelar_orden(self.account_number, oid)
         return True
+
+    def _gala_audited_order_ids(self, ticker, *, entry_only=False):
+        """Return exact broker IDs already written by GALA's REAL order path."""
+        path = getattr(getattr(self, "order_audit", None), "path", None)
+        if path is None:
+            return set()
+        try:
+            with path.open(encoding="utf-8-sig", newline="") as handle:
+                rows = csv.DictReader(handle)
+                return {str(row.get("order_id") or "") for row in rows
+                        if row.get("modo") == "REAL"
+                        and row.get("ticker") == ticker
+                        and row.get("order_id")
+                        and (str(row.get("evento") or "") in {
+                            "ENTRY_SUBMITTED", "ENTRY_ACKNOWLEDGED", "ENTRY_FILLED"}
+                            if entry_only else
+                            str(row.get("evento") or "").endswith("_SUBMITTED")
+                            or row.get("evento") in {
+                                "ENTRY_FILLED", "STOP_MOVED_TO_BREAKEVEN"})}
+        except (OSError, ValueError, csv.Error):
+            return set()
+
+    def _owned_working_ids(self, ticker, orders):
+        """Expand an audited parent ID to its broker-created child strategies."""
+        known = self._gala_audited_order_ids(ticker)
+        owned = set(known)
+        for root in orders or []:
+            if not isinstance(root, dict):
+                continue
+            if str(root.get("orderId") or "") not in known:
+                continue
+            subtree = list(self._iter_broker_orders([root]))
+            if any(self._symbol_from_broker_order(node) != ticker
+                   for node in subtree):
+                continue
+            owned.update(str(node.get("orderId")) for node in subtree
+                         if node.get("orderId"))
+        return owned
 
     def _cantidad_real_broker(self, ticker: str, tipo: str):
         """Cantidad REAL de acciones que el broker reporta para (ticker, tipo).
@@ -3781,6 +3843,13 @@ class ChocoletraBot:
                     propias.append(oid)
             if not propias:
                 return True  # CONFIRMADO: sin órdenes vivas del símbolo → abrir
+            known = self._owned_working_ids(ticker, ordenes)
+            unowned = [oid for oid in propias if oid not in known]
+            if unowned:
+                self._emit_log("WARN", f"[{ticker}] Orden(es) externas/identidad "
+                               "desconocida activas; no cancelar ni abrir/cerrar "
+                               "hasta reconciliar Schwab")
+                return False
             # Aún hay órdenes del símbolo: cancelarlas explícitamente y re-confirmar.
             for oid in propias:
                 cancelar_orden_compatible(self.ejecutor_hibrido,
@@ -3794,11 +3863,7 @@ class ChocoletraBot:
         return False
 
     def _reconciliar_huerfanas(self):
-        """RED DE SEGURIDAD por ciclo (modo real): adopta con protección cualquier
-        posición REAL del broker que el motor NO esté siguiendo. Es el invariante
-        que hace segura toda la gestión: aunque una ruta suelte un hueco con
-        acciones vivas, aquí se recuperan y protegen en el siguiente ciclo, así que
-        nunca quedan acciones huérfanas ni sin stop."""
+        """Protect audited GALA orphans; leave external positions to their owner."""
         if not self._has_real_tickers() or not self.account_number or not self._activo:
             return
         # Órdenes reales (STOP/cierre) requieren un token de trading vigente.
@@ -3814,6 +3879,8 @@ class ChocoletraBot:
         if posiciones is None:
             return
         ahora = datetime.now()
+        session_orders = None
+        session_orders_read = False
         for p in posiciones:
             ticker = str(p.get("symbol") or "").upper()
             cant = int(p.get("cantidad", 0) or 0)
@@ -3834,6 +3901,39 @@ class ChocoletraBot:
             ts_liq = self._liquidados_recientes.get(ticker)
             if ts_liq and (ahora - ts_liq).total_seconds() < self.COOLDOWN_LIQUIDACION_SEG:
                 continue
+            if not session_orders_read:
+                session_orders_read = True
+                reader = getattr(self.schwab, "obtener_ordenes_sesion", None)
+                try:
+                    session_orders = reader(self.account_number) if callable(reader) else None
+                except Exception:
+                    session_orders = None
+            from core.manual_close_reconciliation import verified_gala_orphan_entry
+
+            proof = verified_gala_orphan_entry(
+                session_orders, ticker=ticker, side=p.get("tipo"),
+                quantity=cant, broker_price=p.get("precio"),
+                submitted_entry_ids=self._gala_audited_order_ids(ticker, entry_only=True),
+                submitted_order_ids=self._gala_audited_order_ids(ticker),
+                session_ny=self._ahora_et().date().isoformat(),
+            )
+            if not proof:
+                with self._lock:
+                    quarantine = getattr(self, "_ticker_quarantine", {})
+                    first_seen = quarantine.get(ticker) != "EXTERNAL_BROKER_POSITION"
+                    if first_seen:
+                        quarantine[ticker] = "EXTERNAL_BROKER_POSITION"
+                        self._ticker_quarantine_health[ticker] = 0
+                if first_seen:
+                    self._emit_log("ERROR", f"[{ticker}] Posición broker sin entrada "
+                                   "GALA verificable; ticker REAL en cuarentena. "
+                                   "No se cancela, adopta ni liquida la posición externa.")
+                    self._audit_event(
+                        "EXTERNAL_BROKER_POSITION_QUARANTINED", ticker=ticker,
+                        estado="BROKER_EXPOSURE_UNOWNED", cantidad=cant,
+                        motivo="No exact GALA entry fill and audit link",
+                    )
+                continue
             self._emit_log("WARN", f"[{ticker}] Posición HUÉRFANA en el broker "
                                    f"({p.get('tipo')} {cant}@${float(p.get('precio', 0) or 0):.2f}) — "
                                    f"adoptando con protección (red de seguridad)")
@@ -3844,7 +3944,7 @@ class ChocoletraBot:
         # siga (p. ej. un take-profit/stop que quedó descansando tras cerrarse su
         # posición en una sesión anterior). El broker RECHAZA esas órdenes al madurar
         # (SELL/BUY [TO CLOSE] sobre una posición inexistente); aquí se limpian solas.
-        tickers_con_posicion = {p.get("symbol") for p in posiciones
+        tickers_con_posicion = {str(p.get("symbol") or "").upper() for p in posiciones
                                 if int(p.get("cantidad", 0) or 0) > 0}
         try:
             ordenes = self.schwab.obtener_ordenes_abiertas(self.account_number)
@@ -3855,7 +3955,25 @@ class ChocoletraBot:
         # confirmación de 2 ciclos ni ocultar una orden realmente huérfana).
         if ordenes is None:
             return
+        working_symbols = {self._symbol_from_broker_order(order)
+                           for order in self._iter_broker_orders(ordenes)}
+        for symbol, reason in list(getattr(self, "_ticker_quarantine", {}).items()):
+            if reason != "EXTERNAL_BROKER_POSITION":
+                continue
+            if symbol in tickers_con_posicion or symbol in working_symbols:
+                self._ticker_quarantine_health[symbol] = 0
+                continue
+            cycles = int(self._ticker_quarantine_health.get(symbol, 0) or 0) + 1
+            self._ticker_quarantine_health[symbol] = cycles
+            if cycles >= 2:
+                self._ticker_quarantine.pop(symbol, None)
+                self._ticker_quarantine_health.pop(symbol, None)
+                self._audit_event("EXTERNAL_BROKER_POSITION_FLAT", ticker=symbol,
+                                  estado="BROKER_FLAT", motivo="Two broker position/order reads flat")
+                self._emit_log("INFO", f"[{symbol}] Posición externa ya plana; "
+                               "cuarentena del ticker retirada")
         huerfanas_ahora = set()
+        audited_ids = {}
         for o in ordenes:
             try:
                 leg = (o.get("orderLegCollection") or [{}])[0]
@@ -3874,6 +3992,10 @@ class ChocoletraBot:
             with self._lock:
                 seguido = self._posiciones.get(sym) is not None
             if seguido or sym in tickers_con_posicion:
+                continue
+            known = audited_ids.setdefault(sym, self._owned_working_ids(sym, ordenes))
+            if oid not in known:
+                # A WORKING order from TOS/another app is never ours to cancel.
                 continue
             # Candidata a huérfana. Se exige verla huérfana en 2 ciclos consecutivos
             # antes de cancelar: un payload de posiciones parcial (200 incompleto por
@@ -3916,7 +4038,10 @@ class ChocoletraBot:
         # Cancelar CUALQUIER orden previa del símbolo antes de colocar el STOP nuevo:
         # una huérfana puede traer ya un stop viejo, y dos stops sobre las mismas
         # acciones sobre-venden (doble cierre → posición opuesta desnuda).
-        self._cancelar_ordenes_simbolo(ticker)
+        if self._cancelar_ordenes_simbolo(ticker) is False:
+            self._emit_log("ERROR", f"[{ticker}] Adopción GALA aplazada: órdenes "
+                           "externas/estado de órdenes sin verificar")
+            return
         sl = self.ejecutor_hibrido.colocar_salida(
             ticker, tipo, cant, sl_price, "STOP", self.account_number)
         sl_id = (sl or {}).get("order_id", "")
@@ -4480,6 +4605,55 @@ class ChocoletraBot:
         )
         return recovered
 
+    def _recuperar_cierre_manual_verificado(self, ticker, pos, cantidad_esperada):
+        """Read broker fills before treating a manually flattened REAL trade as risk-known."""
+        if (not pos.get("entry_order_id")
+                or (pos.get("entry_integrity") or {}).get("entry_confirmed") is not True
+                or pos.get("partial_price_pending")):
+            return {}
+        reader = getattr(getattr(self, "schwab", None), "obtener_ordenes_sesion", None)
+        if not callable(reader):
+            return {}
+        try:
+            orders = reader(self.account_number)
+            from core.manual_close_reconciliation import verified_manual_close
+
+            proof = verified_manual_close(
+                orders, ticker=ticker, side=pos.get("tipo"),
+                quantity=cantidad_esperada,
+                total_quantity=pos.get("orden").cantidad,
+                entry_order_id=pos.get("entry_order_id"),
+                entry_price=pos.get("entrada"),
+                managed_order_ids=(pos.get("entry_order_id"),
+                                   pos.get("sl_order_id"),
+                                   pos.get("tp1_order_id")),
+                session_ny=self._ahora_et().date().isoformat(),
+            )
+        except Exception:
+            return {}
+        if proof:
+            try:
+                state = self._refresh_broker_reconciliation(
+                    context="MANUAL_EXIT_VERIFICATION", require_flat=False)
+            except Exception:
+                return {}
+            if (not state.get("ok")
+                    or ticker in {str(row.get("ticker") or "").upper()
+                                  for row in state.get("positions") or []}
+                    or ticker in {str(symbol or "").upper()
+                                  for symbol in state.get("open_order_symbols") or []}):
+                return {}
+            self._audit_event(
+                "MANUAL_EXIT_BROKER_VERIFIED", ticker=ticker,
+                estado="FILLED", order_id=proof["order_id"],
+                cantidad=proof["quantity"], precio=proof["avg_price"],
+                parent_order_id=str(pos.get("entry_order_id") or ""),
+                motivo="External TOS close, excluded from GALA performance",
+                detalle={"order_type": proof["order_type"], "tag": proof["tag"],
+                         "broker_fill_time": proof["filled_at"]},
+            )
+        return proof
+
     def _cerrar_posicion(self, ticker: str, precio_salida: float, motivo: str = "") -> bool:
         """Cierra una posición SERIALIZANDO por ticker: si otro hilo ya está
         cerrando este ticker (worker vs kill switch), no se ejecuta un segundo
@@ -4616,6 +4790,7 @@ class ChocoletraBot:
         # by the time the local close path checks the position.
         sl_cancel_result = None
         exit_execution = {}
+        manual_exit = {}
         # v2.9.8: cualquier cierre REAL que NO sea la confirmación de un STOP
         # ya llenado debe cerrar la posición REAL en Schwab.  Antes se dependía de
         # textos concretos de ``motivo`` (reversión/kill switch/TP); una salida
@@ -4694,15 +4869,21 @@ class ChocoletraBot:
                             f"FILLED {close_order_id}",
                         )
                     else:
-                        # Without a broker-linked exit order we preserve the old
-                        # fail-closed behavior: the close can release local exposure,
-                        # but the observation remains quarantined from x/50.
-                        self._emit_log(
-                            "WARN",
-                            f"[{ticker}] Broker ya plano al procesar cierre ({motivo}); "
-                            "sin order-id de salida verificable, el aprendizaje se "
-                            "mantendrá en cuarentena.",
-                        )
+                        manual_exit = self._recuperar_cierre_manual_verificado(
+                            ticker, pos, expected_close_qty)
+                        if manual_exit:
+                            close_order_id = manual_exit["order_id"]
+                            actual_exit_price = manual_exit["avg_price"]
+                            exit_price_verified = True
+                            self._emit_log(
+                                "WARN", f"[{ticker}] Cierre manual verificado en Schwab "
+                                f"({close_order_id}); P/L aplicado al riesgo diario, "
+                                "operación excluida del rendimiento/aprendizaje GALA.")
+                        else:
+                            self._emit_log(
+                                "WARN", f"[{ticker}] Broker ya plano ({motivo}); "
+                                "sin fill de salida único y verificable. "
+                                "Contabilidad REAL en revisión.")
                     exit_confirmed = True
                 else:
                     # ``liquidar_posicion`` vuelve a leer Schwab y usa SU lado/cantidad
@@ -4949,9 +5130,15 @@ class ChocoletraBot:
                 "broker_confirmed": bool(exit_confirmed),
                 "fill_price_verified": bool(exit_price_verified),
                 "accounting_verified": accounting_verified,
+                "external_manual_exit": bool(manual_exit),
+                "manual_risk_verified": bool(manual_exit and accounting_verified),
                 "exit_execution": exit_execution,
             },
         )
+        if manual_exit and (not history_row or not audit_row):
+            self._require_real_accounting(
+                ticker, pos, "Cierre manual verificado pero ledger no persistido",
+                exit_order_id=close_order_id, broker_flat=True)
         close_integrity = {
             "ticker": ticker,
             **close_fields,
@@ -4959,7 +5146,7 @@ class ChocoletraBot:
             "exit_action": exit_action_for_state(position_state),
             "exit_order_id": close_order_id,
             "exit_confirmed": bool(
-                exit_confirmed and transition_ok
+                exit_confirmed and transition_ok and not manual_exit
                 and accounting_verified
             ),
             "fill_price_verified": bool(exit_price_verified),
@@ -4969,7 +5156,8 @@ class ChocoletraBot:
         try:
             try:
                 self.orquestador.al_cerrar(
-                    ticker, eff_exit, lifecycle=close_integrity
+                    ticker, None if manual_exit else eff_exit,
+                    lifecycle=close_integrity
                 )
             except TypeError:
                 # Compatibility with lightweight test doubles from earlier builds.
@@ -5825,15 +6013,42 @@ class ChocoletraBot:
             return True
 
         self._emit_log("WARN", f"RECONCILIACIÓN: {len(posiciones)} posición(es) abierta(s) "
-                               f"en Schwab al arrancar — readoptando para no quedar ciego")
+                               "en Schwab al arrancar; verificando propiedad antes de readoptar")
+
+        reader = getattr(self.schwab, "obtener_ordenes_sesion", None)
+        try:
+            session_orders = reader(self.account_number) if callable(reader) else None
+        except Exception:
+            session_orders = None
+        from core.manual_close_reconciliation import verified_gala_orphan_entry
 
         for p in posiciones:
             ticker, tipo, cant, entrada = p["symbol"], p["tipo"], p["cantidad"], p["precio"]
+            audited_ids = self._owned_working_ids(ticker, ordenes)
+            proof = verified_gala_orphan_entry(
+                session_orders, ticker=ticker, side=tipo, quantity=cant,
+                broker_price=entrada,
+                submitted_entry_ids=self._gala_audited_order_ids(ticker, entry_only=True),
+                submitted_order_ids=self._gala_audited_order_ids(ticker),
+                session_ny=self._ahora_et().date().isoformat(),
+            )
+            symbol_orders = [order for order in flat_ordenes
+                             if self._symbol_from_broker_order(order) == ticker]
+            unowned_working = any(str(order.get("orderId") or "") not in audited_ids
+                                  for order in symbol_orders)
+            if not proof or unowned_working:
+                self._ticker_quarantine[ticker] = "EXTERNAL_BROKER_POSITION"
+                self._ticker_quarantine_health[ticker] = 0
+                self._emit_log("ERROR", f"[{ticker}] Posición/orden broker sin "
+                               "propiedad GALA verificable; REAL en cuarentena. "
+                               "No se adopta ni liquida.")
+                continue
             sl_id, tp1_id, sl_price = "", "", entrada
             for o in ordenes:
                 try:
                     leg = o.get("orderLegCollection", [{}])[0]
-                    if leg.get("instrument", {}).get("symbol") != ticker:
+                    if (leg.get("instrument", {}).get("symbol") != ticker
+                            or str(o.get("orderId") or "") not in audited_ids):
                         continue
                     ot = str(o.get("orderType", "")).upper()
                     oid = str(o.get("orderId", ""))
@@ -5948,6 +6163,12 @@ class ChocoletraBot:
             except Exception:
                 reales = []
             ahora = datetime.now()
+            reader = getattr(self.schwab, "obtener_ordenes_sesion", None)
+            try:
+                session_orders = reader(self.account_number) if callable(reader) else None
+            except Exception:
+                session_orders = None
+            from core.manual_close_reconciliation import verified_gala_orphan_entry
             for p in (reales or []):
                 tk = p.get("symbol"); cant = int(p.get("cantidad", 0) or 0); tp = p.get("tipo")
                 if (
@@ -5961,6 +6182,18 @@ class ChocoletraBot:
                 # sobre-vendería (posición opuesta desnuda).
                 ts_liq = self._liquidados_recientes.get(tk)
                 if ts_liq and (ahora - ts_liq).total_seconds() < self.COOLDOWN_LIQUIDACION_SEG:
+                    continue
+                proof = verified_gala_orphan_entry(
+                    session_orders, ticker=tk, side=tp, quantity=cant,
+                    broker_price=p.get("precio"),
+                    submitted_entry_ids=self._gala_audited_order_ids(tk, entry_only=True),
+                    submitted_order_ids=self._gala_audited_order_ids(tk),
+                    session_ny=self._ahora_et().date().isoformat(),
+                )
+                if not proof:
+                    self._emit_log("ERROR", f"[{tk}] Kill switch: posición broker "
+                                   "sin propiedad GALA verificable; no se liquida "
+                                   "una operación manual/externa")
                     continue
                 self._emit_log("WARN", f"[{tk}] Kill switch — barrido final: posición real viva "
                                        f"{tp} {cant}, liquidando para quedar plano")

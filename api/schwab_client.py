@@ -1027,6 +1027,39 @@ class SchwabClient:
             _log(f"[ERROR] obtener_ordenes_abiertas: {e}{cuerpo}")
             return None  # None = no se pudo consultar (distinto de [] = sin órdenes)
 
+    def obtener_ordenes_sesion(self, account_number: str) -> Optional[list]:
+        """Read all current New York session orders for strict fill reconciliation.
+
+        An empty list is valid; a truncated or malformed result is unknown.
+        No order is submitted, canceled, or changed by this method.
+        """
+        if not account_number or not self._asegurar_token():
+            return None
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(timezone.utc)
+        start_ny = now.astimezone(ZoneInfo("America/New_York")).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        fmt = "%Y-%m-%dT%H:%M:%S.000Z"
+        try:
+            response = self._get_autorizado(
+                f"{TRADER_URL}/accounts/{account_number}/orders",
+                params={
+                    "fromEnteredTime": start_ny.astimezone(timezone.utc).strftime(fmt),
+                    "toEnteredTime": (now + timedelta(days=1)).strftime(fmt),
+                    "maxResults": 500,
+                },
+                timeout=15,
+            )
+            if response is None:
+                return None
+            response.raise_for_status()
+            orders = response.json()
+            return orders if valid_order_snapshot(orders) and len(orders) < 500 else None
+        except Exception as exc:
+            _log(f"[ERROR] obtener_ordenes_sesion: {type(exc).__name__}")
+            return None
+
     # ----------------------------------------------------------
     # COMPATIBILIDAD (alias viejo)
     # ----------------------------------------------------------

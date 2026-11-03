@@ -53,7 +53,7 @@ class RealAccountingGuard:
             else:
                 checked = annotate_history(rows)
             for i, row in enumerate(checked):
-                if not row["performance_verified"]:
+                if not row["accounting_verified"]:
                     self.require_reconciliation(
                         "history:" + date_ny + ":" + str(row.get("history_id") or row.get("position_id") or i),
                         ticker=row.get("ticker"), session_ny=date_ny,

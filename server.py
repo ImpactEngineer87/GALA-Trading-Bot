@@ -3073,6 +3073,17 @@ def _start_engine_controlled(source: str, capital: float = None):
             accounting_paper_fallback, accounting_reason = (
                 unresolved_real_accounting(cfg, BASE_DIR, account)
             )
+            if (not accounting_paper_fallback
+                    and accounting_reason == "EXACT_HISTORICAL_EXCEPTION_APPROVED"
+                    and (cfg.get("live_trading") or {}).get(
+                        "reviewed_manual_tsla_future_sessions") is True
+                    and not broker_confirmed_flat(cfg, account)):
+                mensaje = (
+                    "MODO REAL BLOQUEADO: la excepción histórica exige una "
+                    "lectura Schwab fresca con cuenta plana y cero órdenes "
+                    "pendientes al iniciar cada sesión.")
+                _log("ERROR", f"[MixedAccounting] {mensaje}")
+                return False, mensaje
             if accounting_paper_fallback:
                 # Do not strand real exposure by starting an engine that will
                 # intentionally quarantine its REAL entry universe.

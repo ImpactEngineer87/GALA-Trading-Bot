@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
+from zoneinfo import ZoneInfo
 
 from api.hybrid_order_executor import EjecutorHibridoDeOrdenes
 from core.daily_loss_guard import DailyLossGuard
@@ -39,6 +40,8 @@ class RealCloseAccountingTests(unittest.TestCase):
         bot._asegurar_ticker_limpio = Mock(return_value=True)
         bot._cantidad_real_broker = Mock(return_value=10)
         bot._recuperar_cierre_stop_llenado = Mock(return_value={})
+        bot._refresh_broker_reconciliation = Mock(return_value={
+            "ok": True, "positions": [], "open_order_symbols": []})
         bot._marcar_liquidado = Mock()
         bot.motor_señales = Mock()
         bot.orquestador = Mock()
@@ -102,6 +105,49 @@ class RealCloseAccountingTests(unittest.TestCase):
         self.assertEqual(self.last_close()["cantidad"], "10")
         self.assertEqual(self.last_close()["pnl_usd"], "")
         self.assertTrue(bot._real_accounting_status()["blocked"])
+
+    def test_verified_manual_close_counts_for_risk_but_not_gala_performance(self):
+        from core.dashboard_evidence import annotate_history
+        from tests.test_manual_close_reconciliation import order
+
+        bot = self.engine()
+        bot._cantidad_real_broker.return_value = 0
+        now = datetime.now(ZoneInfo("America/New_York"))
+        bot.schwab = Mock()
+        bot.schwab.obtener_ordenes_sesion.return_value = [
+            order("entry-1", "BUY", 37.66, now.replace(microsecond=0)),
+            order("manual-exit", "SELL", 37.595, now.replace(microsecond=0),
+                  tag="API_TOS:CHART", order_type="LIMIT"),
+        ]
+        # The broker parser requires the exit after the entry, not a coincident timestamp.
+        from datetime import timedelta
+        earlier = now - timedelta(seconds=5)
+        bot.schwab.obtener_ordenes_sesion.return_value[0]["orderActivityCollection"][0]["executionLegs"][0]["time"] = earlier.isoformat()
+        for raw in bot.schwab.obtener_ordenes_sesion.return_value:
+            raw["orderLegCollection"][0]["instrument"]["symbol"] = "NKE"
+            raw["quantity"] = raw["filledQuantity"] = 10
+            raw["orderActivityCollection"][0]["executionLegs"][0]["quantity"] = 10
+        bot._audit_event("ENTRY_FILLED", ticker="NKE", lado="BUY", estado="FILLED",
+                         order_id="entry-1", cantidad=10, precio=37.66,
+                         position_id="position-1", execution_id="execution-1",
+                         position_side="LONG", detalle={"broker_price_verified": True})
+
+        self.assertTrue(bot._cerrar_posicion_impl("NKE", 37.9, "external flat"))
+        self.assertAlmostEqual(bot.daily_loss_guard.realized_pnl(False), -0.65)
+        self.assertEqual(self.last_close()["order_id"], "manual-exit")
+        bot.orquestador.al_cerrar.assert_called_once()
+        self.assertIsNone(bot.orquestador.al_cerrar.call_args.args[1])
+        self.assertFalse(bot.orquestador.al_cerrar.call_args.kwargs["lifecycle"]["exit_confirmed"])
+        with (self.root / "history.csv").open(newline="") as handle:
+            history_rows = list(csv.DictReader(handle))
+        with (self.root / "audit.csv").open(newline="") as handle:
+            audit_rows = list(csv.DictReader(handle))
+        checked = annotate_history(history_rows, audit_rows)[-1]
+        self.assertTrue(checked["accounting_verified"])
+        self.assertFalse(checked["performance_verified"])
+        bot.real_accounting_guard.inspect_session(
+            self.root / "history.csv", self.root / "audit.csv", now.date().isoformat())
+        self.assertFalse(bot.real_accounting_guard.snapshot()["blocked"])
 
     def test_positive_unverified_price_or_unverified_entry_cannot_make_pnl(self):
         for flag in (False, None):

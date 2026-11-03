@@ -93,6 +93,8 @@ def annotate_history(history_rows, audit_rows=()):
     for row in rows:
         mode = mode_of(row)
         reason = ""
+        risk_reason = ""
+        manual_exit = False
         pnl = number(row.get("pnl_usd"))
         is_close = str(row.get("evento") or "").upper() == "POSITION_CLOSE"
         if not is_close:
@@ -104,10 +106,26 @@ def annotate_history(history_rows, audit_rows=()):
         elif all(_identity(row)) and latest_close.get(_identity(row)) is not row:
             reason = "Cierre duplicado; se conserva sólo el último registro"
         elif mode == "REAL":
-            reason = _real_close_reason(row, index.get(_identity(row), {}))
+            events = index.get(_identity(row), {})
+            risk_reason = _real_close_reason(row, events)
+            close_id = str(row.get("order_id") or "")
+            close = events.get(("POSITION_CLOSED", close_id)) if close_id else None
+            detail = _detail(close or {})
+            manual_exit = detail.get("external_manual_exit") is True
+            reason = risk_reason or (
+                "Cierre manual verificado; excluido del rendimiento GALA"
+                if manual_exit else "")
+            if manual_exit and detail.get("manual_risk_verified") is not True:
+                risk_reason = risk_reason or "Riesgo de cierre manual no verificado"
+        if mode == "REAL" and reason and reason != (
+                "Cierre manual verificado; excluido del rendimiento GALA"):
+            risk_reason = risk_reason or reason
+        row["accounting_verified"] = not bool(risk_reason or (
+            reason if mode != "REAL" else ""))
         row["performance_verified"] = not bool(reason)
         row["performance_exclusion_reason"] = reason
         row["pnl_source"] = (
+            "MANUAL_BROKER_FILL_GROSS" if manual_exit and row["accounting_verified"] else
             "UNVERIFIED" if reason else
             "PAPER_SIMULATION" if mode == "PAPER" else "LOCAL_RECORDED_FILLS_GROSS"
         )

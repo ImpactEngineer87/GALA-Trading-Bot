@@ -144,6 +144,15 @@ class SafeDiagnosticTests(unittest.TestCase):
         self.assertIsNone(diagnostic["content_type"])
         self.assertNotIn("secret-header", json.dumps(diagnostic))
 
+    def test_wrapped_invalid_refresh_grant_requests_new_authorization(self):
+        diagnostic = self.diagnostic(response(400, {
+            "error": "unsupported_token_type",
+            "error_description": '400 Bad Request: {"error":"invalid_grant",'
+                                 '"error_description":"Refresh token is invalid, expired or revoked"}',
+        }))
+        self.assertEqual(diagnostic["recommended_action"], "NEW_AUTHORIZATION_CODE")
+        self.assertEqual(diagnostic["oauth_error"], "unsupported_token_type")
+
     def test_known_secret_is_redacted_even_from_content_type(self):
         diagnostic = self.diagnostic(
             response(403, text="Denied", headers={"Content-Type": "private-secret/json"}),
@@ -204,6 +213,19 @@ class OAuthExchangeTests(unittest.TestCase):
                 self.assertEqual(caught.exception.last_status, status)
                 self.assertEqual(caught.exception.remaining_seconds, delay)
                 post.assert_called_once()
+
+    def test_rejected_invalid_refresh_grant_pauses_retries_until_reconnect(self):
+        post = Mock(return_value=response(400, {
+            "error": "unsupported_token_type",
+            "error_description": '400 Bad Request: {"error":"invalid_grant"}',
+        }))
+        with patch.object(schwab_oauth.time, "monotonic", return_value=1000):
+            with self.assertRaises(schwab_oauth.SchwabOAuthFailure):
+                self.refresh(post)
+            with self.assertRaises(schwab_oauth.SchwabOAuthCooldown) as caught:
+                self.refresh(post)
+        self.assertEqual(caught.exception.remaining_seconds, 300)
+        post.assert_called_once()
 
     def test_manual_authorization_bypasses_and_clears_refresh_cooldown(self):
         post = Mock(side_effect=[

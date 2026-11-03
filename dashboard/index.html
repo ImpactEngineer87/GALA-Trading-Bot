@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.15</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.16</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -1671,8 +1671,10 @@ function updateDailyRisk(risk){
   const blocked = !!risk.blocked;
   const accounting = risk.real_accounting || {};
   const accountingBlocked = !!(accounting.entry_blocked ?? accounting.blocked);
-  const approvalExpired = accountingBlocked && accounting.historical_resume_reason === 'ARCHIVED_APPROVAL_EXPIRED';
+  const approvalExpired = accountingBlocked && ['ARCHIVED_APPROVAL_EXPIRED', 'MANUAL_TSLA_APPROVAL_EXPIRED'].includes(accounting.historical_resume_reason);
   const historicalPending = !!accounting.blocked && !accountingBlocked;
+  const reviewedManualTsla = historicalPending && accounting.manual_tsla_resume_active === true;
+  const reviewedAcrossSessions = reviewedManualTsla && accounting.reviewed_future_sessions_enabled === true;
   const net = risk.net_pnl == null ? null : Number(risk.net_pnl);
   const limit = Number(risk.limit_usd || 0);
   const room = risk.remaining_to_limit_usd == null ? null : Number(risk.remaining_to_limit_usd);
@@ -1686,6 +1688,10 @@ function updateDailyRisk(risk){
     ? '⛔ NUEVAS ENTRADAS REAL BLOQUEADAS: CONTABILIDAD PENDIENTE'
     : blocked
     ? '⛔ BLOQUEADO POR PÉRDIDA DIARIA'
+    : reviewedManualTsla
+    ? (reviewedAcrossSessions
+      ? '📋 TSLA MANUAL REVISADO · ENTRADAS REAL PERMITIDAS'
+      : '📋 TSLA MANUAL REVISADO · ENTRADAS REAL PERMITIDAS ESTA SESIÓN')
     : historicalPending
     ? '📋 CONTABILIDAD HISTÓRICA PENDIENTE · EXCEPCIÓN DE ENTRADA VIGENTE'
     : (enabled ? '🛡️ Kill Switch diario preparado' : '⚠️ Kill Switch diario desactivado');
@@ -1697,6 +1703,10 @@ function updateDailyRisk(risk){
     ? `Reconciliar ejecuciones Schwab · ${(risk.real_accounting.reasons || []).join('; ')} · protecciones existentes siguen activas`
     : blocked
     ? `${risk.trigger_mode || risk.mode || 'PAPER'} · ${risk.reason || ''} · reinicio ${risk.next_reset_at_ny || 'próxima sesión NY'}`
+    : reviewedManualTsla
+    ? (reviewedAcrossSessions
+      ? 'Las siete órdenes manuales TSLA del 2 de noviembre siguen fuera del P/L y del entrenamiento de GALA. La revisión histórica sigue vigente solo mientras sus registros no cambien; cada arranque requiere Schwab plano y cero órdenes pendientes. Los controles de riesgo siguen activos.'
+      : `Las siete órdenes manuales TSLA del 2 de noviembre siguen fuera del P/L y del entrenamiento de GALA. Permiso de nuevas entradas válido solo para ${accounting.authorization_session_ny} (NY); controles de broker y riesgo activos.`)
     : historicalPending
     ? `Registros históricos sin resolver. Autorización válida únicamente para ${accounting.authorization_session_ny || 'esta sesión'} (NY). Los controles de riesgo, modelo y broker siguen activos.`
     : `${risk.mode || 'PAPER'} · Realizado ${money(realized)} · No realizado ${money(unrealized)}${risk.pricing_complete === false ? ' · valoración incompleta' : ''}`;
