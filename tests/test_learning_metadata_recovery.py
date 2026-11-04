@@ -9,11 +9,11 @@ class LearningMetadataRecoveryTests(unittest.TestCase):
             entry_order_id='entry',exit_order_id='exit',execution_valid='1',
             timestamp='2026-09-24 15:16:01',precio_entrada='223.76',precio_salida='223.63',
             closed_utc='',risk_per_share='')
-        entry={**row,'evento':'ENTRY_FILLED','order_id':'entry','precio':'223.76','cantidad':'10',
+        entry={**row,'lado':'SELL','evento':'ENTRY_FILLED','order_id':'entry','precio':'223.76','cantidad':'10',
             'timestamp_utc':'2026-09-24T19:16:03+00:00','detalle':'{"stop_loss":224.18}'}
         close={**row,'evento':'POSITION_CLOSED','order_id':'exit',
             'timestamp_utc':'2026-09-24T19:45:02.352+00:00'}
-        history={**row,'evento':'POSITION_CLOSE','order_id':'exit','parent_order_id':'entry',
+        history={**row,'lado':'SELL','evento':'POSITION_CLOSE','order_id':'exit','parent_order_id':'entry',
             'entrada':'223.76','salida':'223.63','cantidad':'10','pnl_usd':'1.30',
             'timestamp_utc':'2026-09-24T19:45:02.242+00:00'}
         return row,entry,close,history

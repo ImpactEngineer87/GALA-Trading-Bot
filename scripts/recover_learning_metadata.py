@@ -65,7 +65,7 @@ def recover_metadata(row, audit, history):
             float(entry['cantidad']),float(h['pnl_usd']))
         if not all(math.isfinite(v) for v in (h_entry,h_exit,a_entry,a_quantity,pnl)):
             return {}
-        if (h.get('tipo') != row['tipo'] or entry.get('tipo') != row['tipo']
+        if (h.get('lado') != row['tipo'] or entry.get('lado') != row['tipo']
                 or abs(h_entry-price)>1e-5 or abs(h_exit-exit_price)>1e-5
                 or abs(a_entry-price)>1e-5 or a_quantity!=quantity):
             return {}
