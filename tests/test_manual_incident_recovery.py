@@ -21,6 +21,10 @@ class ManualIncidentRecoveryTests(unittest.TestCase):
         self.state = copy.deepcopy(self.baseline)
         self.state['unresolved'].update({key: {'ticker': 'BA'} for key in
             [MANAGED, ORPHAN, *['history:' + DAY + ':' + r['history_id'] for r in self.history]]})
+        for key in (MANAGED, ORPHAN):
+            self.state['unresolved'][key].update(entry_order_id=ENTRY if key == MANAGED else '',
+                exit_order_id=REJECTED, broker_flat=True, broker_exit_price=None,
+                requested_exit_price=176.59)
         self.audit = [dict(fecha=DAY, modo='REAL', ticker='BA', evento='ENTRY_FILLED',
                            position_id=MANAGED, order_id=ENTRY)]
         start = datetime(2026, 11, 4, 10, 17, tzinfo=ZoneInfo('America/New_York'))

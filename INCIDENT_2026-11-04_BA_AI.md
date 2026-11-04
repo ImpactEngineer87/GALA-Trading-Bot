@@ -50,6 +50,12 @@ validation accuracy, training progress, and a promotion decision.
 - Add opt-in complete_evidence_only training. This selects recorded close times
   and finite cost/risk evidence without editing feedback or x/50 counters.
   Production validation and manual promotion requirements remain enforced.
+- Quarantine both PAPER observations when concurrent engines opened distinct
+  positions for the same ticker, side and exact strategy candle. Conflicting
+  outcomes cannot be selected retrospectively. Superseding feedback eligibility
+  and explicit audit exclusions preserve the original rows and remove ambiguous
+  examples from training, x/50 counts and performance summaries. Raw historical
+  risk tallies are retained; this never grants additional daily trading capacity.
 
 ## Bounded incident recovery
 

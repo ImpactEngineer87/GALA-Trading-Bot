@@ -47,6 +47,13 @@ def proof_for(state, baseline, audit, history, orders):
     for key in keys:
         row = expected['unresolved'].pop(key)
         require(row.get('ticker') == 'BA', 'GUARD_SYMBOL_CHANGED')
+        if key in {MANAGED, ORPHAN}:
+            require(row.get('entry_order_id') == (ENTRY if key == MANAGED else '')
+                    and row.get('exit_order_id') == REJECTED
+                    and row.get('broker_flat') is True
+                    and row.get('broker_exit_price') is None
+                    and row.get('requested_exit_price') == 176.59,
+                    'RUNTIME_GUARD_EVIDENCE_CHANGED')
     require(expected == baseline, 'OTHER_ACCOUNTING_CHANGED')
     events = [r for r in audit if r.get('fecha') == DAY and r.get('modo') == 'REAL'
               and r.get('ticker') == 'BA']

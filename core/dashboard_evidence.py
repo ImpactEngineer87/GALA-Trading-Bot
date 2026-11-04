@@ -72,9 +72,13 @@ def annotate_history(history_rows, audit_rows=()):
     rows = [dict(row) for row in history_rows]
     wanted = {_identity(r) for r in rows if mode_of(r) == "REAL"}
     index = defaultdict(dict)
+    paper_quarantine = {}
     for event in audit_rows:
         key = _identity(event)
         kind = str(event.get("evento") or "").upper()
+        if mode_of(event) == 'PAPER' and kind == 'PAPER_OBSERVATION_QUARANTINED' and all(key):
+            paper_quarantine[key] = str(event.get('motivo') or 'Simulación ambigua')
+            continue
         if (key not in wanted or mode_of(event) != "REAL"
                 or kind not in {"ENTRY_FILLED", "POSITION_CLOSED", "TP1_FILLED_70_PERCENT"}):
             continue
@@ -105,6 +109,8 @@ def annotate_history(history_rows, audit_rows=()):
             reason = "P/L ausente o inválido"
         elif all(_identity(row)) and latest_close.get(_identity(row)) is not row:
             reason = "Cierre duplicado; se conserva sólo el último registro"
+        elif mode == 'PAPER' and _identity(row) in paper_quarantine:
+            reason = paper_quarantine[_identity(row)]
         elif mode == "REAL":
             events = index.get(_identity(row), {})
             risk_reason = _real_close_reason(row, events)
