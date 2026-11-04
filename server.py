@@ -862,6 +862,10 @@ def _engine_daily_risk_snapshot():
         with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
             cfg = yaml.safe_load(fh) or {}
         paper = bool((cfg.get("risk", {}) or {}).get("paper_trading", True))
+        if (cfg.get('live_trading') or {}).get('per_ticker_execution'):
+            # Match the running engine: selected REAL tickers determine the
+            # displayed risk mode even while the engine is stopped.
+            paper = not bool(_real_tickers_runtime(cfg))
         guard = DailyLossGuard(
             cfg,
             history_path=_history_path(),

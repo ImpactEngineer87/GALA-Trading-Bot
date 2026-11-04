@@ -1,5 +1,6 @@
 """Exercise the real controller/runner failure race with an offline engine."""
 from pathlib import Path
+import json
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -144,6 +145,20 @@ class EngineRuntimeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json['bot']['server_version'], server._SERVER_VERSION)
         self.assertIsNone(response.json['bot']['engine_runtime']['thread_started_at_ny'])
+
+    def test_stopped_mixed_dashboard_shows_real_risk_for_selected_real_tickers(self):
+        cfg = {'risk':{'paper_trading':True}, 'live_trading':{'per_ticker_execution':True},
+               'execution_engine':{'accounting_state_path':str(self.root/'accounting.json')}}
+        path = self.root/'config.yaml'
+        path.write_text(json.dumps(cfg))
+        guard = Mock()
+        guard.snapshot.return_value = {'mode':'REAL'}
+        with patch.object(server, 'CONFIG_PATH', str(path)), patch.object(
+                server, '_real_tickers_runtime', return_value=['BA']), patch.object(
+                server, 'DailyLossGuard', return_value=guard):
+            result = server._engine_daily_risk_snapshot()
+        self.assertEqual(result['mode'], 'REAL')
+        guard.snapshot.assert_called_once_with(False, unrealized_pnl=0.0)
 
 
 if __name__ == '__main__':
