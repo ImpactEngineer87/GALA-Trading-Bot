@@ -149,6 +149,7 @@ class EntrenadorAgentes:
         self.retrain_state_path: str = resolve_runtime_path(
             auto_cfg.get("state_path", "data/retraining_state.json"))
         self.min_muestras: int = cfg.get("min_muestras", 40)
+        self.complete_evidence_only = bool(cfg.get("complete_evidence_only", False))
         self.umbral_meta: float = cfg.get("umbral_meta_filtro", 0.50)
         self.min_test_muestras: int = int(cfg.get("min_test_muestras", 20))
         self.min_validation_muestras: int = int(
@@ -608,6 +609,11 @@ class EntrenadorAgentes:
             "volumen_relativo_20", "liquidez_dolar_log", *GALA10_FEATURE_NAMES,
         ]).copy()
         df["_net_r"] = net_trade_returns(df, self.round_trip_cost_bps)
+        if self.complete_evidence_only:
+            # Old rows without outcome time/risk must not permanently poison
+            # every future production evaluation. Keep the original ledger and
+            # x/50 counters; train/evaluate only the complete recorded cohort.
+            df = df[df["_closed_utc"].notna() & np.isfinite(df["_net_r"])].copy()
         known = np.isfinite(df["_net_r"])
         df.loc[known, "ganadora"] = (df.loc[known, "_net_r"] > 0).astype(int)
         return df.sort_values("_timestamp", kind="stable").reset_index(drop=True)
@@ -840,6 +846,8 @@ class EntrenadorAgentes:
             "ticker": ticker,
             "evaluation_id": evaluation_id,
             "evaluation_model_policy": "causal_fit_only_cost_aware_v2",
+            "training_evidence_policy": (
+                "COMPLETE_ONLY" if self.complete_evidence_only else "LEGACY_SHADOW"),
             "model_version": evaluation_id,
             "evaluation_utc": evaluation_utc,
             "evaluation_test_start": test_window_start,
@@ -1349,6 +1357,8 @@ class EntrenadorAgentes:
             row["training_readiness"] = {
                 "ready": ready, "reason": reason,
                 "min_samples": int(minimum), "eligible_samples": len(group),
+                "evidence_policy": (
+                    "COMPLETE_ONLY" if self.complete_evidence_only else "LEGACY_SHADOW"),
             }
         return rows
 

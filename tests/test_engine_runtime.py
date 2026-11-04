@@ -76,6 +76,30 @@ class EngineRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime['state'], 'STARTING')
         self.assertIsNone(runtime['thread_started_at_ny'])
 
+    def test_stop_before_runner_starts_cancels_that_exact_launch(self):
+        self.bot.detener.return_value = {'broker_flat': True}
+        with patch.object(server.threading, 'Thread', DeferredThread):
+            server._start_engine_controlled('dashboard')
+        old = server._engine_thread
+        ok, _ = server._stop_engine_controlled('dashboard')
+        self.assertFalse(ok)
+        self.assertIs(server._ENGINE, self.bot)
+        self.assertTrue(self.bot._start_cancel_event.is_set())
+        old.target()
+        self.bot.iniciar.assert_not_called()
+        self.assertFalse(server.BOT_STATE['running'])
+
+    def test_live_cancelled_runner_blocks_replacement_even_when_ui_is_stopped(self):
+        with patch.object(server.threading, 'Thread', DeferredThread):
+            server._start_engine_controlled('dashboard')
+        old = server._engine_thread
+        server.BOT_STATE['running'] = False
+        self.bot._start_cancel_event.set()
+        ok, message = server._start_engine_controlled('dashboard')
+        self.assertFalse(ok)
+        self.assertIn('deteniéndose', message)
+        self.assertIs(server._engine_thread, old)
+
     def test_delayed_failure_sets_error_and_retains_recovery_object(self):
         with patch.object(server.threading, 'Thread', DeferredThread):
             server._start_engine('paper', 10000)

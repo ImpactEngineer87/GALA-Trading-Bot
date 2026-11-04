@@ -123,6 +123,8 @@ class DailyLossGuard:
             # A damaged history must not disable the guard.  It starts from zero
             # and new realized events will continue to be persisted in state.
             return {"PAPER": 0.0, "REAL": 0.0}
+        from core.manual_accounting_resolution import manual_risk_adjustment
+        totals['REAL'] += manual_risk_adjustment(self.history_path.parent, session_date)
         return totals
 
     def _load_or_initialize(self) -> None:

@@ -46,6 +46,11 @@ class RealAccountingGuard:
                         and (r.get("evento") or "POSITION_CLOSE") == "POSITION_CLOSE"]
             if not rows:
                 return
+            from core.manual_accounting_resolution import load_resolutions, history_resolved
+            resolutions = load_resolutions(self.store.path.parent)
+            rows = [row for row in rows if not history_resolved(row, resolutions)]
+            if not rows:
+                return
             audit = Path(audit_path)
             if audit.exists():
                 with audit.open(encoding="utf-8-sig", newline="") as handle:

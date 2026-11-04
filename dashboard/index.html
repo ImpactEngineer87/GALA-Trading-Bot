@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.16</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.17</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -1836,6 +1836,7 @@ function renderSignalFeed(id, sigs){
     const threshold = (s.ai_context||{}).threshold == null
       ? s.ai_threshold
       : Number((s.ai_context||{}).threshold);
+    const modelProbability = financialNumber((s.ai_context||{}).raw_probability ?? s.prob_ia);
     return `
     <div class="signal-row clickable" role="button" tabindex="0"
          data-ticker="${ticker}" data-signal-id="${signalId}"
@@ -1845,9 +1846,9 @@ function renderSignalFeed(id, sigs){
       <span class="sig-ticker">${ticker||'—'}</span>
       <span class="sig-price" title="Referencia de estrategia; no es precio de ejecución">Señal ${positiveMoney(s.precio)}</span>
       <span class="sig-ia">${
-        s.prob_ia == null
+        modelProbability == null
           ? 'IA: N/A'
-          : `IA: ${(s.prob_ia*100).toFixed(0)}%${threshold == null ? '' : ` / umbral:${(Number(threshold)*100).toFixed(0)}%`}`
+          : `IA: ${(modelProbability*100).toFixed(2)}%${threshold == null ? '' : ` / umbral:${(Number(threshold)*100).toFixed(2)}%`}`
       }</span>
       <span class="pill ${String(s.ai_decision||'').includes('VETO') || String(s.ai_decision||'').includes('BLOCKED') ? 'real' : 'paper'}" title="${escHtml(s.motivo||'')}">${escHtml(s.ai_decision||s.motivo||'SEÑAL')}</span>
       <span class="pill" title="Registro local enlazado por señal, fecha, ticker y modo; no consulta de órdenes en vivo">${escHtml(s.execution_mode||'Modo sin verificar')} · ${escHtml(s.execution_evidence?.label||'Ejecución sin verificar')}${s.execution_evidence?.reason_code?' · '+escHtml(s.execution_evidence.reason_code):''}</span>
@@ -1857,6 +1858,7 @@ function renderSignalFeed(id, sigs){
         <div>Modelo: ${escHtml((s.ai_context||{}).model_version || 'N/A')} · ${escHtml((s.ai_context||{}).model_tier || 'N/A')}</div>
         <div>Balanced accuracy: ${(s.ai_context||{}).balanced_accuracy == null ? 'N/A' : Number(s.ai_context.balanced_accuracy).toFixed(2)+'%'} · Régimen: ${escHtml((s.ai_context||{}).market_regime || 'N/A')}</div>
         <div>Probabilidad del modelo: ${(s.ai_context||{}).raw_probability == null ? 'N/A' : (Number(s.ai_context.raw_probability)*100).toFixed(2)+'%'} · Estado: ${escHtml((s.ai_context||{}).production_status || 'N/A')}</div>
+        <div>Señal de estrategia: ${escHtml((s.ai_context||{}).strategy_signal || s.tipo || 'N/A')} · Regla: ${escHtml((s.ai_context||{}).hard_veto_reason || 'Ver motivo registrado')} · Puntuación tras política: ${s.prob_ia == null ? 'N/A' : (Number(s.prob_ia)*100).toFixed(2)+'%'}</div>
         <div>Entrenado: ${escHtml((s.ai_context||{}).training_date || 'N/A')} · Validado: ${escHtml((s.ai_context||{}).validation_date || 'N/A')}</div>
         ${(s.ai_context||{}).manual_authorization ? '<div>Autorización manual aplicada: '+escHtml(s.ai_context.manual_authorization.reason)+'</div>' : ''}
       </details>

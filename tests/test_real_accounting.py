@@ -107,10 +107,18 @@ class RealCloseAccountingTests(unittest.TestCase):
         self.assertTrue(bot._real_accounting_status()["blocked"])
 
     def test_verified_manual_close_counts_for_risk_but_not_gala_performance(self):
+        self._exercise_verified_manual_close(pending=False)
+
+    def test_rejected_pending_exit_does_not_hide_verified_manual_close(self):
+        self._exercise_verified_manual_close(pending=True)
+
+    def _exercise_verified_manual_close(self, *, pending):
         from core.dashboard_evidence import annotate_history
         from tests.test_manual_close_reconciliation import order
 
         bot = self.engine()
+        bot.ejecutor_hibrido.has_pending_exit.return_value = pending
+        bot.ejecutor_hibrido.retire_pending_exit_after_authoritative_flat.return_value = True
         bot._cantidad_real_broker.return_value = 0
         now = datetime.now(ZoneInfo("America/New_York"))
         bot.schwab = Mock()
@@ -135,6 +143,9 @@ class RealCloseAccountingTests(unittest.TestCase):
         self.assertTrue(bot._cerrar_posicion_impl("NKE", 37.9, "external flat"))
         self.assertAlmostEqual(bot.daily_loss_guard.realized_pnl(False), -0.65)
         self.assertEqual(self.last_close()["order_id"], "manual-exit")
+        bot.ejecutor_hibrido.liquidar_posicion.assert_not_called()
+        if pending:
+            bot.ejecutor_hibrido.retire_pending_exit_after_authoritative_flat.assert_called_once()
         bot.orquestador.al_cerrar.assert_called_once()
         self.assertIsNone(bot.orquestador.al_cerrar.call_args.args[1])
         self.assertFalse(bot.orquestador.al_cerrar.call_args.kwargs["lifecycle"]["exit_confirmed"])

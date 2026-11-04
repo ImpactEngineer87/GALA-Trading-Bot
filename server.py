@@ -2761,6 +2761,9 @@ def _start_engine(mode: str, capital: float):
     from engine.bot_engine import ChocoletraBot
 
     bot = ChocoletraBot(CONFIG_PATH)
+    # A stop can arrive while iniciar() is still preparing feeds/authentication.
+    # Keep cancellation attached to this instance so startup cannot revive it.
+    bot._start_cancel_event = threading.Event()
     bot.orquestador.entrenador.automatic_training_allowed = _get_auto_ai_service().allowed_now
     bot._ticker_quarantine.update(_STARTUP_QUARANTINE)
 
@@ -2811,6 +2814,8 @@ def _start_engine(mode: str, capital: float):
             runtime['state'] = 'THREAD_RUNNING'
             runtime['thread_started_at_utc'] = datetime.now(timezone.utc).isoformat()
         try:
+            if bot._start_cancel_event.is_set():
+                return
             _log('INFO', f'[Motor] HILO INICIADO (modo: {mode.upper()})')
             bot.iniciar(tickers=tickers, account_number=bot.account_number, capital=capital)
         except Exception as e:
@@ -3012,6 +3017,13 @@ def _start_engine_controlled(source: str, capital: float = None):
     with _ENGINE_CONTROL_LOCK:
         origen_req = "horario automático" if source == "scheduler" else "dashboard"
         _log("INFO", f"[Motor] SOLICITUD DE ARRANQUE desde {origen_req}")
+        thread = _engine_thread
+        if thread is not None and thread.is_alive():
+            cancel = getattr(_ENGINE, '_start_cancel_event', None)
+            if cancel is not None and cancel.is_set():
+                return False, "El motor anterior sigue deteniéndose; espere antes de reiniciar"
+            BOT_STATE['running'] = True
+            return True, "El motor ya está iniciándose o en ejecución"
         if BOT_STATE["running"] and _ENGINE is not None:
             return True, "El motor ya está en ejecución"
         if _ai_training_busy():
@@ -3207,6 +3219,9 @@ def _stop_engine_controlled(source: str):
         _log("WARN", f"[Motor] SOLICITUD DE PARADA desde {origen}")
         BOT_STATE["running"] = False
         bot = _ENGINE
+        cancel = getattr(bot, '_start_cancel_event', None)
+        if cancel is not None:
+            cancel.set()
         result = {}
         if bot is not None:
             try:
@@ -3222,6 +3237,16 @@ def _stop_engine_controlled(source: str):
         broker_flat = True
         if isinstance(result, dict) and "broker_flat" in result:
             broker_flat = bool(result.get("broker_flat"))
+        thread = _engine_thread
+        if (thread is not None and thread.is_alive()
+                and thread is not threading.current_thread()
+                and callable(getattr(thread, 'join', None))):
+            thread.join(timeout=5.0)
+        if thread is not None and thread.is_alive():
+            # Retain the only recovery object until its runner has really ended.
+            # The next start request must not launch a second trading engine.
+            _ENGINE = bot
+            return False, "Motor deteniéndose; espere a que termine el hilo antes de reiniciar"
         if broker_flat:
             _ENGINE = None
             _log(

@@ -220,6 +220,23 @@ class LearningTrainingTests(unittest.TestCase):
         self.assertFalse(metrics["production_gate_passed"])
         self.assertEqual(metrics["unknown_close_timestamps"], 120)
 
+    def test_complete_cohort_excludes_unknown_evidence_without_changing_ledger_or_counts(self):
+        self.trainer.complete_evidence_only = True
+        valid = self.trades()
+        legacy = self.trades(50).assign(closed_utc=None, risk_per_share=None,
+                                        position_id=lambda f: 'legacy-' + f.position_id)
+        rows = pd.concat([legacy, valid], ignore_index=True)
+        rows.to_csv(self.trainer.feedback_path, index=False)
+        original = Path(self.trainer.feedback_path).read_bytes()
+        with patch.dict('sys.modules', {'xgboost': SimpleNamespace(XGBClassifier=FixedClassifier)}):
+            metrics = self.trainer.entrenar_ticker('AAPL', automatic=True)
+        self.assertEqual(metrics['training_evidence_policy'], 'COMPLETE_ONLY')
+        self.assertTrue(metrics['temporal_integrity_passed'])
+        self.assertTrue(metrics['cost_label_integrity_passed'])
+        self.assertEqual(metrics['muestras'], 120)
+        self.assertEqual(Path(self.trainer.feedback_path).read_bytes(), original)
+        self.assertEqual(self.trainer.retraining_status(['AAPL'])[0]['total_observations'], 170)
+
     def test_automatic_candidate_cannot_activate_even_with_explicit_legacy_permission(self):
         self.trades().to_csv(self.trainer.feedback_path, index=False)
         self.trainer.auto_activate_production = True

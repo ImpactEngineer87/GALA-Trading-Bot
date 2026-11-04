@@ -1167,6 +1167,9 @@ class ChocoletraBot:
     def iniciar(self, tickers: Optional[List[str]] = None,
                 account_number: str = "", capital: float = 10000.0):
         """Inicia el motor real con todos los módulos y agentes activos."""
+        cancel = getattr(self, '_start_cancel_event', None)
+        if cancel is not None and cancel.is_set():
+            return
         if tickers:
             self.tickers = [str(t).strip().upper() for t in tickers if str(t).strip()]
 
@@ -1244,13 +1247,21 @@ class ChocoletraBot:
             pass
         self.tos_reader.iniciar_monitoreo(self.tickers)
 
-        self._activo = True
+        with self._lock:
+            cancel = getattr(self, '_start_cancel_event', None)
+            if cancel is not None and cancel.is_set():
+                self.tos_reader.detener()
+                return
+            self._activo = True
         self._fin_sesion_alcanzado = False
         self._post_session_retrain_scheduled = False
 
         # Modo real: preparar credenciales de TRADING (token de usuario fresco +
         # hash de cuenta) ANTES de reconciliar o enviar cualquier orden.
         self._preparar_trading_real()
+
+        if not self._activo or (cancel is not None and cancel.is_set()):
+            return
 
         # Reconciliación tras reinicio: readoptar posiciones reales abiertas en
         # Schwab (si el VPS se reinició en mitad de una operación) para no quedar
@@ -1430,6 +1441,9 @@ class ChocoletraBot:
         v3.3.2 keeps normal shutdown idempotent while allowing a later stop call
         to retry *only* unresolved REAL exposure.
         """
+        cancel = getattr(self, '_start_cancel_event', None)
+        if cancel is not None:
+            cancel.set()
         # Some recovery/test integrations instantiate the engine through
         # ``__new__``.  Lazily initialize the shutdown guard for compatibility.
         if not hasattr(self, "_stop_lock"):
@@ -1486,7 +1500,8 @@ class ChocoletraBot:
         if fin_sesion is not None:
             self._fin_sesion_alcanzado = bool(fin_sesion)
         already_stopped = not self._activo and not self._posiciones
-        self._activo = False
+        with self._lock:
+            self._activo = False
         self._detener_monitor_ordenes()
         broker_state = dict(getattr(self, "_broker_reconciliation", {}) or {})
         if not already_stopped:
@@ -1849,6 +1864,9 @@ class ChocoletraBot:
         ai_context = dict(getattr(decision, 'ai_model_snapshot', {}) or {})
         ai_context.update(market_regime=getattr(decision, 'market_regime', 'UNKNOWN'),
                           raw_probability=getattr(decision, 'ai_raw_probability', None),
+                          strategy_signal=senal_gala10,
+                          policy_score=decision.prob_meta,
+                          hard_veto_reason=getattr(decision, 'hard_veto_reason', ''),
                           manual_authorization=getattr(decision, 'ai_manual_authorization', None))
         # v3.3.1: persist both decision wall-clock time (server hook) and the
         # exact closed bar that generated GALA10.  The 1m loop can emit at
@@ -2258,10 +2276,33 @@ class ChocoletraBot:
             return None
         vela_id = df_1m.index[-1]
         with self._lock:
-            if self._ultima_vela_procesada.get(ticker) == vela_id:
+            previous_bar = self._ultima_vela_procesada.get(ticker)
+            if previous_bar == vela_id:
                 return None
         try:
             df_calc = self.estrategia.calcular(df_1m)
+            # A slow broker cycle may skip several closed candles. Preserve
+            # their strategy signals on the chart, with explicit missed timing;
+            # only the latest closed candle can authorize a current entry.
+            if previous_bar is not None:
+                missed = df_calc[(df_calc.index > previous_bar) & (df_calc.index < vela_id)]
+                for bar, row in missed.iterrows():
+                    side = row.get('señal')
+                    if side not in ('BUY', 'SELL'):
+                        continue
+                    stamp = pd.Timestamp(bar)
+                    stamp = stamp.tz_localize('UTC') if stamp.tzinfo is None else stamp.tz_convert('UTC')
+                    signal = self._emit_signal(side, ticker, float(row['close']),
+                        float(row.get('atr', 0) or 0), None,
+                        motivo='MISSED_BAR_EVALUATION: señal de vela cerrada registrada tarde',
+                        execution_mode=self.execution_mode_for(ticker),
+                        ai_decision='MISSED_EVALUATION', ai_context={
+                            'strategy_signal': side, 'signal_bar_epoch_ms': int(stamp.timestamp()*1000),
+                            'signal_bar_timestamp_iso': stamp.isoformat(),
+                            'timing': 'MISSED_CLOSED_BAR', 'raw_probability': None})
+                    self._audit_event('SIGNAL_EXECUTION_SKIPPED', ticker=ticker,
+                        signal_id=str((signal or {}).get('signal_id') or ''),
+                        lado=side, estado='NO_ORDER_SENT', motivo='MISSED_BAR_EVALUATION')
             señal = df_calc["señal"].iloc[-1]
             if señal in ("BUY", "SELL"):
                 contexto = extraer_features_gala10(
@@ -2305,6 +2346,10 @@ class ChocoletraBot:
                     self._emit_log("WARN", f"[{ticker}] Error refrescando el precio 1m: {e}")
                 if m1 is not None and len(m1) > 40:
                     from api.schwab_client import SchwabClient
+                    previous = datos.velas.get('1m')
+                    if previous is not None and len(previous):
+                        m1 = pd.concat([previous, m1])
+                        m1 = m1[~m1.index.duplicated(keep='last')].sort_index()
                     datos.velas["1m"] = m1
                     m5 = SchwabClient._resample(m1, "5min")
                     if m5 is not None and len(m5) > 0:
@@ -2319,6 +2364,9 @@ class ChocoletraBot:
                                            f"(API sin datos) — se usa el último y se reintenta")
             return datos
         datos = self.schwab.obtener_multitemporal(ticker, self.config)
+        if ent and ent[1].velas.get('1m') is not None and datos.velas.get('1m') is not None:
+            combined = pd.concat([ent[1].velas['1m'], datos.velas['1m']])
+            datos.velas['1m'] = combined[~combined.index.duplicated(keep='last')].sort_index()
         self._mtf_cache[ticker] = (ahora, datos, ahora)
         return datos
 
@@ -4025,6 +4073,26 @@ class ChocoletraBot:
                 self._orden_huerfana_ciclos.pop(oid, None)
 
     def _adoptar_huerfana(self, ticker: str, p: dict):
+        # A broker snapshot and ownership proof may take seconds to read. An
+        # entry/monitor can establish tracking meanwhile. Recheck under the
+        # SAME symbol lock used by entries and closes before touching protection.
+        with self.ejecutor_hibrido.secuencia_simbolo(ticker):
+            with self._lock:
+                if not self._activo or self._posiciones.get(ticker) is not None:
+                    return
+            current = self.schwab.obtener_posiciones(self.account_number)
+            if not isinstance(current, list):
+                return
+            matches = [row for row in current
+                       if str(row.get('symbol') or '').upper() == ticker
+                       and row.get('tipo') == p.get('tipo')
+                       and row.get('cantidad') == p.get('cantidad')
+                       and row.get('precio') == p.get('precio')]
+            if len(matches) != 1:
+                return
+            return self._adoptar_huerfana_impl(ticker, matches[0])
+
+    def _adoptar_huerfana_impl(self, ticker: str, p: dict):
         """Coloca un STOP de protección a una posición real huérfana y la registra
         en el seguimiento. Si no se puede proteger, la cierra (mejor plano que
         desnudo)."""
@@ -4847,6 +4915,20 @@ class ChocoletraBot:
             if not stop_real_ya_llenado:
                 real = self._cantidad_real_broker(ticker, tipo)
                 has_pending = getattr(self.ejecutor_hibrido, 'has_pending_exit', lambda *a: False)(self.account_number, ticker)
+                if real == 0 and has_pending:
+                    # A rejected bot exit can remain durable after a manual
+                    # close. Verify that external fill BEFORE generic flat
+                    # recovery discards its identity and price.
+                    manual_exit = self._recuperar_cierre_manual_verificado(
+                        ticker, pos, max(1, int(cant_rest or 1)))
+                    if manual_exit:
+                        retire = getattr(self.ejecutor_hibrido,
+                            'retire_pending_exit_after_authoritative_flat', None)
+                        if not callable(retire) or retire(
+                                self.account_number, ticker,
+                                reason='Manual close fill independently verified') is not True:
+                            return False
+                        has_pending = False
                 if real == 0 and not has_pending:
                     # El broker ya está plano.  No enviar un segundo cierre.  Antes
                     # de soltar el estado local, recuperar la evidencia del STOP
@@ -4869,7 +4951,7 @@ class ChocoletraBot:
                             f"FILLED {close_order_id}",
                         )
                     else:
-                        manual_exit = self._recuperar_cierre_manual_verificado(
+                        manual_exit = manual_exit or self._recuperar_cierre_manual_verificado(
                             ticker, pos, expected_close_qty)
                         if manual_exit:
                             close_order_id = manual_exit["order_id"]
