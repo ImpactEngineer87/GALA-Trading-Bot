@@ -3249,7 +3249,7 @@ async function fetchAIStatus(){
         <td title="Cierres verificados disponibles para entrenar. El contador total de operaciones cerradas también conserva filas no elegibles para IA.">${closedSources}</td>
         <td title="Auditoría separada: útiles = el veto habría evitado una pérdida; perdidas = una señal vetada habría sido ganadora. No suma al contador de cierres.">${vetoText}</td>
         <td title="Señales no ejecutadas resueltas por TP/SL. Solo las no ambiguas pueden complementar FIT con peso reducido; nunca suman al contador de cierres ni entran a VALIDACIÓN/TEST.">${learningText}</td>
-        <td title="Ejecutadas válidas para IA / ejecuciones afectadas o legacy en cuarentena">${dataset}</td>
+        <td title="Ejecutadas válidas para IA / ejecuciones afectadas o legacy en cuarentena">${dataset}${readiness.evidence_policy === 'COMPLETE_ONLY' ? `<div class="muted">Entrenamiento: ${Number(readiness.eligible_samples || 0)} cierres completos</div>` : ''}</td>
         <td title="${escHtml(fitDetail)}">${fitText}</td>
         <td><span class="ai-state ${escHtml(row.status||'COLLECTING')}">${escHtml(row.status||'COLLECTING')}</span></td>
         <td title="Resultado del candidato más reciente dentro de SHADOW; REJECTED no degrada el modelo aceptado anterior.">${escHtml(shadowResult)}</td>

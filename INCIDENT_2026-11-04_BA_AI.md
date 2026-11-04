@@ -66,3 +66,12 @@ Exact agreement with the client's ThinkOrSwim chart has not been demonstrated
 from screenshots alone. Retain closed-bar timestamps and compare identical
 study inputs and candle feeds. Historical missed-bar records are never proof
 that a broker order was sent or filled.
+
+## Verification
+
+The candidate passed all 557 tests in an isolated Linux worktree as gala with
+network access disabled. Focused startup/manual-close/accounting regressions
+also passed on Windows. The full Windows suite encountered existing POSIX file
+permission, fcntl and encoding assumptions; Linux is the deployment test gate.
+An offline preview of the incident recovery matched the preserved broker packet,
+the two original history rows and exactly the four new guard records.
