@@ -2,6 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 import pandas as pd
+from unittest.mock import Mock
+from engine.bot_engine import ChocoletraBot
 from core.candle_evidence import evaluation_receipt
 from core.strategy import GALA10Strategy
 from core.ticker_execution import TickerExecutionRegistry
@@ -9,6 +11,13 @@ from core.model_identity import model_snapshot
 
 
 class CandleAndRoutingEvidenceTests(unittest.TestCase):
+    def test_missing_one_minute_candles_never_use_five_minute_signals(self):
+        bot=ChocoletraBot.__new__(ChocoletraBot);bot.estrategia=Mock()
+        data=Mock();data.tf.side_effect=lambda tf:None if tf=='1m' else pd.DataFrame({'close':[10]*40})
+        self.assertIsNone(bot._senal_estrategia(data,'META',10))
+        data.tf.assert_called_once_with('1m')
+        bot.estrategia.calcular.assert_not_called()
+
     def test_candle_or_strategy_changes_have_distinct_evidence(self):
         f=pd.DataFrame({'open':[10.,11.],'high':[12.,13.],'low':[9.,10.],
             'close':[11.,12.],'volume':[10,20]},index=pd.date_range('2026-11-04 15:00',periods=2,freq='min'))
