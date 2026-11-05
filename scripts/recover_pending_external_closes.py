@@ -53,21 +53,23 @@ def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--apply',action='store_true');args=p.parse_args()
     from dotenv import load_dotenv
     import yaml
-    from api.schwab_client import SchwabClient
-    from scripts.authorize_archived_accounting_resume import service_inactive
+    from api.schwab_client import SchwabClient, TRADER_URL
+    from scripts.authorize_archived_accounting_resume import service_inactive, verify_broker_flat
     if os.geteuid()!=0:raise ValueError('ROOT_REQUIRED')
     load_dotenv(ROOT/'.env');cfg=yaml.safe_load((ROOT/'config.yaml').read_text())
     day=datetime.now(ZoneInfo('America/New_York')).date().isoformat()
     queue=ROOT/'data/manual_close_pending.json'
     state=json.loads(queue.read_text());pending=state.get('pending') or {}
     if not pending:print(json.dumps({'pending':0}));return
+    if any(key!=row.get('position_id') for key,row in pending.items()):
+        raise ValueError('PENDING_KEY_IDENTITY_MISMATCH')
     audit_path=ROOT/'data/auditoria_ordenes.csv';history_path=ROOT/'data/historial_operaciones.csv'
     audit=list(csv.DictReader(audit_path.open(encoding='utf-8-sig')))
     with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):
-        client=SchwabClient(cfg);account=client.obtener_account_hash(os.environ['SCHWAB_ACCOUNT_NUMBER'])
-        positions=client.obtener_posiciones(account);working=client.obtener_ordenes_abiertas(account)
+        client=SchwabClient(cfg);client.TRADER_URL=TRADER_URL
+        verify_broker_flat(client,os.environ['SCHWAB_ACCOUNT_NUMBER'])
+        account=client.obtener_account_hash(os.environ['SCHWAB_ACCOUNT_NUMBER'])
         orders=client.obtener_ordenes_sesion(account)
-    if positions!=[] or working!=[]:raise ValueError('FRESH_FLAT_NO_ORDERS_REQUIRED')
     proofs=[prove_pending(row,audit,orders,day) for row in pending.values()]
     print(json.dumps({'pending':len(proofs),'proofs':[{'ticker':r['pending']['ticker'],
         'quantity':r['exit']['quantity'],'entry':r['pending']['entry_price'],
