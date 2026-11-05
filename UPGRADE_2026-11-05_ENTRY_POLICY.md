@@ -122,17 +122,45 @@ Fix commit **`b223648`**, `engine/bot_engine.py:5625`: evaluate the existing tar
 when `tp1_hit` is true **or** partial exits are disabled. Reuse the existing
 verified LIMIT close path. The tests cover long/short targets, exact equality,
 prices before target, partial plans before/after TP1, and a stopped engine.
-Current trade management continues on the existing engine until a flat restart
-window; this source change is not an instruction to close the live BA trade.
+During review, the existing engine continued managing the trade while waiting
+for a flat restart window. The source edit did not close the live BA trade.
 
 The final combined candidate passed **590 tests** on Linux in the isolated
 worktree with network disabled. Fresh broker reads at **21:48:28 Saratov /
 12:48:28 New York** showed no positions and no working orders. The operator had
 explicitly selected waiting for BA to close normally before deployment.
 
-## Deployment status
+## Completed deployment
 
-The reviewed candidate is ready. The active engine must load the new Python
-code through a controlled restart. At review time it was managing a live BA
-short of 5 shares with a working broker order, so deployment must use a broker
-flat maintenance window. Runtime deployment checks are recorded here when done.
+The client selected waiting for BA's normal close. The existing engine closed
+that 5-share short through its reversal path at **21:47:38 Saratov / 12:47:38
+New York**, entry 171.58, exit 170.4799, gross profit 5.5005 USD. Its linked audit
+and history are accounting-verified. The update had not yet been loaded then.
+
+The maintenance helper independently confirmed broker flat/no pending orders
+before stopping the engine. It waited for the runner to terminate before the
+web service stopped. Ten PAPER positions closed by that maintenance stop were
+explicitly excluded from training and performance, preserving their original
+prices and outcomes. Other observations retained their existing eligibility.
+
+Authenticated post-deployment checks at **21:54:42 Saratov / 12:54:42 New York**
+confirmed:
+
+- Version **3.3.20**, active web service, engine off and no runner thread.
+- An independently verified empty broker account position list and no pending
+  orders, including the unfiltered account/order verification.
+- REAL `entry_blocked=false`; empty pending manual-close queue.
+- All **47 protected configuration, routing, production/shadow model and
+  original accounting guard file hashes unchanged**.
+- REAL recorded gross realized risk 88.07 USD; REAL daily loss limit 200 USD.
+  The protected configuration retains the PAPER daily loss limit of 700 USD.
+- Clean deployed Git tree at the reviewed code and documentation commit.
+
+Maintenance backup: `/opt/gala/backups/upgrade-3.3.20-d4m1xpz6`.
+Verification receipt: `data/upgrade_verification_20261105_3320.json`.
+Replay receipt: `data/entry_policy_replay_20261105.json`.
+
+GitHub and the VPS contain both code fixes. The trading engine was left off
+for the client's dashboard start. The saved-signal replay and offline tests
+demonstrate the corrected approval/target paths; a new post-upgrade live order
+or fill has not been used as a deployment test.
