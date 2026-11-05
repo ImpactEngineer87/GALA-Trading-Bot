@@ -33,7 +33,7 @@ same binary could behave differently between signals or sessions.
 
 ## Exact change
 
-Implementation commit: `56c05c3`.
+Entry-policy implementation commit: `56c05c3`.
 
 | File and current entry point | Change |
 | --- | --- |
@@ -89,7 +89,7 @@ and the entry timeout are separate execution behavior.
 - 27 focused tests passed locally, covering actual orchestrator inference,
   engine entry attempts, execution receipts, dashboard rendering and LIMIT
   execution controls.
-- **586 tests passed** in the isolated Linux worktree as `gala` with network
+- Before the additional target fix, the **586-test full suite passed** in the isolated Linux worktree as `gala` with network
   disabled. Added cases cover BUY/SELL in REAL/PAPER, simultaneous macro/range/
   regime conditions, exact threshold equality, below-threshold rejection,
   unavailable models, shadow score preservation, missing data and trading hours.
@@ -102,6 +102,33 @@ and the entry timeout are separate execution behavior.
   entry eligibility, not a retrospective execution or fill.
 
 Review evidence: `/opt/gala/backups/entry-policy-review-acoyrzy2`.
+
+## Additional defect found while waiting for BA's normal close
+
+At 21:43:35 Saratov / 12:43:35 New York, Schwab still reported BA SELL 5 shares
+with its protective STOP working at 172.65. The engine's snapshot showed entry
+171.58, target 170.04, and latest observed price 169.895. The REAL manager's
+target branch at baseline `engine/bot_engine.py:5621` required `tp1_hit`.
+The full-position exit policy disables partial exits, so that flag never becomes
+true. This skips the configured target even when the observed price reaches it.
+The existing protective STOP and opposite-signal close paths remain available.
+
+The guard is already present in initial import `0ea221c`. Full-position REAL
+exit policy was added in `003180c` on October 30 at 21:34:10 Saratov. This is an
+incompatibility between the full-position mode and the older partial-only target
+check. It is distinct from the macro entry veto.
+
+Fix commit **`b223648`**, `engine/bot_engine.py:5625`: evaluate the existing target
+when `tp1_hit` is true **or** partial exits are disabled. Reuse the existing
+verified LIMIT close path. The tests cover long/short targets, exact equality,
+prices before target, partial plans before/after TP1, and a stopped engine.
+Current trade management continues on the existing engine until a flat restart
+window; this source change is not an instruction to close the live BA trade.
+
+The final combined candidate passed **590 tests** on Linux in the isolated
+worktree with network disabled. Fresh broker reads at **21:48:28 Saratov /
+12:48:28 New York** showed no positions and no working orders. The operator had
+explicitly selected waiting for BA to close normally before deployment.
 
 ## Deployment status
 
