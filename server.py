@@ -889,6 +889,16 @@ def _engine_daily_risk_snapshot():
             account = str(BOT_STATE.get("account_number") or get_env(
                 "SCHWAB_ACCOUNT_NUMBER", "") or "").strip()
             accounting.update(exception_status(cfg, account_path, account, root=BASE_DIR))
+        from core.runtime_store import JsonState
+        pending_path = resolve_runtime_path((cfg.get('execution_engine') or {}).get(
+            'manual_close_pending_path', 'data/manual_close_pending.json'), project_root=BASE_DIR)
+        try:
+            pending = JsonState(pending_path).get('pending') or {}
+            if pending:
+                accounting.update(entry_blocked=True, manual_close_retrying=True,
+                                  manual_close_pending_tickers=sorted({r['ticker'] for r in pending.values()}))
+        except Exception:
+            accounting.update(entry_blocked=True, manual_close_retrying=True)
         snapshot["real_accounting"] = accounting
         return snapshot
     except Exception:
@@ -4850,13 +4860,28 @@ def _learning_summary_rows(tickers):
     return store.summary_by_ticker(tickers)
 
 
+@app.route('/api/strategy/evidence')
+def strategy_evaluation_evidence():
+    from core.runtime_store import JsonState
+    from core.project_paths import resolve_runtime_path
+    store = JsonState(resolve_runtime_path('data/candle_evaluation_evidence.json', project_root=BASE_DIR))
+    try:
+        with store.lock:
+            rows = store._read()
+        return jsonify(status='ok', timeframe='1m', closed_candles_only=True, tickers=rows)
+    except Exception:
+        return jsonify(status='error', message='No se pudo leer la evidencia de velas'), 503
+
+
 @app.route('/api/ai/status')
 def ai_retraining_status():
     """Per-ticker model availability and 30/50 retraining progress."""
     try:
-        auto_policy = auto_ai_policy(_auto_ai_read_config())
+        cfg = _auto_ai_read_config()
+        auto_policy = auto_ai_policy(cfg)
         trainer = _ai_trainer_for_status()
         tickers = list(BOT_STATE.get("tickers") or [])
+        execution_rows = {r['ticker']:r for r in _ticker_execution_rows(cfg, persist_missing=False)}
         rows = trainer.retraining_status(tickers)
         veto_rows = _veto_summary_rows(tickers)
         veto_by_ticker = {str(r.get("ticker", "")).upper(): r for r in veto_rows}
@@ -4904,6 +4929,14 @@ def ai_retraining_status():
             row["threshold_source"] = "MANUAL" if override else "MODEL"
             shadow_model = trainer.shadow_snapshot(ticker) if hasattr(trainer, "shadow_snapshot") else {}
             row["shadow_model"] = shadow_model
+            route = execution_rows.get(ticker, {})
+            row['execution_mode'] = route.get('effective_mode', route.get('mode', 'UNKNOWN'))
+            row['execution_selection_updated_utc'] = route.get('updated_utc', '')
+            row['automatic_real_activation'] = False
+            row['inference_model_tier'] = ('PRODUCTION' if row['execution_mode'] == 'REAL'
+                else 'SHADOW' if shadow_model.get('loaded') else 'PRODUCTION')
+            row['inference_model'] = (row['production_model'] if row['inference_model_tier'] == 'PRODUCTION'
+                                      else shadow_model)
             # v3.3.4: historical score of the SHADOW artifact that is currently
             # installed/accepted.  This is deliberately NOT the same metric as
             # last_shadow_incumbent_balanced_accuracy, which is the incumbent

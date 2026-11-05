@@ -53,15 +53,20 @@ class ManualCloseProofTests(unittest.TestCase):
         self.orders[1]["orderActivityCollection"][0]["executionLegs"][0]["price"] = 0
         self.assertEqual(verified_manual_close(self.orders, **self.args), {})
 
-    def test_unknown_source_and_bad_entry_never_gain_manual_proof(self):
-        self.orders[1]["tag"] = "OTHER_API"
-        self.assertEqual(verified_manual_close(self.orders, **self.args), {})
-        self.orders[1]["tag"] = "API_TOS:CHART"
-        self.orders[1]["tag"] = "API_TOS:TraderAPI"
-        self.assertEqual(verified_manual_close(self.orders, **self.args), {})
-        self.orders[1]["tag"] = "API_TOS:CHART"
+    def test_exact_external_close_is_verified_independently_of_broker_tag(self):
+        for tag in ('OTHER_API','API_TOS:TraderAPI',''):
+            self.orders[1]['tag']=tag
+            self.assertEqual(verified_manual_close(self.orders, **self.args)['order_id'],'external')
+
+    def test_bad_entry_and_saturated_window_never_gain_proof(self):
         self.assertEqual(verified_manual_close(self.orders, **{**self.args, "entry_price": 411}), {})
         self.assertEqual(verified_manual_close(self.orders * 250, **self.args), {})
+
+    def test_other_owned_fills_must_balance_the_expected_remaining_quantity(self):
+        extra=order('stop','BUY_TO_COVER',410.7,datetime.fromisoformat(
+            self.orders[1]['orderActivityCollection'][0]['executionLegs'][0]['time']))
+        self.assertEqual(verified_manual_close(self.orders+[extra],**self.args),{})
+        self.assertEqual(verified_manual_close(self.orders,**{**self.args,'total_quantity':4}),{})
 
     def test_orphan_adoption_requires_latest_audited_gala_entry(self):
         entry = self.orders[0]

@@ -1,6 +1,6 @@
 """Read-only proof for a manual close of a GALA-managed REAL position.
 
-The broker's exact equity execution legs supply price and quantity. A chart
+The broker's exact equity execution legs supply price and quantity. An external
 order is accepted only when it is the sole external fill after the audited
 GALA entry and Schwab has already confirmed the symbol flat.
 """
@@ -73,6 +73,7 @@ def verified_manual_close(orders, *, ticker, side, quantity, total_quantity,
 
     ``managed_order_ids`` includes the tracked entry, stop, and partial exit.
     This proof never infers an exit from a limit price or account flatness alone.
+    A broker tag cannot establish who placed the order and is not fill proof.
     """
     try:
         if not isinstance(orders, list) or len(orders) >= 500:
@@ -127,23 +128,38 @@ def verified_manual_close(orders, *, ticker, side, quantity, total_quantity,
                 continue
             if filled_at.astimezone(NY).date().isoformat() != session_ny:
                 return {}
-            if oid in known:
-                continue
             action = str(leg.get("instruction") or "")
             evidence = fill_evidence(order, oid, ticker, action)
             if evidence.get("verified") is not True:
                 return {}
+            if oid in known:
+                # Previously executed partial exits must account exactly for
+                # the difference between original and currently tracked size.
+                if action != instruction:
+                    return {}
+                continue
             external.append((oid, order, action, evidence))
         if len(external) != 1:
             return {}
         oid, order, action, fill = external[0]
         if (action != instruction or fill.get("status") != "FILLED"
-                or abs(float(fill["quantity"]) - quantity) > 1e-6
-                or str(order.get("tag") or "") != "API_TOS:CHART"):
+                or abs(float(fill["quantity"]) - quantity) > 1e-6):
+            return {}
+        known_closed = 0.0
+        for known_id, known_order, known_leg in relevant:
+            if known_id not in known or known_id == str(entry_order_id) or not known_order.get('orderActivityCollection'):
+                continue
+            if _fill_time(known_order) <= opened_at:
+                continue
+            evidence = fill_evidence(known_order, known_id, ticker, instruction)
+            if evidence.get('verified') is not True:
+                return {}
+            known_closed += float(evidence['quantity'])
+        if abs(known_closed + quantity - total_quantity) > 1e-6:
             return {}
         return {"order_id": oid, "avg_price": float(fill["average_price"]),
                 "quantity": quantity, "order_type": fill.get("order_type"),
-                "tag": str(order["tag"]), "filled_at": _fill_time(order).isoformat()}
+                "tag": str(order.get("tag") or ""), "filled_at": _fill_time(order).isoformat()}
     except (ValueError, TypeError, KeyError, OverflowError, AttributeError):
         return {}
 

@@ -1,16 +1,21 @@
 """Model identity and operator authorization pinned to exact artifact bytes."""
 import hashlib
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 from core.runtime_store import JsonState, EventHistory, utc_now
 
 
 def model_snapshot(meta, path='', loaded=False, tier='PRODUCTION'):
     version = meta.get('model_version') or meta.get('evaluation_id')
+    modified = None
     if path and Path(path).is_file():
         digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
         version = digest  # changing artifact bytes always invalidates authorization
+        modified = datetime.fromtimestamp(Path(path).stat().st_mtime, timezone.utc).isoformat()
     return {'model_version': version, 'model_tier': tier,
+            'artifact_modified_utc': modified,
+            'evaluation_id': meta.get('evaluation_id'),
             'training_date': meta.get('trained_utc') or meta.get('entrenado_utc') or meta.get('fecha'),
             'validation_date': meta.get('evaluation_utc'),
             'balanced_accuracy': meta.get('balanced_accuracy'),

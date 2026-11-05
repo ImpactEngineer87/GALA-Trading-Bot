@@ -364,6 +364,13 @@ class ChocoletraBot:
                 "accounting_state_path", "data/real_accounting_reconciliation.json")))
         self.real_accounting_guard.inspect_session(
             history_path, audit_path, self._ahora_et().strftime("%Y-%m-%d"))
+        from core.runtime_store import JsonState
+        self.manual_close_pending = JsonState(resolve_runtime_path(
+            (self.config.get('execution_engine') or {}).get(
+                'manual_close_pending_path', 'data/manual_close_pending.json')))
+        self._manual_observation_lock = threading.Lock()
+        self._manual_positions_cache = {'until': 0, 'positions': None}
+        self.candle_evidence = JsonState(resolve_runtime_path('data/candle_evaluation_evidence.json'))
         self._daily_kill_lock = threading.RLock()
         self._daily_kill_in_progress = False
         self._daily_liquidation_attempted = False
@@ -837,6 +844,17 @@ class ChocoletraBot:
             snapshot["external_exposure_blocked"] = True
             snapshot.setdefault("reasons", []).append(
                 "External broker position in a REAL ticker; account risk not attributable")
+        pending_store = getattr(self, 'manual_close_pending', None)
+        if pending_store is not None:
+            try:
+                pending = pending_store.get('pending') or {}
+                if pending:
+                    snapshot.update(entry_blocked=True, manual_close_retrying=True,
+                                    manual_close_pending_tickers=sorted({r['ticker'] for r in pending.values()}))
+                    snapshot.setdefault('reasons', []).append('Esperando fills Schwab; cierre manual en reconciliación automática')
+            except Exception:
+                snapshot.update(entry_blocked=True, manual_close_retrying=True)
+                snapshot.setdefault('reasons', []).append('No se pudo leer la reconciliación de cierres manuales')
         return snapshot
 
     def _require_real_accounting(self, ticker, pos, reason, **evidence):
@@ -2264,8 +2282,6 @@ class ChocoletraBot:
                           precio_actual: float) -> Optional[str]:
         """Calcula la señal de core/strategy.py sobre 1m para la confluencia."""
         df_1m = datos.tf("1m")
-        if df_1m is None:
-            df_1m = datos.tf("5m")
         if df_1m is None or len(df_1m) < 35:
             return None
         # SOLO VELAS CERRADAS: la señal se evalúa sobre la última vela COMPLETA,
@@ -2281,6 +2297,12 @@ class ChocoletraBot:
                 return None
         try:
             df_calc = self.estrategia.calcular(df_1m)
+            if getattr(self, 'candle_evidence', None) is not None:
+                from core.candle_evidence import evaluation_receipt
+                receipt = evaluation_receipt(df_1m, self.estrategia, df_calc)
+                self.candle_evidence.put(ticker, receipt)
+                self._audit_event('STRATEGY_CANDLE_EVALUATED', ticker=ticker,
+                    estado='CLOSED_CANDLE', motivo='Exact strategy inputs before AI veto', detalle=receipt)
             # A slow broker cycle may skip several closed candles. Preserve
             # their strategy signals on the chart, with explicit missed timing;
             # only the latest closed candle can authorize a current entry.
@@ -4692,9 +4714,9 @@ class ChocoletraBot:
                 total_quantity=pos.get("orden").cantidad,
                 entry_order_id=pos.get("entry_order_id"),
                 entry_price=pos.get("entrada"),
-                managed_order_ids=(pos.get("entry_order_id"),
-                                   pos.get("sl_order_id"),
-                                   pos.get("tp1_order_id")),
+                managed_order_ids={pos.get("entry_order_id"),
+                                   pos.get("sl_order_id"), pos.get("tp1_order_id")}
+                                  | self._gala_audited_order_ids(ticker),
                 session_ny=self._ahora_et().date().isoformat(),
             )
         except Exception:
@@ -4716,11 +4738,68 @@ class ChocoletraBot:
                 estado="FILLED", order_id=proof["order_id"],
                 cantidad=proof["quantity"], precio=proof["avg_price"],
                 parent_order_id=str(pos.get("entry_order_id") or ""),
-                motivo="External TOS close, excluded from GALA performance",
+                motivo="Exact external close fill, excluded from GALA performance",
                 detalle={"order_type": proof["order_type"], "tag": proof["tag"],
                          "broker_fill_time": proof["filled_at"]},
             )
         return proof
+
+    def _defer_flat_manual_close(self, ticker, pos, quantity):
+        """Keep the exact position for automatic retries while fills propagate.
+
+        Never record a fabricated close or release daily risk on flatness alone.
+        The separate durable queue does not invalidate historical review bytes.
+        """
+        store = getattr(self, 'manual_close_pending', None)
+        if (store is None or not pos.get('position_id') or not pos.get('entry_order_id')
+                or (pos.get('entry_integrity') or {}).get('entry_confirmed') is not True):
+            return False
+        try:
+            with store.lock:
+                pending = store.get('pending') or {}
+                pending[pos['position_id']] = {
+                    'ticker': ticker, 'position_id': pos['position_id'],
+                    'entry_order_id': pos['entry_order_id'], 'expected_quantity': quantity,
+                    'entry_price': pos['entrada'], 'side': pos['tipo'],
+                    'session_ny': self._ahora_et().date().isoformat()}
+                store.put('pending', pending)
+            pos['manual_close_retry_after'] = time.monotonic() + 5
+            self._audit_event('MANUAL_EXIT_FILL_PENDING', ticker=ticker,
+                estado='AUTO_RETRY', motivo='Broker flat; waiting for exact fill evidence, local position retained')
+            return True
+        except Exception:
+            self._require_real_accounting(ticker, pos, 'No se pudo persistir el cierre manual pendiente')
+            return False
+
+    def _complete_manual_close_retry(self, pos):
+        store = getattr(self, 'manual_close_pending', None)
+        if store is not None:
+            with store.lock:
+                pending = store.get('pending') or {}
+                if pos.get('position_id') in pending:
+                    del pending[pos['position_id']]
+                    store.put('pending', pending)
+
+    def _manual_broker_quantity(self, ticker, side):
+        # Share one complete broker snapshot across tickers; do not add one
+        # position GET per monitor tick/symbol or compete with order reads.
+        with self._manual_observation_lock:
+            cached = self._manual_positions_cache
+            if time.monotonic() >= cached['until']:
+                try:
+                    rows = self.schwab.obtener_posiciones(self.account_number)
+                except Exception:
+                    rows = None
+                cached.update(until=time.monotonic()+5, positions=rows)
+            rows = cached['positions']
+        if not isinstance(rows, list):
+            return None
+        matching = [r for r in rows if r.get('symbol') == ticker]
+        if not matching:
+            return 0
+        if len(matching) != 1 or matching[0].get('tipo') != side:
+            return None
+        return matching[0].get('cantidad')
 
     def _cerrar_posicion(self, ticker: str, precio_salida: float, motivo: str = "") -> bool:
         """Cierra una posición SERIALIZANDO por ticker: si otro hilo ya está
@@ -5080,6 +5159,11 @@ class ChocoletraBot:
                 )
                 return False
 
+        if (not paper_ticker and exit_confirmed
+                and not (close_order_id and exit_price_verified)
+                and self._defer_flat_manual_close(ticker, pos, cant_rest)):
+            return False
+
         if paper_ticker:
             close_order_id = f"SIM-CLOSE-{pos.get('position_id', ticker)[:16]}"
             exit_confirmed = True
@@ -5221,6 +5305,11 @@ class ChocoletraBot:
             self._require_real_accounting(
                 ticker, pos, "Cierre manual verificado pero ledger no persistido",
                 exit_order_id=close_order_id, broker_flat=True)
+        if accounting_verified and pnl_persisted is True and history_row and audit_row:
+            try:
+                self._complete_manual_close_retry(pos)
+            except Exception:
+                self._require_real_accounting(ticker, pos, 'Cierre verificado; cola de reconciliación no persistida')
         close_integrity = {
             "ticker": ticker,
             **close_fields,
@@ -5293,6 +5382,15 @@ class ChocoletraBot:
                 return
         if not self._asegurar_token_trading():
             return
+
+        if getattr(self, 'manual_close_pending', None) is not None:
+            if time.monotonic() < pos.get('manual_close_retry_after', 0):
+                return
+            if (self._manual_broker_quantity(ticker, pos['tipo']) == 0
+                    and self._cantidad_real_broker(ticker, pos['tipo']) == 0):
+                self._cerrar_posicion(ticker, precio_actual,
+                    motivo='reconciliacion automatica: broker plano')
+                return
 
         # v3.0.2 — reconcile an HTTP-accepted STOP before any replacement.
         # Never convert "ack not visible yet" into a second protective order.

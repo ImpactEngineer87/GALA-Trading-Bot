@@ -93,7 +93,7 @@ class TickerExecutionRegistry:
             if not tk or not isinstance(value, dict):
                 continue
             try:
-                mode = self._normalize_mode(value.get("mode", self.default_mode))
+                mode = self._normalize_mode(value.get("mode", "PAPER"))
                 shares = self._normalize_shares(
                     value.get("shares", self.default_shares)
                 )
@@ -136,7 +136,9 @@ class TickerExecutionRegistry:
                     continue
                 if tk not in state["tickers"]:
                     state["tickers"][tk] = {
-                        "mode": "REAL" if tk in self.initial_real_tickers else self.default_mode,
+                        # Missing/corrupt state is never authorization to trade
+                        # live. Only an explicit update may create a REAL row.
+                        "mode": "PAPER",
                         "shares": self.default_shares,
                         "updated_utc": "",
                     }
@@ -160,7 +162,7 @@ class TickerExecutionRegistry:
         mapping = state.get("tickers", {})
         for tk in ordered:
             rec = mapping.get(tk) or {
-                "mode": "REAL" if tk in self.initial_real_tickers else self.default_mode,
+                "mode": "PAPER",
                 "shares": self.default_shares,
                 "updated_utc": "",
             }
@@ -207,7 +209,7 @@ class TickerExecutionRegistry:
         with self._lock:
             state = self._load_locked()
             current = dict(state["tickers"].get(tk) or {
-                "mode": self.default_mode,
+                "mode": "PAPER",
                 "shares": self.default_shares,
             })
             if mode is not None:

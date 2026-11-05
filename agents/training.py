@@ -31,6 +31,7 @@ import pickle
 import shutil
 import threading
 import json
+import hashlib
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
@@ -848,6 +849,10 @@ class EntrenadorAgentes:
             "evaluation_model_policy": "causal_fit_only_cost_aware_v2",
             "training_evidence_policy": (
                 "COMPLETE_ONLY" if self.complete_evidence_only else "LEGACY_SHADOW"),
+            "training_dataset_sha256": hashlib.sha256(
+                pd.util.hash_pandas_object(df[[c for c in dict.fromkeys([
+                    'timestamp','ticker','position_id','closed_utc','risk_per_share','ganadora',*FEATURES])
+                    if c in df]], index=True).values.tobytes()).hexdigest(),
             "model_version": evaluation_id,
             "evaluation_utc": evaluation_utc,
             "evaluation_test_start": test_window_start,

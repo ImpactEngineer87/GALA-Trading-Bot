@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.17</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.18</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -3244,7 +3244,7 @@ async function fetchAIStatus(){
       const evalTitle = `Snapshot: ${row.last_evaluation_id || 'legacy'} · TEST n=${Number(row.last_test_samples||0)}${testWindow ? ` · ${testWindow}` : ''}`;
       return `<tr>
         <td class="notranslate" translate="no"><strong translate="no">${escHtml(row.ticker||'—')}</strong></td>
-        <td>${escHtml(model)}</td>
+        <td>${escHtml(model)}<div class="muted">${escHtml(row.execution_mode||'SIN CONFIRMAR')} · ${escHtml(row.inference_model_tier||'modelo sin confirmar')}</div><div class="muted" title="Fecha real de entrenamiento del modelo utilizado; un candidato rechazado no reemplaza este modelo">Entrenado: ${escHtml((row.inference_model?.training_date||'sin fecha').replace('T',' '))}</div></td>
         <td title="${escHtml(readinessDetail)}">${progress}</td>
         <td title="Cierres verificados disponibles para entrenar. El contador total de operaciones cerradas también conserva filas no elegibles para IA.">${closedSources}</td>
         <td title="Auditoría separada: útiles = el veto habría evitado una pérdida; perdidas = una señal vetada habría sido ganadora. No suma al contador de cierres.">${vetoText}</td>
@@ -3257,7 +3257,7 @@ async function fetchAIStatus(){
         <td title="Balanced Accuracy del candidato en el TEST de este snapshot">${candidate}</td>
         <td title="Incumbente SHADOW evaluado sobre exactamente el mismo TEST">${shadowInc}</td>
         <td><span class="ai-delta ${deltaClass}">${delta}</span></td>
-        <td title="Puerta independiente para permitir promoción normal a PRODUCTION">${prodGateText}</td>
+        <td title="Validación del candidato. No cambia PAPER/REAL ni activa un modelo de producción.">${prodGateText}<div class="muted">No activa REAL</div></td>
         <td class="${economicSnapshot.gate===true?'ai-economic-pass':economicSnapshot.gate===false?'ai-economic-fail':''}" title="${escHtml(economicTitle)}">${economicText}</td>
         <td title="Incumbente PRODUCTION evaluado sobre exactamente el mismo TEST">${prodInc}</td>
         <td title="Umbral elegido en VALIDACIÓN y luego congelado para este TEST">${threshold}</td>
