@@ -162,6 +162,7 @@ class DailyLossGuard:
                 loaded.get("trigger_limit_usd", 0.0) or 0.0
             ),
             "reason": str(loaded.get("reason", "") or ""),
+            "verified_pending_closes": dict(loaded.get('verified_pending_closes') or {}),
             "realized_pnl": {
                 "PAPER": float(realized.get("PAPER", 0.0) or 0.0),
                 "REAL": float(realized.get("REAL", 0.0) or 0.0),

@@ -66,6 +66,37 @@ def _unpriced_execution(order):
     return (reported > 0 or str(order.get("status") or "").upper() == "FILLED")
 
 
+def _zero_fill_cancellation(order):
+    """Schwab cancellation legs are not trades despite activityType EXECUTION.
+
+    Ignore only a terminal, explicitly zero-filled order whose every activity
+    is a zero-price cancellation. A claimed or malformed FILL is never hidden.
+    """
+    try:
+        if str(order.get('status') or '').upper() not in {'CANCELED','CANCELLED','REPLACED','EXPIRED'}:
+            return False
+        reported=float(order['filledQuantity']);ordered=float(order['quantity'])
+        if not math.isfinite(reported) or reported != 0 or not math.isfinite(ordered) or ordered <= 0:
+            return False
+        activities=order.get('orderActivityCollection')
+        if not isinstance(activities,list) or not activities:
+            return False
+        for activity in activities:
+            if (not isinstance(activity,dict) or activity.get('activityType') != 'EXECUTION'
+                    or activity.get('executionType') not in {'CANCELED','CANCELLED'}):
+                return False
+            legs=activity.get('executionLegs')
+            if not isinstance(legs,list) or not legs:
+                return False
+            for leg in legs:
+                qty,price=float(leg['quantity']),float(leg['price'])
+                if not math.isfinite(qty) or not 0 < qty <= ordered or not math.isfinite(price) or price != 0:
+                    return False
+        return True
+    except (ValueError,TypeError,KeyError,OverflowError):
+        return False
+
+
 def verified_manual_close(orders, *, ticker, side, quantity, total_quantity,
                           entry_order_id, entry_price, managed_order_ids,
                           session_ny):
@@ -117,6 +148,8 @@ def verified_manual_close(orders, *, ticker, side, quantity, total_quantity,
         for oid, order, leg in relevant:
             if oid == str(entry_order_id):
                 continue
+            if _zero_fill_cancellation(order):
+                continue
             # A filled, partly filled, or malformed same-symbol order after the
             # entry makes attribution uncertain unless it is already tracked.
             if not order.get("orderActivityCollection"):
@@ -148,6 +181,8 @@ def verified_manual_close(orders, *, ticker, side, quantity, total_quantity,
         known_closed = 0.0
         for known_id, known_order, known_leg in relevant:
             if known_id not in known or known_id == str(entry_order_id) or not known_order.get('orderActivityCollection'):
+                continue
+            if _zero_fill_cancellation(known_order):
                 continue
             if _fill_time(known_order) <= opened_at:
                 continue
@@ -190,6 +225,8 @@ def verified_gala_orphan_entry(orders, *, ticker, side, quantity, broker_price,
             seen.add(oid)
             leg = _equity_leg(order, ticker)
             if leg is None:
+                continue
+            if _zero_fill_cancellation(order):
                 continue
             if not order.get("orderActivityCollection"):
                 if _unpriced_execution(order):

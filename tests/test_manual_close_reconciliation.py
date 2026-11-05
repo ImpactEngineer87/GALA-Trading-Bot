@@ -68,6 +68,25 @@ class ManualCloseProofTests(unittest.TestCase):
         self.assertEqual(verified_manual_close(self.orders+[extra],**self.args),{})
         self.assertEqual(verified_manual_close(self.orders,**{**self.args,'total_quantity':4}),{})
 
+    def test_replacement_stop_cancellations_with_zero_price_are_not_fills(self):
+        canceled=order('stop','BUY_TO_COVER',0,datetime.fromisoformat(
+            self.orders[1]['orderActivityCollection'][0]['executionLegs'][0]['time']))
+        canceled.update(status='REPLACED',filledQuantity=0)
+        canceled['orderActivityCollection'][0]['executionType']='CANCELED'
+        self.assertEqual(verified_manual_close([*self.orders,canceled],**self.args)['order_id'],'external')
+        canceled['orderId']='untracked-replacement'
+        self.assertEqual(verified_manual_close([*self.orders,canceled],**self.args)['order_id'],'external')
+
+    def test_cancellation_marker_cannot_hide_missing_or_contradictory_fills(self):
+        canceled=order('stop','BUY_TO_COVER',0,datetime.fromisoformat(
+            self.orders[1]['orderActivityCollection'][0]['executionLegs'][0]['time']))
+        canceled.update(status='REPLACED',filledQuantity=0)
+        canceled['orderActivityCollection'][0]['executionType']='CANCELED'
+        for patch in ({'filledQuantity':3},{'status':'WORKING'},{'filledQuantity':'nan'}):
+            self.assertEqual(verified_manual_close([*self.orders,{**canceled,**patch}],**self.args),{})
+        canceled['orderActivityCollection'][0]['executionType']='FILL'
+        self.assertEqual(verified_manual_close([*self.orders,canceled],**self.args),{})
+
     def test_orphan_adoption_requires_latest_audited_gala_entry(self):
         entry = self.orders[0]
         kwargs = dict(ticker="TSLA", side="SELL", quantity=3,
