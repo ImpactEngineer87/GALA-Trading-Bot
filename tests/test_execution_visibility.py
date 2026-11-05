@@ -139,7 +139,12 @@ assert.match(elements.signals.innerHTML,/Señal \$184.43/);assert.match(elements
 assert.match(elements.signals.innerHTML,/REAL_ACCOUNTING_UNRESOLVED/);assert.match(elements.signals.innerHTML,/APPROVED/);
 c.renderSignalFeed('signals',[{ticker:'PINS',prob_ia:.3,ai_context:{raw_probability:.870275855,hard_veto_reason:'MACRO_NEUTRAL'}}]);
 assert.match(elements.signals.innerHTML,/IA: 87.03%/);assert.match(elements.signals.innerHTML,/MACRO_NEUTRAL/);
-assert.match(elements.signals.innerHTML,/política: 30.00%/);
+assert.match(elements.signals.innerHTML,/decisión: 30.00%/);
+assert.match(elements.signals.innerHTML,/Regla histórica: MACRO_NEUTRAL/);
+c.renderSignalFeed('signals',[{ticker:'TSLA',tipo:'SELL',prob_ia:.802,ai_decision:'APPROVED',ai_context:{raw_probability:.802339613,entry_policy:'GALA10_MODEL_THRESHOLD_V1',context_filter_reasons:'MACRO_NEUTRAL'}}]);
+assert.match(elements.signals.innerHTML,/Entrada: señal GALA10 \+ umbral IA/);
+assert.match(elements.signals.innerHTML,/Contexto adicional \(solo observación\): MACRO_NEUTRAL/);
+assert.doesNotMatch(elements.signals.innerHTML,/Regla histórica:/);
 c.renderSignalFeed('signals',[{ticker:'BA',precio:null}]);assert.match(elements.signals.innerHTML,/Señal N\/D/);assert.doesNotMatch(elements.signals.innerHTML,/\$0\.00/);
 c.updateBotUI(false,{state:'FAILED'});assert.equal(elements.botStatus.textContent,'ERROR MOTOR');assert.equal(elements.botToggle.checked,false);
 """

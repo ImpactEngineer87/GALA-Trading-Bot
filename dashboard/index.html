@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.19</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.20</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -1858,7 +1858,7 @@ function renderSignalFeed(id, sigs){
         <div>Modelo: ${escHtml((s.ai_context||{}).model_version || 'N/A')} · ${escHtml((s.ai_context||{}).model_tier || 'N/A')}</div>
         <div>Balanced accuracy: ${(s.ai_context||{}).balanced_accuracy == null ? 'N/A' : Number(s.ai_context.balanced_accuracy).toFixed(2)+'%'} · Régimen: ${escHtml((s.ai_context||{}).market_regime || 'N/A')}</div>
         <div>Probabilidad del modelo: ${(s.ai_context||{}).raw_probability == null ? 'N/A' : (Number(s.ai_context.raw_probability)*100).toFixed(2)+'%'} · Estado: ${escHtml((s.ai_context||{}).production_status || 'N/A')}</div>
-        <div>Señal de estrategia: ${escHtml((s.ai_context||{}).strategy_signal || s.tipo || 'N/A')} · Regla: ${escHtml((s.ai_context||{}).hard_veto_reason || 'Ver motivo registrado')} · Puntuación tras política: ${s.prob_ia == null ? 'N/A' : (Number(s.prob_ia)*100).toFixed(2)+'%'}</div>
+        <div>Señal de estrategia: ${escHtml((s.ai_context||{}).strategy_signal || s.tipo || 'N/A')} · ${((s.ai_context||{}).entry_policy === 'GALA10_MODEL_THRESHOLD_V1') ? 'Entrada: señal GALA10 + umbral IA · Contexto adicional (solo observación): '+escHtml((s.ai_context||{}).context_filter_reasons || 'Sin observaciones') : 'Regla histórica: '+escHtml((s.ai_context||{}).hard_veto_reason || 'Ver motivo registrado')} · Puntuación de decisión: ${s.prob_ia == null ? 'N/A' : (Number(s.prob_ia)*100).toFixed(2)+'%'}</div>
         <div>Entrenado: ${escHtml((s.ai_context||{}).training_date || 'N/A')} · Validado: ${escHtml((s.ai_context||{}).validation_date || 'N/A')}</div>
         ${(s.ai_context||{}).manual_authorization ? '<div>Autorización manual aplicada: '+escHtml(s.ai_context.manual_authorization.reason)+'</div>' : ''}
       </details>

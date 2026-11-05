@@ -1885,6 +1885,10 @@ class ChocoletraBot:
                           strategy_signal=senal_gala10,
                           policy_score=decision.prob_meta,
                           hard_veto_reason=getattr(decision, 'hard_veto_reason', ''),
+                          entry_policy=getattr(decision, 'entry_policy', ''),
+                          context_filter_reasons=getattr(decision, 'context_filter_reasons', ''),
+                          market_regime_policy=getattr(decision, 'market_regime_policy', ''),
+                          execution_veto_reason=getattr(decision, 'execution_veto_reason', ''),
                           manual_authorization=getattr(decision, 'ai_manual_authorization', None))
         # v3.3.1: persist both decision wall-clock time (server hook) and the
         # exact closed bar that generated GALA10.  The 1m loop can emit at
@@ -2118,12 +2122,9 @@ class ChocoletraBot:
             threshold = self._effective_ai_threshold(decision, ticker)
 
             hard_reason = str(getattr(decision, "hard_veto_reason", "") or "")
-            reason = (
-                f"HARD_VETO:{hard_reason}"
-                if hard_reason else str(
-                    getattr(decision, "execution_veto_reason", "") or "AI_THRESHOLD"
-                )
-            )
+            reason = str(getattr(decision, "execution_veto_reason", "") or "")
+            if not reason:
+                reason = f"HARD_VETO:{hard_reason}" if hard_reason else "AI_THRESHOLD"
             row = self.veto_observations.record_veto(
                 ticker=ticker,
                 tipo=tipo,
@@ -3860,6 +3861,8 @@ class ChocoletraBot:
         execution_mode = str(getattr(decision, "execution_mode", "") or "").upper()
 
         if approved:
+            if getattr(decision, "entry_policy", "") == "GALA10_MODEL_THRESHOLD_V1":
+                return "AI_APPROVED|ENTRY_POLICY=GALA10_MODEL_THRESHOLD_V1|EXEC=" + (execution_mode or 'UNKNOWN')
             if regime_block and policy == "observe" and regime:
                 return (
                     f"AI_APPROVED|REGIME_OBSERVE_VETO={regime}|"

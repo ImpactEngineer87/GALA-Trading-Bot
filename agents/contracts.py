@@ -250,11 +250,14 @@ class DecisionFinal:
     shadow_threshold: Optional[float] = None
     shadow_would_approve: Optional[bool] = None
     shadow_model_source: str = ""
-    # Regla determinista solicitada por el cliente. En Shadow Mode solo anota
-    # lo que habría ocurrido; no puede cambiar ``operar`` mientras el veto de
-    # producción permanezca desactivado.
+    # Legacy audit fields retained for historical readers. The GALA10 model
+    # threshold policy records macro/range observations separately below.
     hard_veto: bool = False
     hard_veto_reason: str = ""
+    # GALA10 entries use the ticker model threshold. Legacy macro/range
+    # filters remain observable context, with no authority to reject an entry.
+    entry_policy: str = ""
+    context_filter_reasons: str = ""
     # Exact gate that changed ``operar`` from True to False.  This prevents the
     # dashboard from guessing when more than one veto condition is present.
     execution_veto_reason: str = ""

@@ -69,9 +69,8 @@ class OrquestadorAgentes:
             shadow_cfg.get("decisions_path", "data/shadow_decisions.csv")
         )
 
-        # Reglas deterministas de veto solicitadas por el cliente. Mientras el
-        # filtro de producción esté desactivado (umbral_meta_filtro <= 0), estas
-        # reglas solo modifican la recomendación Shadow y nunca bloquean GALA10.
+        # Legacy macro/range flags now select context observations only.
+        # GALA10 entry approval belongs to the individual model threshold.
         hard_cfg = agents_cfg.get("hard_veto", {})
         self.hard_veto_enabled = bool(hard_cfg.get("enabled", True))
         self.hard_veto_macro_neutral = bool(
@@ -79,9 +78,6 @@ class OrquestadorAgentes:
         )
         self.hard_veto_lateral_range = bool(
             hard_cfg.get("lateral_range", True)
-        )
-        self.hard_veto_probability_cap = float(
-            hard_cfg.get("probability_cap", 0.30)
         )
 
     # =========================================================
@@ -193,9 +189,8 @@ class OrquestadorAgentes:
           Los agentes SMC dan CONTEXTO (features): dirección macro, FVG, ATR, rango.
           El XGBoost INDIVIDUAL del ticker VETA (baja probabilidad → descarta).
         Fuera de RTH y falta de datos siguen siendo vetos operativos inmediatos.
-        Además, macro NEUTRAL y compresión lateral son reglas deterministas del
-        filtro IA: en Shadow Mode se registran como VETO sin bloquear GALA10; al
-        habilitar el filtro de producción sí bloquean.
+        Macro NEUTRAL, lateral range and regime analytics are context only.
+        They cannot cap a model probability or override a passing threshold.
         """
         ts = ahora or datetime.now()
         ticker = datos.ticker
@@ -283,6 +278,7 @@ class OrquestadorAgentes:
         decision = DecisionFinal(
             ticker=ticker, operar=True, tipo=senal_gala10,
             execution_mode=effective_mode,
+            entry_policy="GALA10_MODEL_THRESHOLD_V1",
             propuesta=propuesta, direccion_dia=direccion_dia, veredicto=veredicto,
             fvg_contexto_tam_rel=fvg_contexto_tam_rel,
             confluencia_estrategia=confluencia, timestamp=ts,
@@ -317,7 +313,10 @@ class OrquestadorAgentes:
                 )
                 decision.market_regime_enabled = bool(regime_agent.enabled)
                 decision.market_regime_enforcement = str(regime_agent.enforcement)
-                decision.market_regime_policy = str(regime_agent.policy_for(effective_mode))
+                requested_policy = str(regime_agent.policy_for(effective_mode))
+                # Legacy config may still say "enforce". Context analytics
+                # cannot add a second strategy gate after model approval.
+                decision.market_regime_policy = "off" if requested_policy == "off" else "observe"
                 decision.market_regime = str(regime.regime)
                 decision.market_regime_confidence = float(regime.confidence)
                 decision.market_regime_range_pct = float(regime.range_pct)
@@ -341,8 +340,8 @@ class OrquestadorAgentes:
                 decision.market_regime_would_block = False
                 decision.market_regime_reason = "REGIME_EVALUATION_ERROR"
 
-        # Veto determinista: macro NEUTRAL o compresión lateral. La regla se
-        # registra siempre, pero en la fase Shadow no puede bloquear la orden.
+        # Record what the legacy filters would have rejected, independently
+        # from model approval. Do not populate operational hard-veto fields.
         hard_veto_reasons = []
         # ``auditar_gala10`` is also exercised by legacy integrations and test
         # doubles created with ``__new__``. Use safe defaults instead of assuming
@@ -356,9 +355,6 @@ class OrquestadorAgentes:
         hard_veto_lateral_range = bool(
             getattr(self, "hard_veto_lateral_range", True)
         )
-        hard_veto_probability_cap = float(
-            getattr(self, "hard_veto_probability_cap", 0.30)
-        )
         if hard_veto_enabled:
             if (
                 hard_veto_macro_neutral
@@ -370,8 +366,7 @@ class OrquestadorAgentes:
                 and bool(getattr(veredicto, "es_rango_lateral", False))
             ):
                 hard_veto_reasons.append("LATERAL_RANGE")
-        decision.hard_veto = bool(hard_veto_reasons)
-        decision.hard_veto_reason = "|".join(hard_veto_reasons)
+        decision.context_filter_reasons = "|".join(hard_veto_reasons)
 
         # Production veto and Shadow Mode are deliberately independent.
         # Shadow may recommend VETO, but it can never change decision.operar
@@ -392,16 +387,6 @@ class OrquestadorAgentes:
                 "would_approve": None, "source": "",
             }
 
-        # El hard-veto domina la recomendación aprendida. Si existe una
-        # probabilidad real, se limita a 0.30; sin modelo permanece N/A.
-        if decision.hard_veto:
-            shadow_prob = shadow.get("probability")
-            if shadow_prob is not None:
-                shadow["probability"] = min(
-                    float(shadow_prob), hard_veto_probability_cap
-                )
-            shadow["would_approve"] = False
-
         decision.shadow_enabled = bool(shadow.get("enabled", False))
         decision.shadow_model_loaded = bool(shadow.get("model_loaded", False))
         shadow_probability = shadow.get("probability")
@@ -415,15 +400,8 @@ class OrquestadorAgentes:
         decision.shadow_would_approve = shadow.get("would_approve")
         decision.shadow_model_source = str(shadow.get("source", "") or "")
 
-        # Regime policy is independent from the learned model and from the
-        # PAPER/REAL execution route. ``observe`` records the counterfactual;
-        # ``enforce`` is allowed to veto in that ticker's execution mode.
+        # Retain regime diagnostics without changing either model's approval.
         regime_policy = str(getattr(decision, "market_regime_policy", "off") or "off").lower()
-        if (
-            bool(getattr(decision, "market_regime_would_block", False))
-            and regime_policy in {"observe", "enforce"}
-        ):
-            decision.shadow_would_approve = False
 
         decision.prob_meta = prob
         if not aprueba:
@@ -440,43 +418,6 @@ class OrquestadorAgentes:
                     f"IA (modelo aprobado {ticker}) vetó la señal de Gala 10 "
                     f"(prob={prob:.2f})"
                 )
-            return decision
-
-        # Las reglas duras bloquean producción solo cuando el filtro de veto
-        # está realmente habilitado. En PAPER/Shadow (umbral=0) GALA10 sigue
-        # operando para medir los falsos positivos y falsos negativos.
-        production_veto_enabled = bool(
-            requerir_modelo
-            or float(getattr(self.entrenador, "umbral_meta", 0.0)) > 0
-        )
-        if decision.hard_veto and production_veto_enabled:
-            if decision.prob_meta is not None:
-                decision.prob_meta = min(
-                    float(decision.prob_meta), hard_veto_probability_cap
-                )
-            decision.operar = False
-            decision.execution_veto_reason = decision.hard_veto_reason
-            decision.resumen = (
-                "VETO DURO: " + decision.hard_veto_reason
-            )
-            return decision
-
-        # v3.1.1 mode-aware rollout. PAPER/REAL are independent execution
-        # authorities and can coexist per ticker. A regime veto is applied only
-        # when the explicit policy for this ticker's effective mode is ENFORCE.
-        if (
-            bool(getattr(decision, "market_regime_would_block", False))
-            and regime_policy == "enforce"
-        ):
-            decision.operar = False
-            decision.execution_veto_reason = str(
-                getattr(decision, "market_regime_reason", "REGIME_POLICY")
-            )
-            decision.resumen = (
-                "VETO RÉGIMEN: "
-                + str(getattr(decision, "market_regime_reason", "REGIME_POLICY"))
-                + f" | regime={getattr(decision, 'market_regime', 'UNKNOWN')}"
-            )
             return decision
 
         if decision.shadow_model_loaded:
@@ -501,17 +442,16 @@ class OrquestadorAgentes:
             )
         else:
             decision.resumen += " | IA N/A (modelo no cargado)"
-        if decision.hard_veto:
+        if decision.context_filter_reasons:
             decision.resumen += (
-                f" | REGLA VETO {decision.hard_veto_reason} "
-                f"cap={hard_veto_probability_cap:.2f} (sin bloquear)"
+                f" | CONTEXTO {decision.context_filter_reasons} (solo observación)"
             )
         if bool(getattr(decision, "market_regime_enabled", False)):
             regime_name = str(getattr(decision, "market_regime", "UNKNOWN"))
             regime_reason = str(getattr(decision, "market_regime_reason", "") or "")
             if bool(getattr(decision, "market_regime_would_block", False)):
                 decision.resumen += (
-                    f" | REGIME {regime_name} → VETARÍA ({regime_reason}, "
+                    f" | REGIME {regime_name} contexto ({regime_reason}, "
                     f"exec={effective_mode}, policy={regime_policy})"
                 )
             else:
