@@ -5617,11 +5617,12 @@ class ChocoletraBot:
             # require another explicit exit request; they never become MARKET.
             return
 
-        # Tras TP1 el 30% restante conserva el STOP de breakeven, pero el objetivo
-        # final se ejecuta desde el motor al observar el precio. El cierre usa la
-        # misma secuencia estricta: cancelar stop -> confirmar -> LIMIT -> plano.
+        # Both FULL_POSITION exits and the remainder after TP1 must honor the
+        # configured target. FULL_POSITION never sets tp1_hit. The close uses
+        # the existing cancel/confirm/LIMIT/flat sequence and broker fill proof.
         objetivo = float(pos.get("tp_final", 0) or 0)
-        if pos.get("tp1_hit") and objetivo > 0 and precio_actual > 0:
+        target_active = pos.get("tp1_hit") or not pos.get("salida_parcial", True)
+        if target_active and objetivo > 0 and precio_actual > 0:
             alcanzado = (
                 pos["tipo"] == "BUY" and precio_actual >= objetivo
             ) or (
