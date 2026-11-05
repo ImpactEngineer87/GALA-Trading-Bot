@@ -49,6 +49,34 @@ def prove_pending(row,audit,orders,day):
     return {'pending':row,'entry':entry,'exit':proof,'gross_pnl':gross}
 
 
+def record_verified_close(history,ledger,audit,proof,day):
+    row,entry,exit=proof['pending'],proof['entry'],proof['exit'];pid=row['position_id']
+    common={k:entry.get(k,'') for k in ['ticker','position_id','execution_id','correlation_id','signal_id','position_side']}
+    stamp=datetime.fromisoformat(exit['filled_at']);ny=stamp.astimezone(ZoneInfo('America/New_York'))
+    common.update(modo='REAL',order_id=exit['order_id'],parent_order_id=row['entry_order_id'],
+        cantidad=exit['quantity'],timestamp_utc=stamp.isoformat(),fecha=day,hora_ny=ny.strftime('%H:%M:%S'),
+        state_before=entry['position_side'],state_after='OUT',
+        order_action='SELL' if row['side']=='BUY' else 'BUY_TO_COVER',
+        motivo='Verified external closing fill; maintenance reconciliation')
+    closes=[r for r in history.read() if r.get('position_id')==pid and r.get('evento')=='POSITION_CLOSE']
+    if not closes:
+        history.record_close(**common,entrada=row['entry_price'],salida=exit['avg_price'],pnl_usd=proof['gross_pnl'])
+    elif (len(closes)!=1 or closes[0].get('order_id')!=exit['order_id']
+        or abs(float(closes[0]['pnl_usd'])-proof['gross_pnl'])>1e-6):
+        raise ValueError('CONFLICTING_CLOSE_HISTORY')
+    if not any(r.get('evento')=='POSITION_CLOSED' and r.get('position_id')==pid
+               and r.get('order_id')==exit['order_id'] for r in audit):
+        # Audit timestamps describe this recovery observation. The history and
+        # explicit broker_filled_at retain the actual execution timestamp.
+        audit_fields={k:v for k,v in common.items() if k not in {'timestamp_utc','fecha','hora_ny'}}
+        ledger.record('POSITION_CLOSED',**audit_fields,lado=row['side'],precio=exit['avg_price'],pnl_usd=proof['gross_pnl'],
+            estado='CLOSED',detalle={'broker_confirmed':True,'fill_price_verified':True,
+            'salida_real':exit['avg_price'],'external_manual_exit':True,'manual_risk_verified':True,
+            'tp1_ejecutado':False,'external_order_type':exit['order_type'],'broker_tag':exit['tag'],
+            'broker_filled_at':exit['filled_at']})
+    return common
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--apply',action='store_true');args=p.parse_args()
     from dotenv import load_dotenv
@@ -96,25 +124,7 @@ def main():
         feedback=FeedbackStore(str(paths[4]))
         for proof in proofs:
             row,entry,exit=proof['pending'],proof['entry'],proof['exit'];pid=row['position_id']
-            common={k:entry.get(k,'') for k in ['ticker','position_id','execution_id','correlation_id','signal_id','position_side']}
-            stamp=datetime.fromisoformat(exit['filled_at']);ny=stamp.astimezone(ZoneInfo('America/New_York'))
-            common.update(modo='REAL',order_id=exit['order_id'],parent_order_id=row['entry_order_id'],
-                cantidad=exit['quantity'],timestamp_utc=stamp.isoformat(),fecha=day,hora_ny=ny.strftime('%H:%M:%S'),
-                state_before=entry['position_side'],state_after='OUT',
-                order_action='SELL' if row['side']=='BUY' else 'BUY_TO_COVER',
-                motivo='Verified external replacement STOP; maintenance reconciliation')
-            closes=[r for r in history.read() if r.get('position_id')==pid and r.get('evento')=='POSITION_CLOSE']
-            if not closes:
-                history.record('POSITION_CLOSE',**common,entrada=row['entry_price'],salida=exit['avg_price'],pnl_usd=proof['gross_pnl'])
-            elif (len(closes)!=1 or closes[0].get('order_id')!=exit['order_id']
-                or abs(float(closes[0]['pnl_usd'])-proof['gross_pnl'])>1e-6):
-                raise ValueError('CONFLICTING_CLOSE_HISTORY')
-            if not any(r.get('evento')=='POSITION_CLOSED' and r.get('position_id')==pid
-                       and r.get('order_id')==exit['order_id'] for r in audit):
-                ledger.record('POSITION_CLOSED',**common,lado=row['side'],precio=exit['avg_price'],pnl_usd=proof['gross_pnl'],
-                    estado='CLOSED',detalle={'broker_confirmed':True,'fill_price_verified':True,
-                    'salida_real':exit['avg_price'],'external_manual_exit':True,'manual_risk_verified':True,
-                    'tp1_ejecutado':False,'external_order_type':exit['order_type'],'broker_tag':exit['tag']})
+            common=record_verified_close(history,ledger,audit,proof,day)
             risk_path=paths[3];risk=json.loads(risk_path.read_text())
             if risk.get('session_date')!=day:raise ValueError('CURRENT_RISK_SESSION_REQUIRED')
             markers=risk.setdefault('verified_pending_closes',{})
