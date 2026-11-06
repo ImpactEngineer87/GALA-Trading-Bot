@@ -48,6 +48,7 @@ Private incident packet: `data/incident-3322-qzu4am_a/private.json` (0600).
 | `core/dashboard_evidence.py:139` | Mark only explicitly documented maintenance exclusions as intentional. Preserve their excluded performance/training status. |
 | `server.py:602` | Sum eligible PAPER trades despite known maintenance exclusions; missing/invalid P/L and ambiguous records still produce N/A. Report the number of excluded maintenance closes separately. |
 | `dashboard/index.html` | Label PAPER P/L as eligible performance, show maintenance exclusions, explain re-scored reversal retries and label saved rejection messages as history. |
+| `server.py:_is_execution_retry` / chart markers / counters | Retain retry-analysis receipts for inspection without counting or plotting them as additional GALA master signals. |
 
 Models, thresholds, ticker routing, REAL/PAPER risk limits, order timeouts,
 normal LIMIT-only exits and confirmed cancellation/fill checks are not changed.
@@ -58,8 +59,9 @@ remain separate from actual executed trades and x/50 close counters.
 
 - **117 focused Windows tests passed**, covering the affected analysis, native
   refresh, reversal, cancellation, close-accounting and dashboard paths.
-- **All 633 Linux tests passed in 4.130 seconds**, as `gala`, with networking
-  disabled in `/opt/gala/GALA-Trading-Bot-review-3322-20261107`, code `300b3f4`.
+- **All 635 Linux tests passed in 3.663 seconds**, as `gala`, with networking
+  disabled in `/opt/gala/GALA-Trading-Bot-review-3322-20261107`, final tested code
+  `cb377d5`. This includes the two additional receipt/counter/chart checks.
 - Actual incident-ledger replay produced **-$265.38 eligible PAPER P/L** across
   **125 normal closes**, with **10 maintenance closes still excluded**. Original
   history, audit, feedback, risk files and model artifacts were not amended.
