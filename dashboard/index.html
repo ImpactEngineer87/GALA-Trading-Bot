@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.21</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.22</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -667,7 +667,7 @@
       <div class="stat-card purple">
         <div class="stat-icon">💰</div>
         <div class="stat-value" id="stPnl">$0</div>
-        <div class="stat-label">PnL PAPER actual</div>
+        <div class="stat-label">PnL PAPER elegible</div>
         <div class="daily-risk-sub" id="stPnlPaper">Abierto $0.00 · Cerrado hoy $0.00</div>
       </div>
     </div>
@@ -992,7 +992,7 @@
       <div class="stat-card green">
         <div class="stat-icon">💰</div>
         <div class="stat-value" id="tr-pnl">$0.00</div>
-        <div class="stat-label">PnL PAPER actual</div>
+        <div class="stat-label">PnL PAPER elegible</div>
         <div class="daily-risk-sub" id="tr-pnl-detail">Abierto $0.00 · Cerrado hoy $0.00</div>
       </div>
     </div>
@@ -1649,7 +1649,7 @@ async function fetchStatus(){
       const pnl = financialNumber(stats.paper_session_pnl);
       el('stPnl').textContent   = money(pnl);
       el('stPnl').style.color   = pnl >= 0 ? 'var(--green)' : 'var(--red)';
-      el('stPnlPaper').textContent = `Abierto ${money(stats.paper_unrealized_pnl)} · Cerrado hoy ${money(stats.paper_realized_today)}`;
+      el('stPnlPaper').textContent = `Abierto ${money(stats.paper_unrealized_pnl)} · Cerrado hoy ${money(stats.paper_realized_today)}${stats.paper_excluded_today ? ' · '+stats.paper_excluded_today+' cierres de mantenimiento excluidos' : ''}`;
       updateDailyRisk(d.daily_risk || {});
       updateSchedulerStatus(d.scheduler || {});
       updateBrokerReconciliation(d.broker_reconciliation || {});
@@ -1742,7 +1742,7 @@ function updateBrokerReconciliation(state){
     ordText ? `Órdenes abiertas: ${ordText}` : '',
     state.updated_at ? `Actualizado ${state.updated_at}` : ''
   ].filter(Boolean).join(' · ');
-  if(f) f.textContent = failureRows.length ? `Últimos rechazos: ${failureRows.join(' | ')}` : '';
+  if(f) f.textContent = failureRows.length ? `Últimos rechazos registrados (historial): ${failureRows.join(' | ')}` : '';
 }
 
 async function refreshBrokerReconciliation(){
@@ -1858,6 +1858,7 @@ function renderSignalFeed(id, sigs){
       <details style="max-width:100%;font-size:.72rem"><summary>Por qué / modelo</summary>
         <div>${escHtml(s.motivo || 'Sin motivo registrado')}</div>
         ${(s.ai_context||{}).execution_timing === 'LATE_CLOSED_BAR' ? '<div>Evaluación posterior con datos disponibles al cierre original. Decisión del modelo: '+escHtml((s.ai_context||{}).model_decision || 'N/A')+'. Sin entrada retroactiva.</div>' : ''}
+        ${(s.ai_context||{}).execution_intent?.kind === 'REVERSAL_RETRY' ? '<div>Reintento de reversión: nueva evaluación IA y precio actual tras un cierre pendiente. Señal original: '+escHtml(s.ai_context.execution_intent.parent_signal_id || 'N/A')+'.</div>' : ''}
         <div>IA aprobada no confirma envío/fill. ${escHtml(s.execution_evidence?.label||'Sin evidencia enlazada')}. Referencia de señal: no es precio de ejecución.</div>
         <div>Modelo: ${escHtml((s.ai_context||{}).model_version || 'N/A')} · ${escHtml((s.ai_context||{}).model_tier || 'N/A')}</div>
         <div>Balanced accuracy: ${(s.ai_context||{}).balanced_accuracy == null ? 'N/A' : Number(s.ai_context.balanced_accuracy).toFixed(2)+'%'} · Régimen: ${escHtml((s.ai_context||{}).market_regime || 'N/A')}</div>
@@ -2461,7 +2462,7 @@ async function fetchTrades(){
       const pnl = financialNumber(d.paper_session_pnl);
       el('tr-pnl').textContent = money(pnl);
       el('tr-pnl').style.color = pnl>=0 ? 'var(--green)':'var(--red)';
-      el('tr-pnl-detail').textContent = `Abierto ${money(d.paper_unrealized_pnl)} · Cerrado hoy ${money(d.paper_realized_today)}`;
+      el('tr-pnl-detail').textContent = `Abierto ${money(d.paper_unrealized_pnl)} · Cerrado hoy ${money(d.paper_realized_today)}${d.paper_excluded_today ? ' · '+d.paper_excluded_today+' cierres de mantenimiento excluidos' : ''}`;
       renderPositions('livePositionsFeed', S.positions, false);
       renderPositions('dashTradesFeed', S.positions, true);
       renderTradeEvents('tradesFeed', S.tradeEvents.slice().reverse());

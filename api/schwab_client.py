@@ -825,6 +825,7 @@ class SchwabClient:
 
         # 30m una sola vez -> 1H y 4H
         base_30m = self._fetch_minutos_chunked(ticker, 30, 60)
+        velas['30m'] = base_30m
         velas["4H"] = self._resample(base_30m, "4h") if base_30m is not None else None
         velas["1H"] = self._resample(base_30m, "1h") if base_30m is not None else None
 
@@ -841,6 +842,34 @@ class SchwabClient:
             raise RuntimeError(f"{ticker}: datos multi-temporal insuficientes; sin precios de sustitución")
 
         return DatosMultiTemporal(ticker=ticker, velas=velas)
+
+    def refrescar_contexto_multitemporal(self, ticker, previous, config=None):
+        """Refresh native tails while retaining the full indicator warmup.
+
+        Repeating every 10-day history page is unnecessary for a five-minute
+        context update. The 1m execution feed remains the engine's separate GET.
+        """
+        from agents.contracts import DatosMultiTemporal
+        if previous is None or previous.sintetico or previous.tf('30m') is None:
+            return self.obtener_multitemporal(ticker, config)
+        cfg = config or {}
+        days = cfg.get('ai', {}).get('dias_historia_schwab', 365)
+        frames = dict(previous.velas)
+        for tf in ('1W', '1D'):
+            fresh = self.obtener_historico(ticker, tf, days)
+            if fresh is None or fresh.empty:
+                raise RuntimeError('Native historical context unavailable')
+            frames[tf] = fresh
+        for tf, frequency in (('30m',30), ('15m',15), ('5m',5)):
+            fresh = self._fetch_minutos_chunked(ticker, frequency, 2)
+            if fresh is None or fresh.empty:
+                raise RuntimeError('Native intraday context unavailable')
+            previous_frame = frames.get(tf)
+            combined = pd.concat([previous_frame,fresh]) if previous_frame is not None else fresh
+            frames[tf] = combined[~combined.index.duplicated(keep='last')].sort_index()
+        frames['1H'] = self._resample(frames['30m'], '1h')
+        frames['4H'] = self._resample(frames['30m'], '4h')
+        return DatosMultiTemporal(ticker=ticker, velas=frames)
 
     def _multitemporal_fallback(self, ticker: str):
         """

@@ -598,9 +598,11 @@ def _history_summary():
                 today_counts[mode] += 1
         except (TypeError, ValueError):
             pass
-    incomplete = {mode: any(not r.get("performance_verified") and mode_of(r) == mode
+    incomplete = {mode: any(not r.get("performance_verified")
+                            and not r.get('performance_intentionally_excluded') and mode_of(r) == mode
                             for r in all_closed) for mode in ("PAPER", "REAL")}
-    incomplete_today = {mode: any(not r.get("performance_verified") and mode_of(r) == mode
+    incomplete_today = {mode: any(not r.get("performance_verified")
+                                  and not r.get('performance_intentionally_excluded') and mode_of(r) == mode
                                   and session_date(r) == today_ny for r in all_closed)
                         for mode in ("PAPER", "REAL")}
     return {
@@ -617,6 +619,8 @@ def _history_summary():
         "real_realized_today": None if incomplete_today["REAL"] else round(today_pnl["REAL"], 2),
         "paper_closed_today": today_counts["PAPER"],
         "real_closed_today": today_counts["REAL"],
+        'paper_excluded_today': sum(bool(r.get('performance_intentionally_excluded'))
+            and mode_of(r) == 'PAPER' and session_date(r) == today_ny for r in all_closed),
     }
 
 
@@ -839,6 +843,7 @@ def _dashboard_stats():
     stats["paper_realized_today"] = history["paper_realized_today"]
     stats["real_realized_today"] = history["real_realized_today"]
     stats["paper_closed_today"] = history["paper_closed_today"]
+    stats['paper_excluded_today'] = history.get('paper_excluded_today', 0)
     stats["real_closed_today"] = history["real_closed_today"]
     stats["paper_session_pnl"] = _pnl_sum(
         history["paper_realized_today"], live["paper_unrealized_pnl"]
@@ -3765,6 +3770,7 @@ def get_trades():
         "paper_closed_count": history["paper_closed_count"],
         "real_closed_count": history["real_closed_count"],
         "paper_realized_today": history["paper_realized_today"],
+        'paper_excluded_today': history.get('paper_excluded_today', 0),
         "real_realized_today": history["real_realized_today"],
         **live,
         "paper_session_pnl": _pnl_sum(

@@ -55,6 +55,7 @@ from core.real_accounting import RealAccountingGuard
 from core.project_paths import resolve_runtime_path
 from core.memory_diagnostics import memory_usage_mib
 from core.symbol_work import SymbolWork, causal_snapshot
+from core.macro_refresh import MacroRefresh
 from core.ticker_execution import TickerExecutionRegistry
 from core.live_capacity import RealCapacityManager, max_real_tickers
 from core.runtime_reliability import effective_ai_threshold
@@ -1275,6 +1276,7 @@ class ChocoletraBot:
                 return
             self._activo = True
             self._latest_gala_decisions = {}
+            self._pending_reversal_intents = {}
         self._fin_sesion_alcanzado = False
         self._post_session_retrain_scheduled = False
 
@@ -1357,6 +1359,7 @@ class ChocoletraBot:
             len(self.tickers) + 1, self._run_ticker_work,
             self._discard_ticker_work, self._ticker_work_failed,
         )
+        self._macro_refresh = MacroRefresh(self._refrescar_contexto_mtf)
         try:
             while self._activo:
                 # Strict bar-close cadence: no strategy evaluation occurs in the
@@ -1539,6 +1542,9 @@ class ChocoletraBot:
         with self._lock:
             self._activo = False
         self._close_ticker_work()
+        macro_refresh = getattr(self, '_macro_refresh', None)
+        if macro_refresh is not None:
+            macro_refresh.close()
         self._detener_monitor_ordenes()
         broker_state = dict(getattr(self, "_broker_reconciliation", {}) or {})
         if not already_stopped:
@@ -1660,6 +1666,7 @@ class ChocoletraBot:
 
     def _procesar_ticker(self, ticker: str):
         """Pipeline completo para un ticker (se ejecuta en un hilo)."""
+        pipeline_started = time.monotonic()
         paper_ticker = self._is_paper_ticker(ticker)
         # 1) Datos multi-temporal (con caché)
         try:
@@ -1667,6 +1674,7 @@ class ChocoletraBot:
         except Exception:
             self._quarantine_real_ticker(ticker, 'Market data request failed')
             return
+        data_elapsed_ms = (time.monotonic() - pipeline_started) * 1000
         datos_confirmados = self._datos_micro_confirmados(datos)
         # GALA10 y el dimensionamiento inmediato trabajan sobre 1m. Las TF mayores
         # siguen disponibles para los agentes como contexto/veto.
@@ -1773,6 +1781,13 @@ class ChocoletraBot:
                 bar_duration_minutes=micro_duration_minutes)
             if decision is not None:
                 self._remember_gala_decision(ticker, decision)
+        elif getattr(self, 'agentes_activos', False):
+            decision = self._analizar_reversion_pendiente(
+                ticker, datos_confirmados, precio_actual, df_micro)
+        self._emit_log('INFO', f'[ANALYSIS_TICKER] {ticker}; '
+            f'data_ms={data_elapsed_ms:.0f}; '
+            f'pipeline_ms={(time.monotonic()-pipeline_started)*1000:.0f}; '
+            f'closed_bar={df_micro.index[-1]}')
         payload = (precio_actual, df_micro, decision)
         work = getattr(self, '_ticker_work', None)
         if work is None:
@@ -1799,6 +1814,82 @@ class ChocoletraBot:
             old_bar = getattr(previous, 'signal_bar_timestamp', None)
             if old_bar is None or pd.to_datetime(bar, utc=True) > pd.to_datetime(old_bar, utc=True):
                 self._latest_gala_decisions[ticker] = decision
+                intent = getattr(self, '_pending_reversal_intents', {}).get(ticker)
+                if intent and intent['source_signal_id'] != str(getattr(decision, 'signal_id', '') or ''):
+                    self._pending_reversal_intents.pop(ticker, None)
+                    self._audit_event('REVERSAL_INTENT_CANCELED', ticker=ticker,
+                        signal_id=intent['source_signal_id'], estado='NEW_MASTER_SIGNAL',
+                        motivo='A newer GALA master signal superseded the pending reversal')
+
+    def _retain_reversal_intent(self, decision, position):
+        """Keep an approved reversal until its prior close is resolved."""
+        ticker = decision.ticker
+        with self._lock:
+            if not hasattr(self, '_pending_reversal_intents'):
+                self._pending_reversal_intents = {}
+            existing = self._pending_reversal_intents.get(ticker)
+            parent = str(getattr(decision, 'reversal_parent_signal_id', '')
+                         or getattr(decision, 'signal_id', '') or '')
+            if existing and existing['source_signal_id'] == parent:
+                return
+            self._pending_reversal_intents[ticker] = {
+                'side': decision.tipo, 'source_signal_id': parent,
+                'position': position, 'prior_closed': False,
+                'reversal_id': str(getattr(decision, 'reversal_id', '') or ''),
+                'last_evaluated_bar': getattr(decision, 'signal_bar_timestamp', None),
+            }
+        self._audit_event('REVERSAL_INTENT_RETAINED', ticker=ticker,
+            signal_id=parent, lado=decision.tipo, estado='WAITING_FOR_CLOSE',
+            motivo='Reevaluate approved reversal on each new confirmed candle')
+
+    def _analizar_reversion_pendiente(self, ticker, datos, price, frame):
+        """Re-score a real pending execution intent, never an old chart signal."""
+        with self._lock:
+            intents = getattr(self, '_pending_reversal_intents', {})
+            intent = intents.get(ticker)
+            if intent is None:
+                return None
+            latest = getattr(self, '_latest_gala_decisions', {}).get(ticker)
+            pos = self._posiciones.get(ticker)
+            current = (latest is not None
+                and str(getattr(latest, 'signal_id', '') or '') == intent['source_signal_id']
+                and getattr(latest, 'gala_signal_side', None) == intent['side']
+                and ((pos is intent['position']) or (pos is None and intent['prior_closed'])))
+            if not current or not getattr(self, '_activo', True):
+                intents.pop(ticker, None)
+                self._audit_event('REVERSAL_INTENT_CANCELED', ticker=ticker,
+                    signal_id=intent['source_signal_id'], estado='SUPERSEDED_OR_CLOSED',
+                    motivo='New master signal, changed position or stopped engine')
+                return None
+            bar = frame.index[-1]
+            previous = intent.get('last_evaluated_bar')
+            if previous is not None and pd.to_datetime(bar, utc=True) <= pd.to_datetime(previous, utc=True):
+                return None
+            intent['last_evaluated_bar'] = bar
+        calculated = self.estrategia.calcular(frame)
+        context = extraer_features_gala10(calculated, posicion=-1,
+                                         senal=intent['side'], timestamp=bar)
+        decision = self._analizar_senal_gala(ticker, datos, price, frame,
+            intent['side'], bar, context,
+            execution_intent={'kind': 'REVERSAL_RETRY',
+                'parent_signal_id': intent['source_signal_id']})
+        if decision is not None:
+            decision.reversal_parent_signal_id = intent['source_signal_id']
+            decision.reversal_id = intent['reversal_id']
+        return decision
+
+    def _valid_reversal_retry(self, ticker, decision):
+        parent = getattr(decision, 'reversal_parent_signal_id', '')
+        if not parent:
+            return True
+        with self._lock:
+            intent = getattr(self, '_pending_reversal_intents', {}).get(ticker)
+            latest = getattr(self, '_latest_gala_decisions', {}).get(ticker)
+            pos = self._posiciones.get(ticker)
+            return bool(intent and latest and intent['source_signal_id'] == parent
+                and str(getattr(latest, 'signal_id', '') or '') == parent
+                and getattr(latest, 'gala_signal_side', None) == intent['side']
+                and (pos is intent['position'] or (pos is None and intent['prior_closed'])))
 
     def _close_late_opposite(self, ticker, precio_actual):
         # A missed opposite event must not leave an older position open simply
@@ -1807,7 +1898,7 @@ class ChocoletraBot:
         with self._lock:
             decision = getattr(self, '_latest_gala_decisions', {}).get(ticker)
             pos = self._posiciones.get(ticker)
-            if decision is None or not pos or pos.get('pendiente') or pos.get('reservado'):
+            if decision is None or not pos or pos.get('reservado'):
                 return
             side = getattr(decision, 'gala_signal_side', None)
             if not ((pos.get('tipo') == 'BUY' and side == 'SELL')
@@ -1824,6 +1915,16 @@ class ChocoletraBot:
                     original = original.astimezone(timezone.utc)
             bar = getattr(decision, 'signal_bar_timestamp', None)
             if bar is None or pd.to_datetime(bar, utc=True) <= pd.to_datetime(original, utc=True):
+                return
+        if pos.get('pendiente'):
+            if self._cancelar_pendiente(ticker):
+                return
+            # A fill may win the cancellation race. Close only the adopted
+            # position; an unreadable/pending order cannot authorize a new entry.
+            with self._lock:
+                pos = self._posiciones.get(ticker)
+            if (not pos or pos.get('pendiente') or pos.get('reservado')
+                    or pos.get('tipo') == side):
                 return
         with self._lifecycle_scope({'signal_id':str(getattr(decision, 'signal_id', '') or '')}):
             self._cerrar_posicion(ticker, precio_actual,
@@ -1880,6 +1981,9 @@ class ChocoletraBot:
             if superseded():
                 self._discard_ticker_work(ticker, payload, 'NEWER_CANDLE_ANALYZED')
                 return
+            if not self._valid_reversal_retry(ticker, decision):
+                self._discard_ticker_work(ticker, payload, 'REVERSAL_INTENT_SUPERSEDED')
+                return
             if decision.operar:
                 self._abrir_o_revertir(decision, precio_actual, df_micro)
                 return
@@ -1888,17 +1992,33 @@ class ChocoletraBot:
             side = getattr(decision, 'gala_signal_side', None)
             with self._lock:
                 pos = self._posiciones.get(ticker)
-                opposite = bool(pos and not pos.get('reservado') and not pos.get('pendiente')
+                opposite = bool(pos and not pos.get('reservado')
                     and ((pos.get('tipo') == 'BUY' and side == 'SELL')
                          or (pos.get('tipo') == 'SELL' and side == 'BUY')))
             if opposite:
-                self._cerrar_posicion(ticker, precio_actual,
+                if pos.get('pendiente'):
+                    if self._cancelar_pendiente(ticker):
+                        return
+                    with self._lock:
+                        pos = self._posiciones.get(ticker)
+                    if (not pos or pos.get('pendiente') or pos.get('reservado')
+                            or pos.get('tipo') == side):
+                        return
+                closed = self._cerrar_posicion(ticker, precio_actual,
                     motivo=f'señal opuesta {side} (entrada IA vetada)')
+                if closed and getattr(decision, 'reversal_parent_signal_id', ''):
+                    with self._lock:
+                        getattr(self, '_pending_reversal_intents', {}).pop(ticker, None)
+            elif getattr(decision, 'reversal_parent_signal_id', ''):
+                with self._lock:
+                    if self._posiciones.get(ticker) is None:
+                        getattr(self, '_pending_reversal_intents', {}).pop(ticker, None)
 
     def _analizar_senal_gala(self, ticker, datos_confirmados, precio_actual,
                              df_micro, senal_gala10, signal_bar_timestamp,
                              gala_context, *, observation_only=False,
-                             analysis_time=None, bar_duration_minutes=1):
+                             analysis_time=None, bar_duration_minutes=1,
+                             execution_intent=None):
         paper_ticker = self._is_paper_ticker(ticker)
         # v2.9.3: una señal opuesta a una posición ya abierta tiene DOS efectos
         # distintos: (1) cerrar la posición actual y (2) eventualmente abrir la
@@ -1910,7 +2030,6 @@ class ChocoletraBot:
                 not observation_only
                 and _pos_signal
                 and not _pos_signal.get("reservado")
-                and not _pos_signal.get("pendiente")
                 and (
                     (_pos_signal.get("tipo") == "BUY" and senal_gala10 == "SELL")
                     or (_pos_signal.get("tipo") == "SELL" and senal_gala10 == "BUY")
@@ -2042,6 +2161,8 @@ class ChocoletraBot:
                           market_regime_policy=getattr(decision, 'market_regime_policy', ''),
                           execution_veto_reason=getattr(decision, 'execution_veto_reason', ''),
                           manual_authorization=getattr(decision, 'ai_manual_authorization', None))
+        if execution_intent:
+            ai_context['execution_intent'] = dict(execution_intent)
         # v3.3.1: persist both decision wall-clock time (server hook) and the
         # exact closed bar that generated GALA10.  The 1m loop can emit at
         # 13:34:04 for the bar that opened at 13:33:00.
@@ -2540,6 +2661,13 @@ class ChocoletraBot:
             signal_id=str((signal or {}).get('signal_id') or ''), lado=side,
             estado='NO_ORDER_SENT', motivo='LATE_ANALYSIS_UNAVAILABLE')
 
+    def _refrescar_contexto_mtf(self, ticker):
+        with self._lock:
+            entry = self._mtf_cache.get(ticker)
+            previous = (DatosMultiTemporal(ticker, dict(entry[1].velas),
+                         sintetico=entry[1].sintetico) if entry else None)
+        return self.schwab.refrescar_contexto_multitemporal(ticker, previous, self.config)
+
     def _obtener_mtf(self, ticker: str) -> DatosMultiTemporal:
         """Datos multi-temporal con DOBLE refresco: el 1m/5m se re-baja en cada ciclo
         (barato) para que el precio y la señal estén al día como el bróker; las
@@ -2554,6 +2682,29 @@ class ChocoletraBot:
             self._mtf_cache[ticker] = (ahora, datos, ahora)
             return datos
         ent = self._mtf_cache.get(ticker)     # (t_macro, datos, t_micro)
+        refresher = getattr(self, '_macro_refresh', None)
+        if ent and refresher is not None:
+            try:
+                ready = refresher.completed(ticker)
+            except Exception as exc:
+                ready = None
+                self._emit_log('WARN', f'[{ticker}] Historical context refresh failed '
+                    f'({type(exc).__name__}); fresh 1m polling continues')
+            if ready is not None:
+                refreshed, completed_at = ready
+                if (completed_at > ent[0] and not refreshed.sintetico and refreshed.tf('1m') is not None
+                        and len(refreshed.tf('1m'))):
+                    # A slow historical snapshot must not replace newer 1m data
+                    # already fetched by the analysis thread while it was running.
+                    combined = pd.concat([refreshed.tf('1m'), ent[1].tf('1m')])
+                    refreshed.velas['1m'] = combined[
+                        ~combined.index.duplicated(keep='last')].sort_index()
+                    ent = (completed_at, refreshed, ent[2])
+                    self._mtf_cache[ticker] = ent
+            # Start before expiry; the configured maximum cache age is retained.
+            refresh_after = max(self._mtf_ttl_macro*.5, self._mtf_ttl_macro-120)
+            if (ahora - ent[0]) >= refresh_after:
+                refresher.request(ticker)
         if ent and (ahora - ent[0]) < self._mtf_ttl_macro:
             datos = ent[1]
             if (ahora - ent[2]) >= self._mtf_ttl:
@@ -2883,6 +3034,10 @@ class ChocoletraBot:
                 self._emit_log("INFO", f"[{ticker}] Giro pospuesto: la entrada pendiente ya estaba "
                                        f"llenada; se cerrará y volteará el próximo ciclo")
                 self._audit_approved_signal_skip(decision, "PENDING_ENTRY_NOT_CLEARED")
+                with self._lock:
+                    pending_position = self._posiciones.get(ticker)
+                if pending_position is not None:
+                    self._retain_reversal_intent(decision, pending_position)
                 return
         elif reverse:
             prior_state = state_before.state
@@ -2912,6 +3067,7 @@ class ChocoletraBot:
             decision.signal_id = signal_id
             decision.reversal_id = reversal_id
             decision.correlation_id = reversal_id
+            self._retain_reversal_intent(decision, pos)
             # Cerrar la posición contraria (cancela protecciones y liquida en real)
             self._emit_log("INFO", f"[{ticker}] REVERSIÓN → {tipo}: cerrando y volteando")
             self._audit_event(
@@ -2977,7 +3133,19 @@ class ChocoletraBot:
                 self._reversal_contexts.pop(ticker, None)
                 return
         else:
-            reversal_id = ""
+            reversal_id = str(getattr(decision, 'reversal_id', '') or '')
+
+        # A close may take longer than a candle. Keep the verified flat state,
+        # but require a fresh analysis before submitting the opposite entry.
+        latest_bar = getattr(self, '_ultima_vela_procesada', {}).get(ticker)
+        decision_bar = getattr(decision, 'signal_bar_timestamp', None)
+        if (latest_bar is not None and decision_bar is not None
+                and pd.to_datetime(decision_bar, utc=True) < pd.to_datetime(latest_bar, utc=True)):
+            self._audit_approved_signal_skip(decision, 'NEWER_CANDLE_ANALYZED')
+            return
+        if not self._valid_reversal_retry(ticker, decision):
+            self._audit_approved_signal_skip(decision, 'REVERSAL_INTENT_SUPERSEDED')
+            return
 
         lifecycle = self._assign_entry_lifecycle(decision, reversal_id)
         target_state = state_for_signal(tipo)
@@ -3041,6 +3209,8 @@ class ChocoletraBot:
                 )
         if reverse:
             self._reversal_contexts.pop(ticker, None)
+        with self._lock:
+            getattr(self, '_pending_reversal_intents', {}).pop(ticker, None)
 
     def _abrir_operacion(self, decision, precio_actual: float, df_micro) -> bool:
         """Ejecuta la apertura. Devuelve True si la posición quedó abierta."""
@@ -5513,6 +5683,18 @@ class ChocoletraBot:
                 "exit_execution": exit_execution,
             },
         )
+        with self._lock:
+            intents = getattr(self, '_pending_reversal_intents', {})
+            intent = intents.get(ticker)
+            if intent is not None and intent['position'] is pos:
+                reversal_close = ('revers' in motivo_normalizado
+                                  or 'señal opuesta' in motivo_normalizado)
+                if (reversal_close and accounting_verified and transition_ok
+                        and audit_row and history_row and not manual_exit
+                        and getattr(self, '_activo', False)):
+                    intent['prior_closed'] = True
+                else:
+                    intents.pop(ticker, None)
         if manual_exit and (not history_row or not audit_row):
             self._require_real_accounting(
                 ticker, pos, "Cierre manual verificado pero ledger no persistido",

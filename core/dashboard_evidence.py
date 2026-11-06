@@ -77,7 +77,12 @@ def annotate_history(history_rows, audit_rows=()):
         key = _identity(event)
         kind = str(event.get("evento") or "").upper()
         if mode_of(event) == 'PAPER' and kind == 'PAPER_OBSERVATION_QUARANTINED' and all(key):
-            paper_quarantine[key] = str(event.get('motivo') or 'Simulación ambigua')
+            reason = str(event.get('motivo') or 'Simulación ambigua')
+            detail = _detail(event)
+            known_maintenance = (reason.startswith('CONTROLLED_MAINTENANCE_CLOSE_')
+                and detail.get('training_eligible') is False
+                and detail.get('performance_eligible') is False)
+            paper_quarantine[key] = (reason, known_maintenance)
             continue
         if (key not in wanted or mode_of(event) != "REAL"
                 or kind not in {"ENTRY_FILLED", "POSITION_CLOSED", "TP1_FILLED_70_PERCENT"}):
@@ -110,7 +115,7 @@ def annotate_history(history_rows, audit_rows=()):
         elif all(_identity(row)) and latest_close.get(_identity(row)) is not row:
             reason = "Cierre duplicado; se conserva sólo el último registro"
         elif mode == 'PAPER' and _identity(row) in paper_quarantine:
-            reason = paper_quarantine[_identity(row)]
+            reason = paper_quarantine[_identity(row)][0]
         elif mode == "REAL":
             events = index.get(_identity(row), {})
             risk_reason = _real_close_reason(row, events)
@@ -130,6 +135,10 @@ def annotate_history(history_rows, audit_rows=()):
             reason if mode != "REAL" else ""))
         row["performance_verified"] = not bool(reason)
         row["performance_exclusion_reason"] = reason
+        exclusion = paper_quarantine.get(_identity(row))
+        row['performance_intentionally_excluded'] = bool(
+            mode == 'PAPER' and is_close and pnl is not None and exclusion
+            and exclusion[1] and reason == exclusion[0])
         row["pnl_source"] = (
             "MANUAL_BROKER_FILL_GROSS" if manual_exit and row["accounting_verified"] else
             "UNVERIFIED" if reason else
