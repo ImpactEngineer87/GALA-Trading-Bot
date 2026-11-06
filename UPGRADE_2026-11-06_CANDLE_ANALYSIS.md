@@ -97,9 +97,8 @@ in force. Replaced/stopped/error tasks retain explicit audit reasons.
   saved direction. The replay submitted no orders and changed no positions or
   models. Results below use settled macro context, not the unrecorded exact live
   forming-macro input.
-- The implementation is not yet loaded into the VPS process. Deployment must
-  wait for independently verified broker flat/no pending orders; the client
-  previously selected waiting for positions to close normally.
+- Deployment completed after independently verified broker flat/no pending
+  orders, respecting the client's instruction to wait for normal closes.
 
 ### Production-model replay (November 6, New York emission time)
 
@@ -116,6 +115,42 @@ These are labelled reconstruction results, not replacements for historical
 decisions or evidence of trades that never occurred.
 
 Private replay evidence: `data/timing-model-replay-20261106-veazopoe/result.json`.
+
+## Deployment verified
+
+On **November 6, 11:46:23 New York / 20:46:23 Saratov / 16:46:23 UTC**:
+
+- VPS web service reported **3.3.21**, active from the production checkout.
+  Tested code is `4b60935`; the first deployed commit including its replay report
+  was `822bf49606a93da3837743e0dc6f719f9f99ab05`. GitHub was updated before the
+  VPS fast-forward. Subsequent documentation-only commits use the same code.
+- Authenticated engine status was **STOPPED**, with no live trading thread.
+  The engine was deliberately left off; no start/REAL trading request was sent.
+- Strict, independent Schwab GET verification confirmed **zero positions and
+  zero pending orders**, including child-order inspection. The engine stop
+  completed at **11:44:26 New York**, after broker-flat checks before and after
+  preparing the backup.
+- REAL accounting and daily-loss entry blocks were **false**. No manual-close
+  reconciliation remained pending.
+- All **48 protected files** retained their hashes: configuration, routing,
+  threshold overrides, production/shadow model artifacts and original accounting
+  guard. No new REAL trade audit events occurred during maintenance.
+- The controlled Stop closed **10 PAPER positions**. Exact matching feedback
+  identities were superseded with
+  `CONTROLLED_MAINTENANCE_CLOSE_20261106_3321`, execution-valid=false, before
+  the updated service started. Dataset checks confirmed only those maintenance
+  closes lost training eligibility; model hashes stayed unchanged.
+- The authenticated signals API now explains the original TSLA 10:30:47 row as
+  `MISSED_ANALYSIS` / "Vela procesada tarde; IA no evaluada; sin entrada". Its
+  original `MISSED_EVALUATION` decision is preserved; no past fill is invented.
+
+Private backup: `/opt/gala/backups/upgrade-3.3.21-_f6wtldv`.
+Verification receipt: `data/upgrade_verification_20261106_3321.json` (0600).
+
+The next live trading cycle has not been exercised: deployment verification
+kept the engine off. The client can start it through the dashboard. Subsequent
+`[ANALYSIS]` elapsed times and exact per-signal receipts allow live confirmation
+of analysis timing and any remaining provider/model failures.
 
 Incident packet on VPS: `data/timing-review-2026-11-06-q145_mzw/private.json`
 (0600). This contains the exact read-only broker, signal and audit snapshot.
