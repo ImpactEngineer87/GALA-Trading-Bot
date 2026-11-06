@@ -32,13 +32,13 @@ Baseline is commit `8fffe3b`, version 3.3.20:
 The two-worker configuration predates this upgrade. This change retains the
 configured number of analysis workers and separates the order work.
 
-## Implementation under review
+## Implementation
 
 | File / entry point | Change |
 |---|---|
-| `core/symbol_work.py:12` | Bounded per-symbol order mailboxes: one running task and one latest pending snapshot per symbol; separate threads from analysis. |
-| `core/symbol_work.py:62` | Causal snapshot helper removes forming/future native frames for delayed analysis. |
-| `engine/bot_engine.py:1356` | Create the order-work pool; account reconciliation uses its own mailbox. Analysis retains configured worker count. |
+| `core/symbol_work.py:11` | Bounded per-symbol order mailboxes: one running task and one latest pending snapshot per symbol; separate threads from analysis. |
+| `core/symbol_work.py:60` | Causal snapshot helper removes forming/future native frames for delayed analysis. |
+| `engine/bot_engine.py:1356` | Create up to 18 lightweight order workers for the 17 tickers plus account reconciliation. Heavy analysis retains the two configured workers. |
 | `engine/bot_engine.py:1766` | Calculate and publish the signal/model decision before submitting position/order work. |
 | `engine/bot_engine.py:1803` | Remember the newest analysed master direction; an opposite event can close an older position on a later heartbeat. It cannot close a position opened after that event or open a historical entry. |
 | `engine/bot_engine.py:1852` | Run order/position work under the existing symbol lock, recheck current state, and explicitly explain stopped/superseded snapshots. |
@@ -88,9 +88,34 @@ in force. Replaced/stopped/error tasks retain explicit audit reasons.
   historical-log fixture. The old timing-label expectation was updated to the
   new explicit unavailable-analysis outcome for its deliberately incomplete
   context. Linux full-suite verification is the deployment gate.
+- **All 610 tests pass on Linux**, run as `gala` with networking disabled in
+  `/opt/gala/GALA-Trading-Bot-review-20261106` at code commit `4b60935`.
+  The production checkout and trading process were untouched during testing.
+- An isolated replay used copied production TSLA/META models, the active
+  threshold overrides and actual Schwab candles. All four formerly unevaluated
+  signals produced a model score; each reconstructed GALA direction matched the
+  saved direction. The replay submitted no orders and changed no positions or
+  models. Results below use settled macro context, not the unrecorded exact live
+  forming-macro input.
 - The implementation is not yet loaded into the VPS process. Deployment must
   wait for independently verified broker flat/no pending orders; the client
   previously selected waiting for positions to close normally.
+
+### Production-model replay (November 6, New York emission time)
+
+| Signal | Reconstructed score | Active threshold | New-entry model decision |
+|---|---:|---:|---|
+| TSLA SELL 09:36:54 | 66.42% | 55% | APPROVED |
+| TSLA SELL 10:30:47 | 47.79% | 55% | VETO |
+| META BUY 10:17:57 | 30.65% | 56% | VETO |
+| META BUY 10:46:38 | 40.00% | 56% | VETO |
+
+A veto of a new short does not veto closing an existing long on the opposite
+GALA signal. The late-opposite heartbeat path is covered by execution tests.
+These are labelled reconstruction results, not replacements for historical
+decisions or evidence of trades that never occurred.
+
+Private replay evidence: `data/timing-model-replay-20261106-veazopoe/result.json`.
 
 Incident packet on VPS: `data/timing-review-2026-11-06-q145_mzw/private.json`
 (0600). This contains the exact read-only broker, signal and audit snapshot.
