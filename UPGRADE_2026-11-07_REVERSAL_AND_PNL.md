@@ -46,7 +46,7 @@ Private incident packet: `data/incident-3322-qzu4am_a/private.json` (0600).
 | `engine/bot_engine.py:1894` | The late-opposite heartbeat also handles pending-entry cancellation. It never opens a historical observation. |
 | Successful close accounting | Only a verified intended reversal close can keep an intent ready for its opposite entry. Manual/unverified closes, replacement positions, stopped engines, newer master signals and a fresh AI veto cannot reopen the old intent. A newer candle arriving during a close wait requires another fresh analysis. |
 | `core/dashboard_evidence.py:139` | Mark only explicitly documented maintenance exclusions as intentional. Preserve their excluded performance/training status. |
-| `server.py:602` | Sum eligible PAPER trades despite known maintenance exclusions; missing/invalid P/L and ambiguous records still produce N/A. Report the number of excluded maintenance closes separately. |
+| `server.py:609` | Sum eligible PAPER trades despite known maintenance exclusions; missing/invalid P/L and ambiguous records still produce N/A. Report the number of excluded maintenance closes separately. |
 | `dashboard/index.html` | Label PAPER P/L as eligible performance, show maintenance exclusions, explain re-scored reversal retries and label saved rejection messages as history. |
 | `server.py:_is_execution_retry` / chart markers / counters | Retain retry-analysis receipts for inspection without counting or plotting them as additional GALA master signals. |
 
@@ -72,11 +72,36 @@ remain separate from actual executed trades and x/50 close counters.
   80 HTTP calls were GETs; no order was submitted and no position was modified.
   These are after-hours data measurements, not an open-session latency guarantee.
   Evidence: `data/incident-3322-qzu4am_a/candidate-replay-result.json`.
-- Deployment verification is pending. The production checkout remains on
-  3.3.21 at this writing.
-- The client selected waiting for normal REAL closes before maintenance. The
-  latest read confirmed flat; deployment will repeat the strict broker checks
-  and leave the trading engine OFF, with the dashboard service available.
+- Deployment verification completed successfully; details below.
+
+## Verified deployment
+
+At **03:45:12 Saratov November 7 / 18:45:12 New York November 6**:
+
+- The active VPS web service reported **3.3.22**, deployed by fast-forward from
+  GitHub at `ecfdd367a1c4bcce54695545d443ce6fd96eef51`. Final tested code is
+  `cb377d5`; subsequent commits only document verification.
+- Engine **OFF**, trading thread **not alive**. It had already stopped at its
+  configured session cutoff. Maintenance sent no engine Stop/Start request,
+  submitted no order and forced no position close.
+- Strict independent Schwab GET checks confirmed **0 positions / 0 pending
+  orders**, including child orders. Effective REAL accounting and daily-loss
+  blocks were **false**, and no manual-close reconciliation was pending.
+- Authenticated API PAPER P/L was **-$265.38**, with **125 eligible simulated
+  closes** and **10 maintenance exclusions**. REAL recorded gross P/L was **$8.85**;
+  these figures are local strategy records, not Schwab account-wide net P/L.
+- **56 protected files were byte-identical**, including models, thresholds,
+  routing, configuration, trade/signal/feedback ledgers and risk/accounting
+  state. The 57th file, `data/retraining_state.json`, differed only in its
+  top-level `updated_utc` startup timestamp. Its entire remaining payload,
+  including every ticker counter, training result and promotion status, matched
+  the backup. The verification explicitly checks that sole metadata exception.
+
+Backup: `/opt/gala/backups/upgrade-3.3.22-ysme3qhf` (private).
+Receipt: `data/upgrade_verification_20261107_3322.json` (0600).
+
+Refresh the dashboard to load the updated interface. The next live session has
+not been exercised: no live reversal or new entry was sent during verification.
 
 Cold startup, provider outages and genuine missing data can still delay
 analysis. The live `[ANALYSIS]` and new `[ANALYSIS_TICKER]` timings distinguish
