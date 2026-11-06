@@ -1837,9 +1837,10 @@ function renderSignalFeed(id, sigs){
       ? s.ai_threshold
       : Number((s.ai_context||{}).threshold);
     const modelProbability = financialNumber((s.ai_context||{}).raw_probability ?? s.prob_ia);
-    const decisionLabel = ({MISSED_EVALUATION:'IA no evaluada (tarde)',
+    const isRetry = (s.ai_context||{}).execution_intent?.kind === 'REVERSAL_RETRY';
+    const decisionLabel = (({MISSED_EVALUATION:'IA no evaluada (tarde)',
       LATE_ANALYZED:'IA analizada tarde', LATE_ANALYSIS_UNAVAILABLE:'Análisis tardío no disponible'})[s.ai_decision]
-      || s.ai_decision || s.motivo || 'SEÑAL';
+      || s.ai_decision || s.motivo || 'SEÑAL') + (isRetry ? ' · reevaluación de reversión' : '');
     return `
     <div class="signal-row clickable" role="button" tabindex="0"
          data-ticker="${ticker}" data-signal-id="${signalId}"
@@ -1874,7 +1875,9 @@ function renderSignalFeed(id, sigs){
 
 function updateTickerSignalBadges(signals){
   const latest = {};
-  signals.forEach(s => { latest[String(s.ticker||'').toUpperCase()] = s; });
+  signals.forEach(s => {
+    if((s.ai_context||{}).execution_intent?.kind !== 'REVERSAL_RETRY') latest[String(s.ticker||'').toUpperCase()] = s;
+  });
   Object.entries(latest).forEach(([ticker,s]) => {
     const badge = el('tsig-'+ticker);
     if(!badge) return;

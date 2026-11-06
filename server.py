@@ -484,10 +484,18 @@ def _append_signal_history(signal: dict):
             os.fsync(fh.fileno())
 
 
+def _is_execution_retry(row):
+    context = row.get('ai_context')
+    intent = context.get('execution_intent') if isinstance(context, dict) else None
+    return isinstance(intent, dict) and intent.get('kind') == 'REVERSAL_RETRY'
+
+
 def _signal_counts(rows):
     counts = {"buy": 0, "sell": 0, "omr": 0, "omt": 0}
     keys = {"BUY": "buy", "SELL": "sell", "OM-R": "omr", "OM-T": "omt"}
     for row in rows:
+        if _is_execution_retry(row):
+            continue
         key = keys.get(str(row.get("tipo", "")).upper())
         if key:
             counts[key] += 1
@@ -1793,7 +1801,7 @@ def _register_signal(
     stat_key = {
         "BUY": "buy", "SELL": "sell", "OM-R": "omr", "OM-T": "omt",
     }.get(sig["tipo"])
-    if stat_key:
+    if stat_key and not _is_execution_retry(sig):
         BOT_STATE["stats"][stat_key] += 1
     return sig
 
@@ -3636,6 +3644,8 @@ def get_signal_chart():
     end_ms = candles[-1]["epoch_ms"]
     markers = []
     for row in ticker_signals:
+        if _is_execution_retry(row):
+            continue
         marker_time = _signal_datetime(row)
         if marker_time is None:
             continue
