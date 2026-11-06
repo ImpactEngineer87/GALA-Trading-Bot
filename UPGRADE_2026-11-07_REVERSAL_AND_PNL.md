@@ -58,8 +58,20 @@ remain separate from actual executed trades and x/50 close counters.
 
 - **117 focused Windows tests passed**, covering the affected analysis, native
   refresh, reversal, cancellation, close-accounting and dashboard paths.
-- Full Linux suite, actual incident replay and deployment verification are
-  pending. The production checkout remains on 3.3.21 at this writing.
+- **All 633 Linux tests passed in 4.130 seconds**, as `gala`, with networking
+  disabled in `/opt/gala/GALA-Trading-Bot-review-3322-20261107`, code `300b3f4`.
+- Actual incident-ledger replay produced **-$265.38 eligible PAPER P/L** across
+  **125 normal closes**, with **10 maintenance closes still excluded**. Original
+  history, audit, feedback, risk files and model artifacts were not amended.
+- A GET-only actual market-data measurement refreshed **17 native 1m feeds in
+  4,353 ms** with two workers. For TSLA/BA/META, a cold full history batch took
+  **11,681 ms**, current 1m reads during background history work **1,553 ms**,
+  and all three incremental context updates completed in **5,563 ms**. The
+  80 HTTP calls were GETs; no order was submitted and no position was modified.
+  These are after-hours data measurements, not an open-session latency guarantee.
+  Evidence: `data/incident-3322-qzu4am_a/candidate-replay-result.json`.
+- Deployment verification is pending. The production checkout remains on
+  3.3.21 at this writing.
 - The client selected waiting for normal REAL closes before maintenance. The
   latest read confirmed flat; deployment will repeat the strict broker checks
   and leave the trading engine OFF, with the dashboard service available.
