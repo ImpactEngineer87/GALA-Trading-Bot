@@ -35,6 +35,35 @@ class ExecutionVisibilityTests(unittest.TestCase):
         self.assertFalse(result['is_live_broker_query'])
         self.assertFalse(result['is_price_or_quantity_verification'])
 
+    def test_historical_timing_miss_explains_missing_rating_in_real_and_paper(self):
+        for mode in ['REAL','PAPER']:
+            value=signal();value.update(execution_mode=mode,ai_decision='MISSED_EVALUATION',prob_ia=None)
+            result=self.state([event('SIGNAL_EXECUTION_SKIPPED',modo=mode,motivo='MISSED_BAR_EVALUATION')],value)
+            self.assertEqual(result['state'],'MISSED_ANALYSIS')
+            self.assertEqual(result['reason_code'],'MISSED_BAR_EVALUATION')
+            self.assertIn('IA no evaluada',result['label'])
+            self.assertNotIn('bloqueada',result['label'])
+
+    def test_late_causal_analysis_keeps_score_without_claiming_order_or_fill(self):
+        value=signal();value.update(ai_decision='LATE_ANALYZED',prob_ia=.802,
+            ai_context={'raw_probability':.802339613,'execution_timing':'LATE_CLOSED_BAR'})
+        before=copy.deepcopy(value)
+        row=annotate_signals([value],[event('SIGNAL_EXECUTION_SKIPPED',motivo='LATE_CLOSED_BAR_ANALYZED')])[0]
+        self.assertEqual(row['execution_evidence']['state'],'LATE_ANALYZED')
+        self.assertEqual(row['prob_ia'],.802);self.assertEqual(value,before)
+        self.assertIn('sin entrada retroactiva',row['execution_evidence']['label'])
+
+    def test_submitted_or_filled_order_evidence_wins_over_a_timing_tag(self):
+        value=signal();value['ai_decision']='MISSED_EVALUATION'
+        self.assertEqual(self.state([event('ENTRY_FILLED',order_id='private')],value)['state'],'FILL_RECORDED')
+        self.assertEqual(self.state([event('ENTRY_SUBMITTED',order_id='private')],value)['state'],'SUBMITTED')
+
+    def test_real_model_refusal_explains_reason_and_invalid_context_is_safe(self):
+        value=signal();value.update(ai_decision='VETO',ai_context={'execution_veto_reason':'AI_THRESHOLD'})
+        self.assertEqual(self.state([],value)['reason_code'],'AI_THRESHOLD')
+        value['ai_context']='legacy malformed context'
+        self.assertEqual(self.state([],value)['state'],'UNLINKED')
+
     def test_exact_accounting_block_is_visible_without_modifying_ai_decision(self):
         signals = [signal()]
         events = [event('ENTRY_BLOCKED', motivo='REAL_ACCOUNTING_UNRESOLVED')]
@@ -145,6 +174,11 @@ c.renderSignalFeed('signals',[{ticker:'TSLA',tipo:'SELL',prob_ia:.802,ai_decisio
 assert.match(elements.signals.innerHTML,/Entrada: señal GALA10 \+ umbral IA/);
 assert.match(elements.signals.innerHTML,/Contexto adicional \(solo observación\): MACRO_NEUTRAL/);
 assert.doesNotMatch(elements.signals.innerHTML,/Regla histórica:/);
+c.renderSignalFeed('signals',[{ticker:'TSLA',tipo:'SELL',prob_ia:.802,ai_decision:'LATE_ANALYZED',
+ ai_context:{raw_probability:.802339613,execution_timing:'LATE_CLOSED_BAR',model_decision:'APPROVED'},
+ execution_evidence:{label:'IA evaluada con contexto histórico; sin entrada retroactiva'}}]);
+assert.match(elements.signals.innerHTML,/IA analizada tarde/);assert.match(elements.signals.innerHTML,/80.23%/);
+assert.match(elements.signals.innerHTML,/Sin entrada retroactiva/);assert.doesNotMatch(elements.signals.innerHTML,/Entrada bloqueada/);
 c.renderSignalFeed('signals',[{ticker:'BA',precio:null}]);assert.match(elements.signals.innerHTML,/Señal N\/D/);assert.doesNotMatch(elements.signals.innerHTML,/\$0\.00/);
 c.updateBotUI(false,{state:'FAILED'});assert.equal(elements.botStatus.textContent,'ERROR MOTOR');assert.equal(elements.botToggle.checked,false);
 """

@@ -40,7 +40,7 @@ import threading
 import uuid
 from contextlib import contextmanager, nullcontext
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Dict, Callable
 
@@ -54,6 +54,7 @@ from core.daily_loss_guard import DailyLossGuard
 from core.real_accounting import RealAccountingGuard
 from core.project_paths import resolve_runtime_path
 from core.memory_diagnostics import memory_usage_mib
+from core.symbol_work import SymbolWork, causal_snapshot
 from core.ticker_execution import TickerExecutionRegistry
 from core.live_capacity import RealCapacityManager, max_real_tickers
 from core.runtime_reliability import effective_ai_threshold
@@ -82,7 +83,7 @@ from notifications.telegram_bot import TelegramBot
 from agents.orchestrator import OrquestadorAgentes
 from agents.veto_observation_store import VetoObservationStore
 from agents.signal_learning_store import SignalLearningStore
-from agents.contracts import DatosMultiTemporal, Direccion
+from agents.contracts import DatosMultiTemporal, Direccion, DecisionFinal
 from agents.gala10_features import extraer_features_gala10
 
 from engine.logger import log_señal, log_orden, log_error, log_info, log_inicio_bot
@@ -354,6 +355,7 @@ class ChocoletraBot:
         self._cerrando = set()
         self._order_monitor_stop = threading.Event()
         self._order_monitor_thread = None
+        self._ticker_work = None
 
         # --- Protección persistente por pérdida diaria neta ---
         self.daily_loss_guard = DailyLossGuard(
@@ -395,6 +397,7 @@ class ChocoletraBot:
         # The decision itself is emitted seconds later; keeping both timestamps
         # prevents the chart from placing/dropping a signal on the wrong minute.
         self._gala10_signal_bar: Dict[str, object] = {}
+        self._latest_gala_decisions: Dict[str, object] = {}
         # Refresco MICRO (1m/5m): en CADA ciclo se re-baja solo el 1m (barato) para que
         # el precio y la señal estén al día como la pantalla del bróker (ThinkOrSwim).
         # Debe ser menor que loop_interval_sec.
@@ -1271,6 +1274,7 @@ class ChocoletraBot:
                 self.tos_reader.detener()
                 return
             self._activo = True
+            self._latest_gala_decisions = {}
         self._fin_sesion_alcanzado = False
         self._post_session_retrain_scheduled = False
 
@@ -1346,6 +1350,13 @@ class ChocoletraBot:
                 f"= total máximo {self.max_total_positions}",
             )
 
+        # Broker waits and order lifecycles have bounded, per-symbol mailboxes.
+        # Keep the configured heavy analysis worker count; a slow fill must not
+        # occupy either of those workers or delay every other ticker's candle.
+        self._ticker_work = SymbolWork(
+            len(self.tickers) + 1, self._run_ticker_work,
+            self._discard_ticker_work, self._ticker_work_failed,
+        )
         try:
             while self._activo:
                 # Strict bar-close cadence: no strategy evaluation occurs in the
@@ -1359,6 +1370,8 @@ class ChocoletraBot:
                     # Kill switch por cierre de mercado
                     if self.ks_liquidar_cierre and self._es_hora_cierre():
                         self._emit_log("WARN", "Cierre de mercado alcanzado — ejecutando kill switch")
+                        self._activo = False
+                        self._close_ticker_work()
                         self._liquidar_todo("kill switch — cierre de mercado")
                         self._fin_sesion_alcanzado = True
                         self._activo = False
@@ -1389,8 +1402,9 @@ class ChocoletraBot:
                     # Garantiza que ninguna acción real quede sin stop ni seguimiento,
                     # pase lo que pase en las rutas individuales (invariante: el broker
                     # es la fuente de verdad y se reconcilia cada ciclo).
-                    self._reconciliar_huerfanas()
+                    self._ticker_work.submit('__BROKER_RECONCILIATION__', None)
                     n_workers = max(1, min(len(self.tickers), max_workers))
+                    analysis_started = time.monotonic()
                     with ThreadPoolExecutor(max_workers=n_workers) as pool:
                         futuros = {pool.submit(self._procesar_ticker, t): t for t in self.tickers}
                         for futuro in as_completed(futuros):
@@ -1399,6 +1413,10 @@ class ChocoletraBot:
                                 futuro.result()
                             except Exception as e:
                                 self._emit_log("ERROR", f"Error inesperado en {ticker}: {e}")
+                    self._emit_log('INFO', '[ANALYSIS] '
+                        f'{len(self.tickers)} tickers; workers={n_workers}; '
+                        f'elapsed_ms={(time.monotonic()-analysis_started)*1000:.0f}; '
+                        'order waits run separately')
                     self._memory_health("cycle_end")
                 except _DailyLossCycleBlocked:
                     pass
@@ -1520,6 +1538,7 @@ class ChocoletraBot:
         already_stopped = not self._activo and not self._posiciones
         with self._lock:
             self._activo = False
+        self._close_ticker_work()
         self._detener_monitor_ordenes()
         broker_state = dict(getattr(self, "_broker_reconciliation", {}) or {})
         if not already_stopped:
@@ -1744,19 +1763,143 @@ class ChocoletraBot:
         if self._evaluar_limite_perdida_diaria():
             return
 
-        # 2) Gestionar posición ya abierta (parciales / breakeven / cierre)
+        # Strategy/model analysis is completed before any broker order waits.
+        senal_gala10 = self._senal_estrategia(datos_confirmados, ticker, precio_actual)
+        decision = None
+        if senal_gala10 in ('BUY', 'SELL') and self.agentes_activos:
+            decision = self._analizar_senal_gala(
+                ticker, datos_confirmados, precio_actual, df_micro, senal_gala10,
+                self._gala10_signal_bar.get(ticker), self._gala10_contexto.get(ticker),
+                bar_duration_minutes=micro_duration_minutes)
+            if decision is not None:
+                self._remember_gala_decision(ticker, decision)
+        payload = (precio_actual, df_micro, decision)
+        work = getattr(self, '_ticker_work', None)
+        if work is None:
+            # Direct callers and offline integrations retain synchronous semantics.
+            self._run_ticker_work(ticker, payload)
+        elif not work.submit(ticker, payload):
+            self._discard_ticker_work(ticker, payload, 'ENGINE_STOPPED')
+
+    def _close_ticker_work(self):
+        work = getattr(self, '_ticker_work', None)
+        if work is not None:
+            # Stop is serialized by _stop_lock. Keep the closed object visible:
+            # a racing analysis must be rejected, never fall back to execution.
+            work.close()
+
+    def _remember_gala_decision(self, ticker, decision):
+        bar = getattr(decision, 'signal_bar_timestamp', None)
+        if bar is None:
+            return
+        with self._lock:
+            if not hasattr(self, '_latest_gala_decisions'):
+                self._latest_gala_decisions = {}
+            previous = self._latest_gala_decisions.get(ticker)
+            old_bar = getattr(previous, 'signal_bar_timestamp', None)
+            if old_bar is None or pd.to_datetime(bar, utc=True) > pd.to_datetime(old_bar, utc=True):
+                self._latest_gala_decisions[ticker] = decision
+
+    def _close_late_opposite(self, ticker, precio_actual):
+        # A missed opposite event must not leave an older position open simply
+        # because the latest candle has no new crossing. Use the newest analysed
+        # master direction, never reopen a delayed entry or close a later entry.
+        with self._lock:
+            decision = getattr(self, '_latest_gala_decisions', {}).get(ticker)
+            pos = self._posiciones.get(ticker)
+            if decision is None or not pos or pos.get('pendiente') or pos.get('reservado'):
+                return
+            side = getattr(decision, 'gala_signal_side', None)
+            if not ((pos.get('tipo') == 'BUY' and side == 'SELL')
+                    or (pos.get('tipo') == 'SELL' and side == 'BUY')):
+                return
+            original = getattr(pos.get('decision'), 'signal_bar_timestamp', None)
+            if original is None:
+                # Adoption has no reliable signal baseline; only events after
+                # the recorded adoption/open time may close that position.
+                original = pos.get('abierta_ts')
+                if original is None:
+                    return
+                if isinstance(original, datetime):
+                    original = original.astimezone(timezone.utc)
+            bar = getattr(decision, 'signal_bar_timestamp', None)
+            if bar is None or pd.to_datetime(bar, utc=True) <= pd.to_datetime(original, utc=True):
+                return
+        with self._lifecycle_scope({'signal_id':str(getattr(decision, 'signal_id', '') or '')}):
+            self._cerrar_posicion(ticker, precio_actual,
+                motivo=f'señal opuesta {side} (evaluación demorada)')
+
+    def _ticker_work_failed(self, ticker, payload, exc):
+        self._emit_log('ERROR', f'[{ticker}] Order/position worker failed '
+                       f'({type(exc).__name__}); next confirmed snapshot will retry')
+        if payload is not None and payload[2] is not None:
+            decision = payload[2]
+            self._audit_approved_signal_skip(decision, 'ORDER_WORKER_FAILED')
+            self._registrar_senal_no_ejecutada(decision, reason='ORDER_WORKER_FAILED',
+                source_kind='EXECUTION_ERROR', training_candidate=False)
+
+    def _discard_ticker_work(self, ticker, payload, reason):
+        if payload is None:
+            return
+        decision = payload[2]
+        if decision is None:
+            return
+        self._audit_approved_signal_skip(decision, reason)
+        if decision.operar:
+            self._registrar_senal_no_ejecutada(decision, reason=reason,
+                source_kind='EXECUTION_MISSED', training_candidate=True)
+
+    def _run_ticker_work(self, ticker, payload):
+        if not getattr(self, '_activo', True):
+            self._discard_ticker_work(ticker, payload, 'ENGINE_STOPPED')
+            return
+        if ticker == '__BROKER_RECONCILIATION__':
+            self._reconciliar_huerfanas()
+            return
+        precio_actual, df_micro, decision = payload
         with self.ejecutor_hibrido.secuencia_simbolo(ticker):
+            if not getattr(self, '_activo', True):
+                self._discard_ticker_work(ticker, payload, 'ENGINE_STOPPED')
+                return
+            def superseded():
+                latest = getattr(self, '_ultima_vela_procesada', {}).get(ticker)
+                if latest is None or df_micro is None or len(df_micro) == 0:
+                    return False
+                return pd.to_datetime(df_micro.index[-1], utc=True) < pd.to_datetime(latest, utc=True)
+            if superseded():
+                self._discard_ticker_work(ticker, payload, 'NEWER_CANDLE_ANALYZED')
+                return
             self._gestionar_posiciones(ticker, precio_actual, df_micro)
+            if decision is None:
+                if getattr(self, '_activo', True):
+                    self._close_late_opposite(ticker, precio_actual)
+                return
+            if not getattr(self, '_activo', True):
+                self._discard_ticker_work(ticker, payload, 'ENGINE_STOPPED')
+                return
+            if superseded():
+                self._discard_ticker_work(ticker, payload, 'NEWER_CANDLE_ANALYZED')
+                return
+            if decision.operar:
+                self._abrir_o_revertir(decision, precio_actual, df_micro)
+                return
+            # Model refusal applies to a new entry. An opposite GALA signal
+            # still closes the position that is actually present now.
+            side = getattr(decision, 'gala_signal_side', None)
+            with self._lock:
+                pos = self._posiciones.get(ticker)
+                opposite = bool(pos and not pos.get('reservado') and not pos.get('pendiente')
+                    and ((pos.get('tipo') == 'BUY' and side == 'SELL')
+                         or (pos.get('tipo') == 'SELL' and side == 'BUY')))
+            if opposite:
+                self._cerrar_posicion(ticker, precio_actual,
+                    motivo=f'señal opuesta {side} (entrada IA vetada)')
 
-        # 3) GALA 10 = DISPARADOR ÚNICO. Sin señal de Gala 10 no se opera.
-        senal_gala10 = self._senal_estrategia(
-            datos_confirmados, ticker, precio_actual
-        )
-        if senal_gala10 not in ("BUY", "SELL"):
-            return
-        if not self.agentes_activos:
-            return
-
+    def _analizar_senal_gala(self, ticker, datos_confirmados, precio_actual,
+                             df_micro, senal_gala10, signal_bar_timestamp,
+                             gala_context, *, observation_only=False,
+                             analysis_time=None, bar_duration_minutes=1):
+        paper_ticker = self._is_paper_ticker(ticker)
         # v2.9.3: una señal opuesta a una posición ya abierta tiene DOS efectos
         # distintos: (1) cerrar la posición actual y (2) eventualmente abrir la
         # opuesta. La IA de producción puede vetar (2), pero nunca debe dejar una
@@ -1764,7 +1907,8 @@ class ChocoletraBot:
         with self._lock:
             _pos_signal = self._posiciones.get(ticker)
             _opposite_existing = bool(
-                _pos_signal
+                not observation_only
+                and _pos_signal
                 and not _pos_signal.get("reservado")
                 and not _pos_signal.get("pendiente")
                 and (
@@ -1773,7 +1917,8 @@ class ChocoletraBot:
                 )
             )
             _existing_long = bool(
-                _pos_signal
+                not observation_only
+                and _pos_signal
                 and not _pos_signal.get("reservado")
                 and not _pos_signal.get("pendiente")
                 and _pos_signal.get("tipo") == "BUY"
@@ -1782,7 +1927,8 @@ class ChocoletraBot:
         # En long-only, SELL sigue siendo válida para CERRAR un LONG existente.
         # Solo se bloquea SELL cuando implicaría ABRIR un SHORT desde OUT.
         if (
-            not paper_ticker
+            not observation_only
+            and not paper_ticker
             and senal_gala10 == "SELL"
             and not self.live_allow_short
             and not _existing_long
@@ -1803,13 +1949,13 @@ class ChocoletraBot:
         requerir_modelo = bool(
             not paper_ticker and self.requerir_modelo_aprobado_en_real
         )
-        if requerir_modelo and self.orquestador.entrenador.modelo_disponible(ticker):
+        if not observation_only and requerir_modelo and self.orquestador.entrenador.modelo_disponible(ticker):
             self._recover_ticker_quarantine(ticker, 'model')
         model_unavailable = bool(
             requerir_modelo
             and not self.orquestador.entrenador.modelo_disponible(ticker)
         )
-        if model_unavailable:
+        if model_unavailable and not observation_only:
             self._quarantine_real_ticker(ticker, 'Production model unavailable')
             self._emit_log(
                 "ERROR",
@@ -1822,7 +1968,7 @@ class ChocoletraBot:
 
         # 4) ATR micro + features GSCO (opcional) para la auditoría del ticker.
         atr_micro = self._atr_micro(df_micro)
-        gsco = self._gsco_features(ticker, senal_gala10, precio_actual, self._ahora_et())
+        gsco = {} if observation_only else self._gsco_features(ticker, senal_gala10, precio_actual, self._ahora_et())
 
         # 5) El XGBoost INDIVIDUAL del ticker AUDITA la señal de Gala 10 (veto).
         try:
@@ -1833,36 +1979,42 @@ class ChocoletraBot:
             # si el VPS no está en ET → skew train/serve. Ver backtest_trainer._as_dt.
             decision = self.orquestador.auditar_gala10(
                 datos_confirmados, precio_actual, senal_gala10, atr_micro,
-                ahora=self._ahora_et().replace(tzinfo=None),
+                ahora=analysis_time or self._ahora_et().replace(tzinfo=None),
                 actual_en_formacion=False,
-                macro_en_formacion=True,
+                macro_en_formacion=not observation_only,
                 micro_en_formacion=False,
                 gsco=gsco,
-                gala10_contexto=self._gala10_contexto.get(ticker),
+                gala10_contexto=gala_context,
                 requerir_modelo=requerir_modelo,
                 execution_mode=("PAPER" if paper_ticker else "REAL"),
             )
         except Exception as e:
-            self._emit_log("ERROR", f"[{ticker}] Error en auditoría de agentes: {e}")
-            self._quarantine_real_ticker(ticker, 'AI inference failed')
-            return
+            self._emit_log("ERROR", f"[{ticker}] Error en auditoría de agentes ({type(e).__name__})")
+            if not observation_only:
+                self._quarantine_real_ticker(ticker, 'AI inference failed')
+            decision = DecisionFinal.no_operar(ticker, 'AI inference unavailable',
+                timestamp=analysis_time or self._ahora_et().replace(tzinfo=None))
+            decision.tipo = senal_gala10
+            decision.execution_veto_reason = 'AI_INFERENCE_ERROR'
+            decision.execution_mode = 'PAPER' if paper_ticker else 'REAL'
 
         if model_unavailable:
             decision.operar = False
             decision.execution_veto_reason = "AI_MODEL_UNAVAILABLE"
+        decision.gala_signal_side = senal_gala10
 
         # Persist the exact UTC candle baseline for counterfactual labels. NY
         # decision wall-clock time is distinct from Schwab's UTC candle index.
         with self._lock:
-            signal_bar = self._gala10_signal_bar.get(ticker)
+            signal_bar = signal_bar_timestamp
         decision.signal_bar_timestamp = (
             signal_bar if signal_bar is not None else df_micro.index[-1]
         )
-        decision.signal_bar_duration_minutes = micro_duration_minutes
+        decision.signal_bar_duration_minutes = bar_duration_minutes
 
-        if getattr(decision, 'ai_inference_error', False) and not paper_ticker:
+        if not observation_only and getattr(decision, 'ai_inference_error', False) and not paper_ticker:
             self._quarantine_real_ticker(ticker, 'Production inference unavailable')
-        elif not paper_ticker:
+        elif not observation_only and not paper_ticker:
             self._recover_ticker_quarantine(ticker, 'inference')
 
         # v3.1: one explainable line per GALA10 decision.  This is deliberately
@@ -1895,7 +2047,7 @@ class ChocoletraBot:
         # 13:34:04 for the bar that opened at 13:33:00.
         try:
             with self._lock:
-                signal_bar = self._gala10_signal_bar.get(ticker)
+                signal_bar = signal_bar_timestamp
             if signal_bar is not None:
                 bar_ts = pd.Timestamp(signal_bar)
                 if bar_ts.tzinfo is None:
@@ -1906,6 +2058,33 @@ class ChocoletraBot:
                 ai_context["signal_bar_timestamp_iso"] = bar_ts.isoformat()
         except Exception:
             pass
+        if observation_only:
+            # A delayed signal is scored at its own causal candle, never using
+            # later prices, and never submits a historical order.
+            threshold = self._effective_ai_threshold(decision, ticker)
+            model_score = getattr(decision, 'ai_raw_probability', None)
+            model_result = ('UNAVAILABLE' if model_score is None or threshold is None
+                else 'APPROVED' if float(model_score) >= float(threshold) else 'VETO')
+            late_code = 'LATE_ANALYSIS_UNAVAILABLE' if model_score is None else 'LATE_CLOSED_BAR_ANALYZED'
+            ai_context.update(execution_timing='LATE_CLOSED_BAR',
+                analysis_basis='SETTLED_FRAMES_AS_OF_ORIGINAL_CLOSE',
+                model_decision=model_result,
+                policy_decision='APPROVED' if decision.operar else 'VETO')
+            signal_row = self._emit_signal(
+                senal_gala10, ticker, precio_actual, atr_micro, decision.prob_meta,
+                motivo=late_code + ':' + self._ai_decision_reason(decision, approved=decision.operar),
+                ai_threshold=threshold,
+                execution_mode='PAPER' if paper_ticker else 'REAL',
+                ai_decision='LATE_ANALYZED' if model_score is not None else 'LATE_ANALYSIS_UNAVAILABLE', ai_context=ai_context,
+            )
+            decision.signal_id = str((signal_row or {}).get('signal_id') or uuid.uuid4().hex)
+            decision.tipo = senal_gala10
+            self._audit_approved_signal_skip(decision, late_code)
+            self._registrar_senal_no_ejecutada(decision,
+                reason=late_code, source_kind='EXECUTION_MISSED_CAUSAL_ANALYSIS',
+                training_candidate=True)
+            return decision
+
         if decision.operar:
             signal_row = self._emit_signal(
                 senal_gala10, ticker, precio_actual,
@@ -1947,13 +2126,8 @@ class ChocoletraBot:
                     f"[{ticker}] {senal_gala10} opuesta: IA vetó la nueva entrada, "
                     "pero se cerrará la posición vigente y quedará OUT.",
                 )
-                with self.ejecutor_hibrido.secuencia_simbolo(ticker):
-                    self._cerrar_posicion(
-                        ticker, precio_actual,
-                        motivo=f"señal opuesta {senal_gala10} (entrada IA vetada)",
-                    )
                 self._registrar_no_op(decision)
-                return
+                return decision
             signal_row = self._emit_signal(
                 "OM-R", ticker, precio_actual, atr_micro, decision.prob_meta,
                 motivo=(
@@ -1972,11 +2146,9 @@ class ChocoletraBot:
                 execution_mode=("PAPER" if paper_ticker else "REAL"),
             )
             self._registrar_no_op(decision)
-            return
+            return decision
 
-        # 6) Reversión o apertura
-        with self.ejecutor_hibrido.secuencia_simbolo(ticker):
-            self._abrir_o_revertir(decision, precio_actual, df_micro)
+        return decision
 
     def _atr_micro(self, df_micro) -> float:
         """ATR de la temporalidad micro (para dimensionar SL/TP de la entrada)."""
@@ -2304,28 +2476,15 @@ class ChocoletraBot:
                 self.candle_evidence.put(ticker, receipt)
                 self._audit_event('STRATEGY_CANDLE_EVALUATED', ticker=ticker,
                     estado='CLOSED_CANDLE', motivo='Exact strategy inputs before AI veto', detalle=receipt)
-            # A slow broker cycle may skip several closed candles. Preserve
-            # their strategy signals on the chart, with explicit missed timing;
-            # only the latest closed candle can authorize a current entry.
+            # Analyse every newly discovered signal at its own causal cutoff.
+            # Only the latest closed candle can authorize a current entry.
             if previous_bar is not None:
                 missed = df_calc[(df_calc.index > previous_bar) & (df_calc.index < vela_id)]
                 for bar, row in missed.iterrows():
                     side = row.get('señal')
                     if side not in ('BUY', 'SELL'):
                         continue
-                    stamp = pd.Timestamp(bar)
-                    stamp = stamp.tz_localize('UTC') if stamp.tzinfo is None else stamp.tz_convert('UTC')
-                    signal = self._emit_signal(side, ticker, float(row['close']),
-                        float(row.get('atr', 0) or 0), None,
-                        motivo='MISSED_BAR_EVALUATION: señal de vela cerrada registrada tarde',
-                        execution_mode=self.execution_mode_for(ticker),
-                        ai_decision='MISSED_EVALUATION', ai_context={
-                            'strategy_signal': side, 'signal_bar_epoch_ms': int(stamp.timestamp()*1000),
-                            'signal_bar_timestamp_iso': stamp.isoformat(),
-                            'timing': 'MISSED_CLOSED_BAR', 'raw_probability': None})
-                    self._audit_event('SIGNAL_EXECUTION_SKIPPED', ticker=ticker,
-                        signal_id=str((signal or {}).get('signal_id') or ''),
-                        lado=side, estado='NO_ORDER_SENT', motivo='MISSED_BAR_EVALUATION')
+                    self._analizar_senal_atrasada(datos, ticker, bar, side, df_calc)
             señal = df_calc["señal"].iloc[-1]
             if señal in ("BUY", "SELL"):
                 contexto = extraer_features_gala10(
@@ -2344,6 +2503,42 @@ class ChocoletraBot:
         except Exception as e:
             self._emit_log("WARN", f"[{ticker}] Estrategia no disponible: {e}")
             return None
+
+    def _analizar_senal_atrasada(self, datos, ticker, bar, side, calculated):
+        stamp = pd.Timestamp(bar)
+        stamp = stamp.tz_localize('UTC') if stamp.tzinfo is None else stamp.tz_convert('UTC')
+        cutoff = stamp + pd.Timedelta(minutes=1)
+        try:
+            from zoneinfo import ZoneInfo
+            snapshot = causal_snapshot(datos, cutoff)
+            micro = snapshot.tf('1m')
+            if micro is None or len(micro) < 35:
+                raise ValueError('Insufficient causal candle history')
+            context = extraer_features_gala10(calculated.loc[:bar], posicion=-1,
+                senal=side, timestamp=bar)
+            decision = self._analizar_senal_gala(ticker, snapshot,
+                float(micro['close'].iloc[-1]), micro, side, stamp, context,
+                observation_only=True,
+                analysis_time=cutoff.tz_convert(ZoneInfo('America/New_York')).to_pydatetime().replace(tzinfo=None))
+            if decision is not None:
+                self._remember_gala_decision(ticker, decision)
+                return
+        except Exception as exc:
+            self._emit_log('ERROR', f'[{ticker}] Delayed AI analysis unavailable '
+                           f'({type(exc).__name__})')
+        # Missing context/models must remain visibly unknown; never fabricate
+        # a rating. This exception cannot stop analysis of later candles.
+        row = calculated.loc[bar]
+        signal = self._emit_signal(side, ticker, float(row['close']),
+            float(row.get('atr', 0) or 0), None,
+            motivo='LATE_ANALYSIS_UNAVAILABLE', ai_decision='LATE_ANALYSIS_UNAVAILABLE',
+            execution_mode=self.execution_mode_for(ticker), ai_context={
+                'strategy_signal':side, 'signal_bar_epoch_ms':int(stamp.timestamp()*1000),
+                'signal_bar_timestamp_iso':stamp.isoformat(),
+                'execution_timing':'LATE_CLOSED_BAR', 'raw_probability':None})
+        self._audit_event('SIGNAL_EXECUTION_SKIPPED', ticker=ticker,
+            signal_id=str((signal or {}).get('signal_id') or ''), lado=side,
+            estado='NO_ORDER_SENT', motivo='LATE_ANALYSIS_UNAVAILABLE')
 
     def _obtener_mtf(self, ticker: str) -> DatosMultiTemporal:
         """Datos multi-temporal con DOBLE refresco: el 1m/5m se re-baja en cada ciclo
@@ -4079,10 +4274,24 @@ class ChocoletraBot:
             self._orden_huerfana_ciclos[oid] = n
             if n < 2:
                 continue
-            self._emit_log("WARN", f"[{sym}] Orden HUÉRFANA confirmada (id {oid}) sin posición "
-                                   f"asociada — cancelando (limpieza de la red de seguridad)")
-            cancel_ok = cancelar_orden_compatible(self.ejecutor_hibrido,
-                self.account_number, oid, ticker=sym)
+            # Reconciliation now runs beside per-symbol order work. Recheck
+            # under the SAME symbol lease; an earlier account snapshot must not
+            # cancel protection belonging to a position opened in the meantime.
+            with self.ejecutor_hibrido.secuencia_simbolo(sym):
+                with self._lock:
+                    if not self._activo or self._posiciones.get(sym) is not None:
+                        continue
+                fresh = self.schwab.obtener_posiciones(self.account_number)
+                if fresh is None or any(str(p.get('symbol') or '').upper() == sym
+                        and float(p.get('cantidad', 0) or 0) > 0 for p in fresh):
+                    continue
+                working = self.schwab.obtener_ordenes_abiertas(self.account_number)
+                if working is None or oid not in self._owned_working_ids(sym, working):
+                    continue
+                self._emit_log("WARN", f"[{sym}] Orden HUÉRFANA confirmada (id {oid}) sin posición "
+                                       f"asociada — cancelando (limpieza de la red de seguridad)")
+                cancel_ok = cancelar_orden_compatible(self.ejecutor_hibrido,
+                    self.account_number, oid, ticker=sym)
             self._audit_event(
                 "ORPHAN_ORDER_CLEANUP", ticker=sym,
                 estado=cancel_ok.get("broker_status", "DESCONOCIDO"),

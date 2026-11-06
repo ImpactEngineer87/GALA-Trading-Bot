@@ -315,7 +315,8 @@ class DecisionFinal:
                   direccion_dia: Optional[DireccionDia] = None,
                   propuesta: Optional[PropuestaOperacion] = None,
                   veredicto: Optional[VeredictoAuditor] = None,
-                  timestamp: Optional[datetime] = None) -> "DecisionFinal":
+                  timestamp: Optional[datetime] = None,
+                  reason: str = "") -> "DecisionFinal":
         """Fábrica para una decisión negativa (no se abre operación)."""
         return cls(
             ticker=ticker,
@@ -326,4 +327,5 @@ class DecisionFinal:
             veredicto=veredicto,
             timestamp=timestamp or datetime(1970, 1, 1),
             resumen=resumen,
+            execution_veto_reason=reason,
         )

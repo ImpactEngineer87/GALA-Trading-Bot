@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.20</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.21</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -1837,6 +1837,9 @@ function renderSignalFeed(id, sigs){
       ? s.ai_threshold
       : Number((s.ai_context||{}).threshold);
     const modelProbability = financialNumber((s.ai_context||{}).raw_probability ?? s.prob_ia);
+    const decisionLabel = ({MISSED_EVALUATION:'IA no evaluada (tarde)',
+      LATE_ANALYZED:'IA analizada tarde', LATE_ANALYSIS_UNAVAILABLE:'Análisis tardío no disponible'})[s.ai_decision]
+      || s.ai_decision || s.motivo || 'SEÑAL';
     return `
     <div class="signal-row clickable" role="button" tabindex="0"
          data-ticker="${ticker}" data-signal-id="${signalId}"
@@ -1850,10 +1853,11 @@ function renderSignalFeed(id, sigs){
           ? 'IA: N/A'
           : `IA: ${(modelProbability*100).toFixed(2)}%${threshold == null ? '' : ` / umbral:${(Number(threshold)*100).toFixed(2)}%`}`
       }</span>
-      <span class="pill ${String(s.ai_decision||'').includes('VETO') || String(s.ai_decision||'').includes('BLOCKED') ? 'real' : 'paper'}" title="${escHtml(s.motivo||'')}">${escHtml(s.ai_decision||s.motivo||'SEÑAL')}</span>
+      <span class="pill ${String(s.ai_decision||'').includes('VETO') || String(s.ai_decision||'').includes('BLOCKED') ? 'real' : 'paper'}" title="${escHtml(s.motivo||'')}">${escHtml(decisionLabel)}</span>
       <span class="pill" title="Registro local enlazado por señal, fecha, ticker y modo; no consulta de órdenes en vivo">${escHtml(s.execution_mode||'Modo sin verificar')} · ${escHtml(s.execution_evidence?.label||'Ejecución sin verificar')}${s.execution_evidence?.reason_code?' · '+escHtml(s.execution_evidence.reason_code):''}</span>
       <details style="max-width:100%;font-size:.72rem"><summary>Por qué / modelo</summary>
         <div>${escHtml(s.motivo || 'Sin motivo registrado')}</div>
+        ${(s.ai_context||{}).execution_timing === 'LATE_CLOSED_BAR' ? '<div>Evaluación posterior con datos disponibles al cierre original. Decisión del modelo: '+escHtml((s.ai_context||{}).model_decision || 'N/A')+'. Sin entrada retroactiva.</div>' : ''}
         <div>IA aprobada no confirma envío/fill. ${escHtml(s.execution_evidence?.label||'Sin evidencia enlazada')}. Referencia de señal: no es precio de ejecución.</div>
         <div>Modelo: ${escHtml((s.ai_context||{}).model_version || 'N/A')} · ${escHtml((s.ai_context||{}).model_tier || 'N/A')}</div>
         <div>Balanced accuracy: ${(s.ai_context||{}).balanced_accuracy == null ? 'N/A' : Number(s.ai_context.balanced_accuracy).toFixed(2)+'%'} · Régimen: ${escHtml((s.ai_context||{}).market_regime || 'N/A')}</div>

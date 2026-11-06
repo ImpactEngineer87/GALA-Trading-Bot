@@ -265,13 +265,13 @@ class OrquestadorAgentes:
             return DecisionFinal.no_operar(
                 ticker, "Sin microcontexto auditable (datos micro insuficientes)",
                 direccion_dia=direccion_dia, propuesta=propuesta,
-                veredicto=veredicto, timestamp=ts,
+                veredicto=veredicto, timestamp=ts, reason='AI_CONTEXT_INSUFFICIENT',
             )
         if not veredicto.es_horario_institucional:
             return DecisionFinal.no_operar(
                 ticker, "Fuera de horario institucional (RTH)",
                 direccion_dia=direccion_dia, propuesta=propuesta,
-                veredicto=veredicto, timestamp=ts,
+                veredicto=veredicto, timestamp=ts, reason='OUTSIDE_RTH',
             )
 
         confluencia = direccion_dia.permite(senal_gala10)   # ¿el macro acompaña? (feature)

@@ -27,6 +27,10 @@ def _code(value):
              'POSITION_STATE_MISMATCH', 'PENDING_ENTRY_NOT_CLEARED',
              'ENTRY_SLOT_NOT_AVAILABLE', 'ENTRY_NOT_EXECUTED',
              'REAL_LONG_ONLY_CLOSE_ONLY', 'REVERSAL_PRIOR_CLOSE_FAILED'}
+    known.update({'MISSED_BAR_EVALUATION', 'LATE_CLOSED_BAR_ANALYZED',
+                  'LATE_ANALYSIS_UNAVAILABLE', 'NEWER_CANDLE_ANALYZED',
+                  'AI_INFERENCE_ERROR', 'AI_MODEL_UNAVAILABLE',
+                  'AI_CONTEXT_INSUFFICIENT', 'OUTSIDE_RTH', 'ORDER_WORKER_FAILED'})
     if text in known or re.fullmatch(r'(BROKER|PAPER)_ENTRY_(ERROR|REJECTED|RECONCILIAR|CANCELED|CANCELLED)', text):
         return text
     return ''
@@ -78,6 +82,28 @@ def annotate_signals(signals, audit_rows=(), *, audit_available=True):
             reason = _code(named.get(name, {}).get('motivo'))
             if reason:
                 break
+        # A timing miss affects both modes. Keep broker submission/fill evidence
+        # authoritative, while explaining why an unsubmitted signal has no score.
+        if state in {'UNLINKED', 'BLOCKED', 'PAPER'}:
+            timing = str(row.get('ai_decision') or '').upper()
+            if timing == 'MISSED_EVALUATION':
+                state, label, reason = 'MISSED_ANALYSIS', 'Vela procesada tarde; IA no evaluada; sin entrada', 'MISSED_BAR_EVALUATION'
+            elif timing == 'LATE_ANALYZED':
+                state, label, reason = 'LATE_ANALYZED', 'IA evaluada con contexto histórico; sin entrada retroactiva', 'LATE_CLOSED_BAR_ANALYZED'
+            elif timing == 'LATE_ANALYSIS_UNAVAILABLE':
+                state, label, reason = 'ANALYSIS_UNAVAILABLE', 'Análisis tardío sin contexto/modelo válido; sin entrada', 'LATE_ANALYSIS_UNAVAILABLE'
+            elif reason == 'NEWER_CANDLE_ANALYZED':
+                state, label = 'SUPERSEDED', 'Otra vela ya analizada; entrada anterior no enviada'
+            elif str(row.get('ai_decision') or '').upper() == 'VETO':
+                context = row.get('ai_context')
+                code = _code(context.get('execution_veto_reason')) if isinstance(context,dict) else ''
+                if code:
+                    labels = {'AI_THRESHOLD':'IA por debajo del umbral; sin entrada',
+                        'AI_MODEL_UNAVAILABLE':'Modelo no disponible; sin entrada',
+                        'AI_INFERENCE_ERROR':'Error de evaluación IA; sin entrada',
+                        'AI_CONTEXT_INSUFFICIENT':'Datos insuficientes para IA; sin entrada',
+                        'OUTSIDE_RTH':'Fuera del horario de análisis; sin entrada'}
+                    state, label, reason = 'AI_REJECTED', labels.get(code,'Decisión IA registrada; sin entrada'), code
         if str(row.get('execution_mode') or '').upper() == 'PAPER' and state != 'UNAVAILABLE':
             label = 'PAPER · simulación · ' + label
         row['execution_evidence'] = {

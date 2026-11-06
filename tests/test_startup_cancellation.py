@@ -43,7 +43,7 @@ class StartupCancellationTests(unittest.TestCase):
         bot.schwab.obtener_posiciones.assert_not_called()
         self.assertIs(bot._posiciones['BA'], original)
 
-    def test_slow_cycle_records_missed_strategy_signals_without_retroactive_entries(self):
+    def test_slow_cycle_without_causal_context_records_unknown_analysis_without_old_entries(self):
         bot = ChocoletraBot.__new__(ChocoletraBot)
         bot._lock = threading.RLock()
         index = pd.date_range('2026-11-04T14:00:00Z', periods=40, freq='min')
@@ -65,7 +65,9 @@ class StartupCancellationTests(unittest.TestCase):
         with patch('engine.bot_engine.extraer_features_gala10', return_value={}):
             self.assertEqual(bot._senal_estrategia(data, 'BA', 100), 'SELL')
         self.assertEqual(bot._emit_signal.call_count, 2)
-        self.assertTrue(all(call.kwargs['ai_decision'] == 'MISSED_EVALUATION'
+        self.assertTrue(all(call.kwargs['ai_decision'] == 'LATE_ANALYSIS_UNAVAILABLE'
+                            for call in bot._emit_signal.call_args_list))
+        self.assertTrue(all(call.kwargs['motivo'] == 'LATE_ANALYSIS_UNAVAILABLE'
                             for call in bot._emit_signal.call_args_list))
         self.assertEqual(bot._gala10_signal_bar['BA'], index[-1])
         self.assertIsNone(bot._senal_estrategia(data, 'BA', 100))
