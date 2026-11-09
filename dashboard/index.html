@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.22</div>
+      <div class="brand-ver">Trading Algorítmico v3.3.23</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -1675,6 +1675,8 @@ function updateDailyRisk(risk){
   const historicalPending = !!accounting.blocked && !accountingBlocked;
   const reviewedManualTsla = historicalPending && accounting.manual_tsla_resume_active === true;
   const reviewedAcrossSessions = reviewedManualTsla && accounting.reviewed_future_sessions_enabled === true;
+  const isolated = Array.isArray(accounting.external_isolated_tickers)
+    ? accounting.external_isolated_tickers : [];
   const net = risk.net_pnl == null ? null : Number(risk.net_pnl);
   const limit = Number(risk.limit_usd || 0);
   const room = risk.remaining_to_limit_usd == null ? null : Number(risk.remaining_to_limit_usd);
@@ -1688,6 +1690,8 @@ function updateDailyRisk(risk){
     ? '⛔ NUEVAS ENTRADAS REAL BLOQUEADAS: CONTABILIDAD PENDIENTE'
     : blocked
     ? '⛔ BLOQUEADO POR PÉRDIDA DIARIA'
+    : isolated.length
+    ? `REAL PARCIAL · TICKERS AISLADOS: ${isolated.join(', ')}`
     : reviewedManualTsla
     ? (reviewedAcrossSessions
       ? '📋 TSLA MANUAL REVISADO · ENTRADAS REAL PERMITIDAS'
@@ -1703,6 +1707,8 @@ function updateDailyRisk(risk){
     ? `Reconciliar ejecuciones Schwab · ${(risk.real_accounting.reasons || []).join('; ')} · protecciones existentes siguen activas`
     : blocked
     ? `${risk.trigger_mode || risk.mode || 'PAPER'} · ${risk.reason || ''} · reinicio ${risk.next_reset_at_ny || 'próxima sesión NY'}`
+    : isolated.length
+    ? `Posiciones externas en ${isolated.join(', ')}: nuevas entradas suspendidas solo en esos tickers. Los demás continúan con sus controles. P/L y límite corresponden a operaciones GALA; revise las posiciones externas en Schwab.`
     : reviewedManualTsla
     ? (reviewedAcrossSessions
       ? 'Las siete órdenes manuales TSLA del 2 de noviembre siguen fuera del P/L y del entrenamiento de GALA. La revisión histórica sigue vigente solo mientras sus registros no cambien; cada arranque requiere Schwab plano y cero órdenes pendientes. Los controles de riesgo siguen activos.'

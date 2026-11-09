@@ -31,7 +31,7 @@ def _code(value):
                   'LATE_ANALYSIS_UNAVAILABLE', 'NEWER_CANDLE_ANALYZED',
                   'AI_INFERENCE_ERROR', 'AI_MODEL_UNAVAILABLE',
                   'AI_CONTEXT_INSUFFICIENT', 'OUTSIDE_RTH', 'ORDER_WORKER_FAILED'})
-    known.add('REVERSAL_INTENT_SUPERSEDED')
+    known.update({'REVERSAL_INTENT_SUPERSEDED', 'EXTERNAL_POSITION_ISOLATED'})
     if text in known or re.fullmatch(r'(BROKER|PAPER)_ENTRY_(ERROR|REJECTED|RECONCILIAR|CANCELED|CANCELLED)', text):
         return text
     return ''

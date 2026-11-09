@@ -59,7 +59,9 @@ class ManualOwnershipTests(unittest.TestCase):
         self.assertEqual(bot._ticker_quarantine["TSLA"], "EXTERNAL_BROKER_POSITION")
         self.assertNotIn("TSLA", bot._posiciones)
         bot._state_machine.assert_not_called()
-        self.assertTrue(bot._real_accounting_status()["entry_blocked"])
+        accounting = bot._real_accounting_status()
+        self.assertFalse(accounting["entry_blocked"])
+        self.assertEqual(accounting['external_isolated_tickers'], ['TSLA'])
 
     def test_working_manual_order_is_never_canceled(self):
         bot = self.bot

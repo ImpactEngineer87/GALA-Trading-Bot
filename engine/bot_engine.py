@@ -841,13 +841,19 @@ class ChocoletraBot:
                 now=self._ahora_et() if callable(getattr(self, "_ahora_et", None)) else None,
             )
             snapshot.update(approval)
-        if any(reason == "EXTERNAL_BROKER_POSITION" for reason in
-               getattr(self, "_ticker_quarantine", {}).values()):
-            snapshot["blocked"] = True
-            snapshot["entry_blocked"] = True
-            snapshot["external_exposure_blocked"] = True
-            snapshot.setdefault("reasons", []).append(
-                "External broker position in a REAL ticker; account risk not attributable")
+        # An unowned position belongs to the symbol's quarantine, not the
+        # strategy accounting ledger. Do not let a manual entry in one symbol
+        # stop unrelated REAL symbols. Unknown GALA fills/pending manual closes
+        # below still hold REAL entries globally until their evidence resolves.
+        with getattr(self, "_lock", threading.RLock()):
+            isolated = sorted(ticker for ticker, reason in
+                getattr(self, "_ticker_quarantine", {}).items()
+                if reason == "EXTERNAL_BROKER_POSITION"
+                and not self._is_paper_ticker(ticker))
+        snapshot["external_isolated_tickers"] = isolated
+        snapshot["external_exposure_present"] = bool(isolated)
+        snapshot["external_exposure_blocked"] = False
+        snapshot["risk_scope"] = "GALA_MANAGED_POSITIONS"
         pending_store = getattr(self, 'manual_close_pending', None)
         if pending_store is not None:
             try:
@@ -986,6 +992,7 @@ class ChocoletraBot:
                     snapshot['net_pnl'] - snapshot['limit_usd']), 2)
         snapshot["pricing_complete"] = unpriced == 0
         snapshot["valuation_source"] = "trusted_market_data"
+        snapshot["valuation_scope"] = "GALA_MANAGED_POSITIONS"
         accounting = self._real_accounting_status()
         snapshot["real_accounting"] = accounting
         if not guard_paper and accounting["entry_blocked"]:
@@ -3160,14 +3167,21 @@ class ChocoletraBot:
 
         # Reservar hueco de forma atómica antes de ejecutar la apertura
         if not self._reservar_slot(ticker, tipo):
-            self._audit_approved_signal_skip(decision, "ENTRY_SLOT_NOT_AVAILABLE")
+            isolated = (not self._is_paper_ticker(ticker) and
+                getattr(self, '_ticker_quarantine', {}).get(ticker)
+                == 'EXTERNAL_BROKER_POSITION')
+            skip_reason = ('EXTERNAL_POSITION_ISOLATED' if isolated
+                           else 'ENTRY_SLOT_NOT_AVAILABLE')
+            self._audit_approved_signal_skip(decision, skip_reason)
             # Same-side repeats are intentionally not new learning samples. If
             # there was no active position before the attempt, this was a real
             # missed opportunity (capacity/quarantine/risk gate).
             if pos is None:
                 self._registrar_senal_no_ejecutada(
-                    decision, reason="ENTRY_SLOT_NOT_AVAILABLE",
-                    source_kind="CAPACITY_OR_GUARD_MISSED", training_candidate=True,
+                    decision, reason=skip_reason,
+                    source_kind=('EXTERNAL_POSITION_ISOLATION' if isolated
+                                 else 'CAPACITY_OR_GUARD_MISSED'),
+                    training_candidate=not isolated,
                 )
             if reverse:
                 self._reversal_contexts.pop(ticker, None)
@@ -3223,6 +3237,13 @@ class ChocoletraBot:
             self._audit_event("ENTRY_BLOCKED", ticker=ticker, lado=prop.tipo,
                               estado="REAL_ACCOUNTING_UNRESOLVED",
                               motivo="Contabilidad de ejecuciones REAL pendiente de reconciliación")
+            return False
+        if (not paper_ticker and getattr(self, '_ticker_quarantine', {}).get(ticker)
+                == 'EXTERNAL_BROKER_POSITION'):
+            decision.execution_skip_reason = 'EXTERNAL_POSITION_ISOLATED'
+            self._audit_event('ENTRY_BLOCKED', ticker=ticker, lado=prop.tipo,
+                estado='EXTERNAL_POSITION_ISOLATED',
+                motivo='Ticker aislado por posición externa en Schwab')
             return False
         if self._daily_blocked():
             decision.execution_skip_reason = "DAILY_LOSS_BLOCK"
@@ -4393,6 +4414,31 @@ class ChocoletraBot:
         # confirmación de 2 ciclos ni ocultar una orden realmente huérfana).
         if ordenes is None:
             return
+        # Publish the positions AND orders just read. A prior verified close of
+        # one GALA position must not leave a stale account-wide FLAT banner when
+        # another ticker contains an external position.
+        real_symbols = set(self._real_tickers(self.tickers))
+        broker_positions = [
+            {'ticker': str(p.get('symbol') or '').upper(),
+             'side': str(p.get('tipo') or '').upper(),
+             'quantity': int(p.get('cantidad', 0) or 0)}
+            for p in posiciones
+            if str(p.get('symbol') or '').upper() in real_symbols
+            and int(p.get('cantidad', 0) or 0) > 0]
+        broker_order_symbols = sorted({self._symbol_from_broker_order(o)
+            for o in self._iter_broker_orders(ordenes)
+            if self._symbol_from_broker_order(o) in real_symbols})
+        self._set_broker_reconciliation(
+            # Publishing an exposure snapshot is not proof that a previously
+            # failed protection/startup reconciliation has recovered. Entry's
+            # existing authoritative recovery path decides that separately.
+            ok=bool(getattr(self, '_broker_reconciliation_ok', True)),
+            flat=not broker_positions and not broker_order_symbols,
+            context='PERIODIC_READ_ONLY',
+            message=('Broker sincronizado; posiciones y órdenes actuales'
+                     if broker_positions or broker_order_symbols
+                     else 'Broker confirmado plano'),
+            positions=broker_positions, open_order_symbols=broker_order_symbols)
         working_symbols = {self._symbol_from_broker_order(order)
                            for order in self._iter_broker_orders(ordenes)}
         for symbol, reason in list(getattr(self, "_ticker_quarantine", {}).items()):

@@ -4201,7 +4201,13 @@ def get_ticker_execution():
                 else:
                     blockers.append({"code": "REAL_ACCOUNTING_UNRESOLVED", "message": "Contabilidad REAL pendiente de reconciliación"})
             if row["ticker"] in quarantine:
-                blockers.append({"code": "REAL_STARTUP_QUARANTINE", "message": str(quarantine[row["ticker"]])})
+                reason = str(quarantine[row["ticker"]])
+                blockers.append({
+                    "code": ("EXTERNAL_POSITION_ISOLATED" if reason == "EXTERNAL_BROKER_POSITION"
+                             else "REAL_STARTUP_QUARANTINE"),
+                    "message": ("Ticker aislado por posición externa en Schwab"
+                                if reason == "EXTERNAL_BROKER_POSITION" else reason),
+                })
             if _unsupported_real_partial_exit(cfg, row.get("shares", 1)):
                 blockers.append({"code": "REAL_PARTIAL_EXIT_UNSUPPORTED", "message": "REAL 70/30 bloqueado: TP1 independiente y STOP total no son compatibles en Schwab"})
         # Saved routing is not proof that a ticker may submit an order. These
