@@ -69,6 +69,15 @@ class ExternalIsolationTests(unittest.TestCase):
         self.assertEqual(b._audit_event.call_args.kwargs['motivo'],'EXTERNAL_POSITION_ISOLATED')
         self.assertFalse(b._registrar_senal_no_ejecutada.call_args.kwargs['training_candidate'])
 
+    def test_status_read_survives_concurrent_quarantine_release(self):
+        b=self.bot;b._ticker_quarantine['AAPL']='EXTERNAL_BROKER_POSITION'
+        def mode(ticker):
+            b._ticker_quarantine.pop('AAPL',None)
+            return False
+        b._is_paper_ticker.side_effect=mode
+        self.assertEqual(b._real_accounting_status()['external_isolated_tickers'],['AAPL','META'])
+        self.assertEqual(b._real_accounting_status()['external_isolated_tickers'],['META'])
+
     def test_direct_entry_path_cannot_bypass_external_symbol_isolation(self):
         d=self.decision('META')
         self.assertFalse(self.bot._abrir_operacion(d,643.,None))

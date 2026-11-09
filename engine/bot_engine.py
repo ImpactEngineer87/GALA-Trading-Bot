@@ -846,10 +846,12 @@ class ChocoletraBot:
         # stop unrelated REAL symbols. Unknown GALA fills/pending manual closes
         # below still hold REAL entries globally until their evidence resolves.
         with getattr(self, "_lock", threading.RLock()):
-            isolated = sorted(ticker for ticker, reason in
-                getattr(self, "_ticker_quarantine", {}).items()
-                if reason == "EXTERNAL_BROKER_POSITION"
-                and not self._is_paper_ticker(ticker))
+            quarantine = dict(getattr(self, "_ticker_quarantine", {}))
+        # Recovery can remove a quarantine between ticker-mode reads. Iterate
+        # an immutable observation rather than a live dictionary view.
+        isolated = sorted(ticker for ticker, reason in quarantine.items()
+            if reason == "EXTERNAL_BROKER_POSITION"
+            and not self._is_paper_ticker(ticker))
         snapshot["external_isolated_tickers"] = isolated
         snapshot["external_exposure_present"] = bool(isolated)
         snapshot["external_exposure_blocked"] = False

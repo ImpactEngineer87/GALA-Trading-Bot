@@ -27,6 +27,8 @@ accounting records had not changed.
   unreadable accounting state, and the daily loss latch retain global holds.
 - The dashboard reports isolated tickers, and periodic broker snapshots replace
   stale FLAT information without clearing a prior failed reconciliation.
+- Status reads use a copy of the quarantine map so automatic recovery cannot
+  invalidate a dictionary iteration while the dashboard is reading it.
 - Entry audit/API evidence identifies `EXTERNAL_POSITION_ISOLATED`.
   Such observations are excluded from executable-trade training samples.
 
@@ -37,8 +39,9 @@ Implementation: `engine/bot_engine.py`, `server.py`,
 Regression coverage: `tests/test_external_position_isolation.py` and
 `tests/test_manual_order_ownership.py`.
 
-Windows focused gate: 60 tests passed. Linux full-suite and deployment evidence
-are recorded after their gates complete.
+Initial Windows focused gate: 60 tests passed; initial Linux full suite: 649
+passed. The final candidate adds a concurrent quarantine-release regression;
+its verification and deployment results are recorded after the gates complete.
 
 No models, thresholds, ticker selections, loss limits, historical fills, or
 accounting exceptions are changed by this release. Fixed entry-limit pricing and
