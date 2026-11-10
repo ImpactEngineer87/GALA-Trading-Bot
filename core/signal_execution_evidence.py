@@ -1,8 +1,6 @@
 """Read-only signal attribution. An AI score is never broker fill evidence."""
 from collections import defaultdict
-import csv
 import re
-from pathlib import Path
 from core.dashboard_evidence import session_date
 
 
@@ -119,12 +117,7 @@ def annotate_signals(signals, audit_rows=(), *, audit_available=True):
 
 def read_signal_audit(path, signals):
     """Do not construct a ledger: its legacy schema migration can write files."""
-    path = Path(path)
-    if not path.exists():
-        return [], False
+    from core.display_audit_cache import DISPLAY_AUDIT_CACHE
+
     wanted = {_key(s, signal=True) for s in signals} - {None}
-    with path.open(encoding='utf-8-sig', newline='') as handle:
-        reader = csv.DictReader(handle)
-        if not {'modo', 'ticker', 'signal_id', 'evento', 'order_id'} <= set(reader.fieldnames or []):
-            return [], False
-        return [row for row in reader if _key(row) in wanted], True
+    return DISPLAY_AUDIT_CACHE.signals(path, wanted)

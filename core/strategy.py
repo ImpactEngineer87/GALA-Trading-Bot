@@ -265,22 +265,26 @@ class GALA10Strategy:
         cross_low = np.full(n, np.nan)
         cross_bars = np.zeros(n, dtype=int)
         direccion = np.zeros(n, dtype=int)
+        # These recurrences are sequential; index arrays directly instead of
+        # constructing pandas Series/indexers for every candle and column.
+        highs, lows = df['high'].to_numpy(), df['low'].to_numpy()
+        bulls, bears = df['bull_cross'].to_numpy(), df['bear_cross'].to_numpy()
 
         for i in range(n):
             if i == 0:
-                cross_high[i] = df['high'].iloc[i]
-                cross_low[i] = df['low'].iloc[i]
+                cross_high[i] = highs[i]
+                cross_low[i] = lows[i]
                 cross_bars[i] = 0
                 direccion[i] = 0
                 continue
 
-            bull = df['bull_cross'].iloc[i]
-            bear = df['bear_cross'].iloc[i]
+            bull = bulls[i]
+            bear = bears[i]
 
             # Actualizar cross_high cuando hay cruce alcista
-            cross_high[i] = df['high'].iloc[i] if bull else cross_high[i - 1]
+            cross_high[i] = highs[i] if bull else cross_high[i - 1]
             # Actualizar cross_low cuando hay cruce bajista
-            cross_low[i] = df['low'].iloc[i] if bear else cross_low[i - 1]
+            cross_low[i] = lows[i] if bear else cross_low[i - 1]
 
             # Reiniciar contador en cada cruce, incrementar en caso contrario
             cross_bars[i] = 0 if (bull or bear) else cross_bars[i - 1] + 1
@@ -537,6 +541,12 @@ class GALA10Strategy:
         señal = [None] * n
         buy = np.zeros(n, dtype=bool)
         sell = np.zeros(n, dtype=bool)
+        raw_buy = df['buy_signal_raw'].to_numpy()
+        raw_sell = df['sell_signal_raw'].to_numpy()
+        range_buy = df['omitida_buy_rango'].to_numpy()
+        range_sell = df['omitida_sell_rango'].to_numpy()
+        trend_buy = df['omitida_buy_tendencia'].to_numpy()
+        trend_sell = df['omitida_sell_tendencia'].to_numpy()
 
         for i in range(n):
             if i == 0:
@@ -544,17 +554,17 @@ class GALA10Strategy:
                 barras_sell[i] = 100
             else:
                 # Contador buy: reinicia a 1 si hubo señal raw en vela anterior
-                barras_buy[i] = 1 if df['buy_signal_raw'].iloc[i - 1] else barras_buy[i - 1] + 1
+                barras_buy[i] = 1 if raw_buy[i - 1] else barras_buy[i - 1] + 1
                 # Contador sell: reinicia a 1 si hubo señal raw en vela anterior
-                barras_sell[i] = 1 if df['sell_signal_raw'].iloc[i - 1] else barras_sell[i - 1] + 1
+                barras_sell[i] = 1 if raw_sell[i - 1] else barras_sell[i - 1] + 1
 
             # Señal BUY válida: señal raw activa Y han pasado más de N velas
             buy_final = bool(
-                df['buy_signal_raw'].iloc[i]
+                raw_buy[i]
                 and barras_buy[i] > self.cooldown_bars
             )
             sell_final = bool(
-                df['sell_signal_raw'].iloc[i]
+                raw_sell[i]
                 and barras_sell[i] > self.cooldown_bars
             )
             buy[i] = buy_final
@@ -565,9 +575,9 @@ class GALA10Strategy:
                 señal[i] = 'BUY'
             elif sell_final:
                 señal[i] = 'SELL'
-            elif df['omitida_buy_rango'].iloc[i] or df['omitida_sell_rango'].iloc[i]:
+            elif range_buy[i] or range_sell[i]:
                 señal[i] = 'OM-R'
-            elif df['omitida_buy_tendencia'].iloc[i] or df['omitida_sell_tendencia'].iloc[i]:
+            elif trend_buy[i] or trend_sell[i]:
                 señal[i] = 'OM-T'
 
         df['barras_desde_buy'] = barras_buy

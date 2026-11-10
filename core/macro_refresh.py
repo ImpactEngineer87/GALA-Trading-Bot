@@ -5,9 +5,9 @@ import time
 
 
 class MacroRefresh:
-    def __init__(self, fetch):
+    def __init__(self, fetch, max_workers=2):
         self._fetch = fetch
-        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='GalaHistory')
+        self._pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix='GalaHistory')
         self._lock = threading.Lock()
         self._futures = {}
         self._closed = False
@@ -29,6 +29,20 @@ class MacroRefresh:
                 return None
             del self._futures[symbol]
         return future.result()
+
+    def result(self, symbol):
+        """Join the existing refresh at expiry instead of duplicating its GETs."""
+        self.request(symbol)
+        with self._lock:
+            future = self._futures.get(symbol)
+        if future is None:
+            raise RuntimeError('Historical refresher is closed')
+        try:
+            return future.result()
+        finally:
+            with self._lock:
+                if self._futures.get(symbol) is future:
+                    del self._futures[symbol]
 
     def close(self):
         with self._lock:

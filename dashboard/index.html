@@ -1494,7 +1494,9 @@ function showPage(id, navBtn, sideBtn, bnavBtn) {
     fetchAuditoriaOrdenes();
     fetchSlippageEntradas();
   }
-  if(id === 'trades') fetchSlippageEntradas();
+  if(id === 'trades') { fetchSlippageEntradas(); fetchTickerPerformance(); fetchTickerAnalysis(); }
+  if(id === 'logs') fetchLogs();
+  if(id === 'signals') fetchSignals();
   closeSidebar();
 }
 
@@ -1796,9 +1798,13 @@ function updateSchedulerStatus(scheduler){
 // ─────────────────────────────────────────────────────────
 // FETCH SIGNALS
 // ─────────────────────────────────────────────────────────
+let signalFetchInFlight = false;
 async function fetchSignals(){
+  if(signalFetchInFlight || document.hidden) return;
+  signalFetchInFlight = true;
+  const fullHistory = el('page-signals')?.classList.contains('active');
   try {
-    const r = await api('/api/signals?limit=2000');
+    const r = await api('/api/signals?limit=' + (fullHistory ? 2000 : 100));
     const d = await r.json();
     if(!r.ok || d.status!=='ok') throw new Error('Señales no disponibles');
     if(d.status === 'ok'){
@@ -1814,7 +1820,7 @@ async function fetchSignals(){
       if(count) count.textContent = total > sigs.length
         ? `${total} señales guardadas · mostrando las ${sigs.length} más recientes`
         : `${total} señales guardadas · sobreviven reinicios del servidor`;
-      renderSignalFeed('allSignalFeed', sigs.slice().reverse());
+      if(fullHistory) renderSignalFeed('allSignalFeed', sigs.slice().reverse());
       renderSignalFeed('dashSignalFeed', sigs.slice().reverse().slice(0,6));
       updateTickerSignalBadges(sigs);
     }
@@ -1825,6 +1831,8 @@ async function fetchSignals(){
     }
     const count=el('signalHistoryCount');
     if(count) count.textContent='Consulta no disponible · no se confirma el estado de órdenes';
+  } finally {
+    signalFetchInFlight = false;
   }
 }
 
@@ -4100,9 +4108,9 @@ setInterval(fetchSignals, 5000);
 setInterval(fetchAIStatus, 10000);
 setInterval(fetchTickerExecution, 7000);
 setInterval(fetchTrades,  6000);
-setInterval(fetchTickerPerformance, 8000);
-setInterval(fetchTickerAnalysis, 15000);
-setInterval(fetchLogs,    7000);
+setInterval(() => { if(!document.hidden && el('page-trades')?.classList.contains('active')) fetchTickerPerformance(); }, 8000);
+setInterval(() => { if(!document.hidden && el('page-trades')?.classList.contains('active')) fetchTickerAnalysis(); }, 15000);
+setInterval(() => { if(!document.hidden && el('page-logs')?.classList.contains('active')) fetchLogs(); }, 7000);
 setInterval(() => {
   const page=el('page-signals');
   if(

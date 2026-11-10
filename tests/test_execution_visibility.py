@@ -187,17 +187,43 @@ c.updateBotUI(false,{state:'FAILED'});assert.equal(elements.botStatus.textConten
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
 
     @unittest.skipUnless(shutil.which('node'), 'Node.js is required for dashboard checks')
+    def test_signal_polling_has_backpressure_and_downloads_history_only_when_visible(self):
+        dashboard = Path(__file__).resolve().parents[1]/'dashboard/index.html'
+        js = r"""
+const fs=require('fs'),vm=require('vm'),assert=require('assert'),h=fs.readFileSync(process.argv[1],'utf8');
+const elements={},requests=[],renders=[];let visible=false,release;
+const el=id=>elements[id]??={classList:{contains:()=>visible}};
+const c=vm.createContext({S:{},el,document:{hidden:false},
+ api:async url=>{requests.push(url);return await new Promise(resolve=>{release=()=>resolve({ok:true,json:async()=>({status:'ok',signals:[],counts:{}})});});},
+ renderSignalFeed:(id)=>renders.push(id),updateTickerSignalBadges:()=>{}});
+const a=h.indexOf('let signalFetchInFlight = false;'),b=h.indexOf('function renderSignalFeed(',a);
+vm.runInContext(h.slice(a,b),c);
+(async()=>{
+ const first=c.fetchSignals();await c.fetchSignals();assert.equal(requests.length,1);
+ assert.match(requests[0],/limit=100$/);release();await first;
+ assert.deepEqual(renders,['dashSignalFeed']);
+ c.document.hidden=true;await c.fetchSignals();assert.equal(requests.length,1);
+ c.document.hidden=false;visible=true;const history=c.fetchSignals();
+ assert.match(requests[1],/limit=2000$/);release();await history;
+ assert.ok(renders.includes('allSignalFeed'));
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+        result = subprocess.run([shutil.which('node'), '-e', js, str(dashboard)],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is required for dashboard checks')
     def test_failed_polls_do_not_keep_old_active_prices_or_claim_a_flat_account(self):
         dashboard = Path(__file__).resolve().parents[1]/'dashboard/index.html'
         js = r"""
 const fs=require('fs'),vm=require('vm'),assert=require('assert'),h=fs.readFileSync(process.argv[1],'utf8');
-const elements={},el=id=>elements[id]??={textContent:'OLD DATA',innerHTML:'OLD PRICE 999',style:{}};
+const elements={},el=id=>elements[id]??={textContent:'OLD DATA',innerHTML:'OLD PRICE 999',style:{},classList:{contains:()=>false}};
 const c=vm.createContext({S:{positions:[{ticker:'BA',entry_price:999}]},el,document:{getElementById:el},
   api:async()=>{throw Error('offline')},updateDailyRisk:()=>{},updateSchedulerStatus:()=>{},updateBrokerReconciliation:()=>{}});
 for(const [start,end] of [['function financialNumber(','function renderPositions('],
  ['function updateBotUI(','// ─'],['async function fetchStatus(){','function updateDailyRisk('],
  ['async function fetchTrades(){','async function fetchTickerPerformance(){'],
- ['async function fetchSignals(){','function renderSignalFeed(']]){
+ ['let signalFetchInFlight = false;','function renderSignalFeed(']]){
  const a=h.indexOf(start),b=h.indexOf(end,a);vm.runInContext(h.slice(a,b),c);
 }
 (async()=>{

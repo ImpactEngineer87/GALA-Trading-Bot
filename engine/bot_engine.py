@@ -2711,9 +2711,27 @@ class ChocoletraBot:
                     ent = (completed_at, refreshed, ent[2])
                     self._mtf_cache[ticker] = ent
             # Start before expiry; the configured maximum cache age is retained.
-            refresh_after = max(self._mtf_ttl_macro*.5, self._mtf_ttl_macro-120)
+            refresh_after = self._mtf_ttl_macro*.5
             if (ahora - ent[0]) >= refresh_after:
                 refresher.request(ticker)
+        if ent and (ahora - ent[0]) >= self._mtf_ttl_macro:
+            # A warm context needs recent native bars, not another cold download
+            # of every historical page. Join any queued refresh for this symbol;
+            # never let two requests compete for the same market-data budget.
+            if refresher is not None:
+                refreshed, completed_at = refresher.result(ticker)
+            else:
+                refreshed = self._refrescar_contexto_mtf(ticker)
+                completed_at = time.time()
+            if (refreshed.sintetico or refreshed.tf('1m') is None
+                    or not len(refreshed.tf('1m'))):
+                raise RuntimeError('Fresh native historical context unavailable')
+            combined = pd.concat([refreshed.tf('1m'), ent[1].tf('1m')])
+            refreshed.velas['1m'] = combined[
+                ~combined.index.duplicated(keep='last')].sort_index()
+            ent = (completed_at, refreshed, ent[2])
+            self._mtf_cache[ticker] = ent
+            ahora = time.time()
         if ent and (ahora - ent[0]) < self._mtf_ttl_macro:
             datos = ent[1]
             if (ahora - ent[2]) >= self._mtf_ttl:
@@ -2745,7 +2763,7 @@ class ChocoletraBot:
         if ent and ent[1].velas.get('1m') is not None and datos.velas.get('1m') is not None:
             combined = pd.concat([ent[1].velas['1m'], datos.velas['1m']])
             datos.velas['1m'] = combined[~combined.index.duplicated(keep='last')].sort_index()
-        self._mtf_cache[ticker] = (ahora, datos, ahora)
+        self._mtf_cache[ticker] = (time.time(), datos, time.time())
         return datos
 
     # ==========================================================

@@ -422,6 +422,9 @@ def _load_local_chart_candles(
     return rows, ("historico_csv" if historical else "")
 
 
+_SIGNAL_HISTORY_CACHE = {}
+
+
 def _read_signal_history(*, ticker: str = "", limit: int = None):
     """Read valid signal rows oldest-first without losing earlier good rows.
 
@@ -434,6 +437,12 @@ def _read_signal_history(*, ticker: str = "", limit: int = None):
     wanted = str(ticker or "").strip().upper()
     rows = []
     with _SIGNAL_LOCK:
+        st = os.stat(path)
+        signature = (path, st.st_ino, st.st_size, st.st_mtime_ns)
+        if _SIGNAL_HISTORY_CACHE.get('key') == signature:
+            cached = _SIGNAL_HISTORY_CACHE['rows']
+            rows = [dict(r) for r in cached if not wanted or str(r.get('ticker', '')).upper() == wanted]
+            return rows[-max(0, int(limit)):] if limit is not None else rows
         with open(path, "r", encoding="utf-8-sig") as fh:
             for raw in fh:
                 try:
@@ -441,8 +450,6 @@ def _read_signal_history(*, ticker: str = "", limit: int = None):
                 except (TypeError, ValueError):
                     continue
                 if not isinstance(row, dict):
-                    continue
-                if wanted and str(row.get("ticker", "")).upper() != wanted:
                     continue
                 # v3.3.1: old v3.3.0 rows could persist ai_threshold from the
                 # production trainer even when the decision actually used a
@@ -467,6 +474,8 @@ def _read_signal_history(*, ticker: str = "", limit: int = None):
                 except (TypeError, ValueError):
                     pass
                 rows.append(row)
+        _SIGNAL_HISTORY_CACHE.update(key=signature, rows=rows)
+    rows = [dict(r) for r in rows if not wanted or str(r.get('ticker', '')).upper() == wanted]
     if limit is not None:
         rows = rows[-max(0, int(limit)):]
     return rows
@@ -519,13 +528,15 @@ def _read_history_rows(*, newest_first: bool = True):
 
 _DASHBOARD_HISTORY_CACHE = {}
 _DASHBOARD_HISTORY_LOCK = threading.RLock()
+_HISTORY_SUMMARY_CACHE = {}
 
 
-def _dashboard_history_rows(*, newest_first=True):
-    """Read-only provenance view, cached until either source ledger changes."""
+def _dashboard_history_rows(*, newest_first=True, copy_rows=True):
+    """Read-only view, invalidated by history changes or relevant fill evidence."""
     import csv
     from core.dashboard_evidence import annotate_history
     from core.trade_history import LEGACY_HISTORY_FIELDS, HISTORY_FIELDS
+    from core.display_audit_cache import DISPLAY_AUDIT_CACHE
 
     history_path, audit_path = _history_path(), _order_audit_path()
     def signature(path):
@@ -535,8 +546,9 @@ def _dashboard_history_rows(*, newest_first=True):
         except FileNotFoundError:
             return (path, None)
 
-    key = (signature(history_path), signature(audit_path))
     with _DASHBOARD_HISTORY_LOCK:
+        audit_revision, audit_rows, _ = DISPLAY_AUDIT_CACHE.history(audit_path)
+        key = (signature(history_path), audit_revision)
         if _DASHBOARD_HISTORY_CACHE.get("key") != key:
             rows = []
             if os.path.exists(history_path):
@@ -548,14 +560,12 @@ def _dashboard_history_rows(*, newest_first=True):
                     rows = list(reader)
                     if fields == LEGACY_HISTORY_FIELDS:
                         rows = [{**r, "evento": "POSITION_CLOSE"} for r in rows]
-            try:
-                with open(audit_path, encoding="utf-8-sig", newline="") as handle:
-                    annotated = annotate_history(rows, csv.DictReader(handle))
-            except (OSError, csv.Error):
-                annotated = annotate_history(rows)
+            annotated = annotate_history(rows, audit_rows)
             _DASHBOARD_HISTORY_CACHE.clear()
             _DASHBOARD_HISTORY_CACHE.update(key=key, rows=annotated)
         rows = _DASHBOARD_HISTORY_CACHE["rows"]
+        if not copy_rows and not newest_first:
+            return rows
         return [dict(row) for row in (reversed(rows) if newest_first else rows)]
 
 
@@ -573,7 +583,7 @@ def _history_summary():
     """Persistent closed count/PnL, so dashboard stats survive restarts."""
     from core.dashboard_evidence import mode_of, session_date
     try:
-        rows = _dashboard_history_rows(newest_first=False)
+        rows = _dashboard_history_rows(newest_first=False, copy_rows=False)
     except Exception:
         return {
             "available": False, "excluded_closed_count": 0,
@@ -585,6 +595,11 @@ def _history_summary():
             "paper_realized_today": None, "real_realized_today": None,
             "paper_closed_today": 0, "real_closed_today": 0,
         }
+    today_ny = _ahora_ny_datetime().strftime("%Y-%m-%d")
+    with _DASHBOARD_HISTORY_LOCK:
+        if (_HISTORY_SUMMARY_CACHE.get('rows') is rows
+                and _HISTORY_SUMMARY_CACHE.get('day') == today_ny):
+            return dict(_HISTORY_SUMMARY_CACHE['result'])
     all_closed = _closed_history_rows(rows)
     excluded = sum(not r.get("performance_verified", False) for r in all_closed)
     closed = [r for r in all_closed if r.get("performance_verified")]
@@ -592,7 +607,6 @@ def _history_summary():
     counts = {"PAPER": 0, "REAL": 0}
     today_pnl = {"PAPER": 0.0, "REAL": 0.0}
     today_counts = {"PAPER": 0, "REAL": 0}
-    today_ny = _ahora_ny_datetime().strftime("%Y-%m-%d")
     for row in closed:
         try:
             value = float(row.get("pnl_usd", 0.0) or 0.0)
@@ -613,7 +627,7 @@ def _history_summary():
                                   and not r.get('performance_intentionally_excluded') and mode_of(r) == mode
                                   and session_date(r) == today_ny for r in all_closed)
                         for mode in ("PAPER", "REAL")}
-    return {
+    result = {
         "available": True,
         "excluded_closed_count": excluded,
         "pnl_source": "LOCAL_RECORDED_FILLS_AND_PAPER_SIMULATION",
@@ -630,6 +644,9 @@ def _history_summary():
         'paper_excluded_today': sum(bool(r.get('performance_intentionally_excluded'))
             and mode_of(r) == 'PAPER' and session_date(r) == today_ny for r in all_closed),
     }
+    with _DASHBOARD_HISTORY_LOCK:
+        _HISTORY_SUMMARY_CACHE.update(rows=rows, day=today_ny, result=result)
+    return dict(result)
 
 
 def _position_pnl_summary(positions):

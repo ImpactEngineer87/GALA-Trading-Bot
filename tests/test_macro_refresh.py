@@ -58,10 +58,35 @@ class MacroRefreshTests(unittest.TestCase):
 
     def test_history_is_not_served_indefinitely_after_refresh_failures(self):
         self.bot._macro_refresh=Mock();self.bot._macro_refresh.completed.return_value=None
-        self.bot.schwab.obtener_multitemporal.return_value=self.data
+        self.bot._macro_refresh.result.side_effect=RuntimeError('provider unavailable')
         with patch('engine.bot_engine.time.time',return_value=1400):
-            self.bot._obtener_mtf('TSLA')
-        self.bot.schwab.obtener_multitemporal.assert_called_once_with('TSLA',{})
+            with self.assertRaisesRegex(RuntimeError,'provider unavailable'):
+                self.bot._obtener_mtf('TSLA')
+        self.assertEqual(self.bot._mtf_cache['TSLA'][0],800)
+        self.bot.schwab.obtener_multitemporal.assert_not_called()
+
+    def test_expiry_joins_native_refresh_then_fetches_current_one_minute_prices(self):
+        self.bot._macro_refresh=Mock();self.bot._macro_refresh.completed.return_value=None
+        refreshed=DatosMultiTemporal('TSLA',{'1m':self.data.tf('1m').copy()})
+        self.bot._macro_refresh.result.return_value=(refreshed,1399)
+        with patch('engine.bot_engine.time.time',return_value=1400):
+            result=self.bot._obtener_mtf('TSLA')
+        self.assertEqual(self.bot._mtf_cache['TSLA'][0],1399)
+        self.assertEqual(result.tf('1m').iloc[-1]['close'],2.)
+        self.bot._macro_refresh.result.assert_called_once_with('TSLA')
+        self.bot.schwab.obtener_1m_reciente.assert_called_once_with('TSLA')
+        self.bot.schwab.obtener_multitemporal.assert_not_called()
+
+    def test_expiry_and_background_share_one_fetch(self):
+        entered,release=threading.Event(),threading.Event()
+        def fetch(symbol):
+            entered.set();release.wait(3);return self.data
+        load=Mock(side_effect=fetch);refresher=MacroRefresh(load)
+        self.addCleanup(refresher.close);self.addCleanup(release.set)
+        self.assertTrue(refresher.request('TSLA'));self.assertTrue(entered.wait(2))
+        release.set();data,completed=refresher.result('TSLA')
+        self.assertIs(data,self.data);self.assertGreater(completed,0)
+        self.assertIsNone(refresher.completed('TSLA'));load.assert_called_once_with('TSLA')
 
     def test_closed_refresher_cannot_schedule_or_install_results(self):
         refresher=MacroRefresh(Mock(return_value=self.data));refresher.close()
