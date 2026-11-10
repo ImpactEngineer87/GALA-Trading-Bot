@@ -556,7 +556,7 @@
     <div class="brand-icon">🤖</div>
     <div>
       <div class="brand-name">GALA10 Chocoletra</div>
-      <div class="brand-ver">Trading Algorítmico v3.3.23</div>
+      <div class="brand-ver" id="brandVersion">Trading Algorítmico · verificando versión</div>
     </div>
   </div>
   <div class="nav-tabs">
@@ -667,10 +667,20 @@
       <div class="stat-card purple">
         <div class="stat-icon">💰</div>
         <div class="stat-value" id="stPnl">$0</div>
-        <div class="stat-label">PnL PAPER elegible</div>
+        <div class="stat-label">SIMULACIÓN PAPER · HOY</div>
         <div class="daily-risk-sub" id="stPnlPaper">Abierto $0.00 · Cerrado hoy $0.00</div>
+        <div class="daily-risk-sub">No es la pérdida REAL ni el P/L de cuenta Schwab.</div>
       </div>
     </div>
+
+    <details class="card" id="pnlBreakdownPanel" ontoggle="if(this.open)fetchPnlBreakdown()" style="margin-top:12px">
+      <summary style="cursor:pointer;font-weight:700">Ver de dónde sale el P/L · PAPER y REAL separados</summary>
+      <div style="display:flex;gap:12px;align-items:center;margin:14px 0">
+        <select id="pnlBreakdownMode" class="exec-mode-select" onchange="renderPnlBreakdown()"><option value="PAPER">PAPER · simulación</option><option value="REAL">REAL · cierres GALA</option></select>
+        <button class="btn btn-ghost btn-sm" onclick="fetchPnlBreakdown()">↻ Actualizar</button>
+      </div>
+      <div id="pnlBreakdownContent" class="section-note">Abra el desglose para consultar los registros.</div>
+    </details>
 
     <div class="card daily-risk-card" id="dailyRiskCard">
       <div>
@@ -1634,6 +1644,8 @@ async function fetchStatus(){
       updateBotUI(d.bot.running,d.bot.engine_runtime);
       const runtime=d.bot.engine_runtime||{}, runtimeEl=el('engineRuntimeStatus');
       if(runtimeEl) runtimeEl.textContent=`Servidor ${d.bot.server_version||'sin verificar'} · Inicio del hilo (NY): ${runtime.thread_started_at_ny||'sin registro en este proceso'} · Estado: ${runtime.state||'sin verificar'}${runtime.last_error_code?' · '+runtime.last_error_code:''} · ACTIVO no confirma envíos ni fills.`;
+      const brand=el('brandVersion');
+      if(brand) brand.textContent=`Trading Algorítmico v${d.bot.server_version||'sin verificar'}`;
       const stats = d.stats || {};
       el('stBuy').textContent   = stats.buy   || 0;
       el('stSell').textContent  = stats.sell  || 0;
@@ -1650,7 +1662,7 @@ async function fetchStatus(){
         : `PAPER ${paperOpen} · REAL ${realOpen}`;
       const pnl = financialNumber(stats.paper_session_pnl);
       el('stPnl').textContent   = money(pnl);
-      el('stPnl').style.color   = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+      el('stPnl').style.color   = pnl == null ? 'var(--muted)' : pnl >= 0 ? 'var(--green)' : 'var(--red)';
       el('stPnlPaper').textContent = `Abierto ${money(stats.paper_unrealized_pnl)} · Cerrado hoy ${money(stats.paper_realized_today)}${stats.paper_excluded_today ? ' · '+stats.paper_excluded_today+' cierres de mantenimiento excluidos' : ''}`;
       updateDailyRisk(d.daily_risk || {});
       updateSchedulerStatus(d.scheduler || {});
@@ -1847,6 +1859,8 @@ function renderSignalFeed(id, sigs){
     const signalId = escHtml(s.signal_id || '');
     const tipo = escHtml(s.tipo || '—');
     const time = [s.date, s.timestamp].filter(Boolean).join(' ');
+    const nyTime=v=>new Date(v).toLocaleTimeString('es-ES',{hour12:false,timeZone:'America/New_York'});
+    const evidence=s.execution_evidence||{};
     const threshold = (s.ai_context||{}).threshold == null
       ? s.ai_threshold
       : Number((s.ai_context||{}).threshold);
@@ -1875,6 +1889,8 @@ function renderSignalFeed(id, sigs){
         ${(s.ai_context||{}).execution_timing === 'LATE_CLOSED_BAR' ? '<div>Evaluación posterior con datos disponibles al cierre original. Decisión del modelo: '+escHtml((s.ai_context||{}).model_decision || 'N/A')+'. Sin entrada retroactiva.</div>' : ''}
         ${(s.ai_context||{}).execution_intent?.kind === 'REVERSAL_RETRY' ? '<div>Reintento de reversión: nueva evaluación IA y precio actual tras un cierre pendiente. Señal original: '+escHtml(s.ai_context.execution_intent.parent_signal_id || 'N/A')+'.</div>' : ''}
         <div>IA aprobada no confirma envío/fill. ${escHtml(s.execution_evidence?.label||'Sin evidencia enlazada')}. Referencia de señal: no es precio de ejecución.</div>
+        ${evidence.source_bar_closed_at_utc?`<div>Vela cerró ${escHtml(nyTime(evidence.source_bar_closed_at_utc))} NY · análisis registrado ${escHtml(nyTime(evidence.analysis_recorded_at_utc))} NY · demora ${Number(evidence.analysis_delay_seconds).toFixed(1)} s.</div>`:''}
+        ${evidence.submitted_at_utc?`<div>Límite enviado ${positiveMoney(evidence.submitted_limit_price)} a las ${escHtml(nyTime(evidence.submitted_at_utc))} NY${evidence.submission_delay_seconds==null?'':` · ${Number(evidence.submission_delay_seconds).toFixed(1)} s desde el registro IA`} · bid ${positiveMoney(evidence.bid_at_submission)} / ask ${positiveMoney(evidence.ask_at_submission)}.</div>`:''}
         <div>Modelo: ${escHtml((s.ai_context||{}).model_version || 'N/A')} · ${escHtml((s.ai_context||{}).model_tier || 'N/A')}</div>
         <div>Balanced accuracy: ${(s.ai_context||{}).balanced_accuracy == null ? 'N/A' : Number(s.ai_context.balanced_accuracy).toFixed(2)+'%'} · Régimen: ${escHtml((s.ai_context||{}).market_regime || 'N/A')}</div>
         <div>Probabilidad del modelo: ${(s.ai_context||{}).raw_probability == null ? 'N/A' : (Number(s.ai_context.raw_probability)*100).toFixed(2)+'%'} · Estado: ${escHtml((s.ai_context||{}).production_status || 'N/A')}</div>
@@ -1882,7 +1898,7 @@ function renderSignalFeed(id, sigs){
         <div>Entrenado: ${escHtml((s.ai_context||{}).training_date || 'N/A')} · Validado: ${escHtml((s.ai_context||{}).validation_date || 'N/A')}</div>
         ${(s.ai_context||{}).manual_authorization ? '<div>Autorización manual aplicada: '+escHtml(s.ai_context.manual_authorization.reason)+'</div>' : ''}
       </details>
-      <span class="sig-time">${escHtml(time)}</span>
+      <span class="sig-time">IA ${escHtml(time)}${evidence.source_bar_closed_at_utc?`<br>Vela cerró ${escHtml(nyTime(evidence.source_bar_closed_at_utc))} NY`:''}</span>
     </div>`;
   }).join('');
 }
@@ -2533,7 +2549,8 @@ async function fetchTickerPerformance(){
           <span>W/L <b>${Number(row.wins||0)}/${Number(row.losses||0)}</b></span>
           <span>Realizado bruto <b>${money(row.realized_pnl)}</b></span>
           <span>${mode==='REAL'?'P/L Schwab: consulta separada':'Flotante PAPER'} <b>${mode==='REAL'?'N/D':money(row.unrealized_pnl)}</b></span>
-          <span>Sin verificar / excluidos <b>${Number(row.excluded_closed_trades||0)}</b></span>
+          <span>Sin verificar <b>${Number(row.unverified_closed_trades??row.excluded_closed_trades??0)}</b></span>
+          <span>Mantenimiento / manuales verificados, fuera del rendimiento <b>${Number(row.intentionally_excluded_closed_trades||0)}</b></span>
         </div>
       </div>`;
     }).join('') || '<div class="empty-state">Sin actividad por ticker hoy.</div>';
@@ -4103,6 +4120,37 @@ window.addEventListener('orientationchange',scheduleSignalChartResize,{passive:t
 // ─────────────────────────────────────────────────────────
 // POLLING
 // ─────────────────────────────────────────────────────────
+async function fetchPnlBreakdown(){
+  if(S.pnlBreakdownBusy) return;
+  S.pnlBreakdownBusy=true;
+  try{
+    const r=await api('/api/pnl-breakdown'),d=await r.json();
+    if(!r.ok || d.status!=='ok') throw new Error('Desglose no verificable');
+    S.pnlBreakdown=d;
+    renderPnlBreakdown();
+  }catch(e){
+    S.pnlBreakdown=null;
+    el('pnlBreakdownContent').textContent='Desglose no verificable en esta consulta; no se muestran importes anteriores.';
+  }finally{S.pnlBreakdownBusy=false;}
+}
+
+function renderPnlBreakdown(){
+  const data=S.pnlBreakdown,mode=el('pnlBreakdownMode')?.value||'PAPER',d=data?.modes?.[mode];
+  if(!d) return;
+  const price=v=>financialNumber(v)==null?'N/D':Number(v).toFixed(4);
+  const tableRows=(d.tickers||[]).map(r=>`<tr><td>${escHtml(r.ticker)}</td><td>${Number(r.closed_trades||0)}</td><td>${money(r.realized_pnl)}</td><td>${money(r.unrealized_pnl)}</td><td>${money(r.total_pnl)}</td><td>${Number(r.intentionally_excluded_closed_trades||0)} / ${Number(r.unverified_closed_trades||0)}</td></tr>`).join('');
+  const closes=(d.closes||[]).map(r=>`<tr><td>${escHtml(r.time_ny||'')}</td><td>${escHtml(r.ticker)}</td><td>${escHtml(r.side||'')}</td><td>${escHtml(r.quantity??'N/D')}</td><td>${price(r.entry)}</td><td>${price(r.exit)}</td><td>${r.included?money(r.included_pnl):'Fuera del total'}</td><td>${escHtml(r.included?(r.reason||'Incluido'):(r.exclusion_reason||'Sin verificar'))}</td></tr>`).join('');
+  el('pnlBreakdownContent').innerHTML=`
+    <p><b>${mode==='PAPER'?'SIMULACIÓN PAPER':'REAL GALA · fills locales verificados, bruto'}</b> · sesión ${escHtml(data.date_ny)} · consulta ${escHtml(data.as_of_utc)}</p>
+    <p><b>Cerrado ${money(d.closed_pnl)} + abierto ${money(d.open_pnl)} = ${money(d.total_pnl)}</b></p>
+    <p>${Number(d.closed_count)} cierres incluidos · ${Number(d.open_count)} posiciones abiertas · ${Number(d.maintenance_excluded_count)} cierres de mantenimiento excluidos · ${Number(d.unverified_closed_count)} cierres sin verificar.</p>
+    ${mode==='REAL'?`<p>Cierres manuales verificados, fuera del rendimiento GALA: ${Number(d.verified_manual_closed_count)} · ${money(d.verified_manual_closed_pnl)}. El flotante REAL no se estima con velas en este total.</p>`:''}
+    <p>${escHtml(data.note)}</p>
+    <div style="overflow:auto"><table class="hist-table"><thead><tr><th>Ticker</th><th>Cierres incluidos</th><th>Cerrado</th><th>Abierto</th><th>Total</th><th>Excluidos / sin verificar</th></tr></thead><tbody>${tableRows||'<tr><td colspan="6">Sin actividad en esta sesión</td></tr>'}</tbody></table></div>
+    <details style="margin-top:12px"><summary>Ver los ${Number((d.closes||[]).length)} registros de cierre y sus precios</summary><p>El P/L utiliza los precios y cantidades registrados, con su precisión original; los importes se muestran redondeados al centavo.</p><div style="max-height:420px;overflow:auto"><table class="hist-table"><thead><tr><th>Hora NY</th><th>Ticker</th><th>Lado</th><th>Acciones</th><th>Entrada</th><th>Salida</th><th>P/L incluido</th><th>Motivo / exclusión</th></tr></thead><tbody>${closes||'<tr><td colspan="8">Sin cierres</td></tr>'}</tbody></table></div></details>`;
+}
+
+setInterval(()=>{if(!document.hidden && el('page-dashboard')?.classList.contains('active') && el('pnlBreakdownPanel')?.open) fetchPnlBreakdown();},10000);
 setInterval(fetchStatus,  4000);
 setInterval(fetchSignals, 5000);
 setInterval(fetchAIStatus, 10000);

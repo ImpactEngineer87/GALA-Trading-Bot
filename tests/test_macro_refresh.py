@@ -35,7 +35,8 @@ class MacroRefreshTests(unittest.TestCase):
         self.assertTrue(entered.wait(2));self.assertFalse(finished.is_set())
         self.assertEqual(result.tf('1m').iloc[-1]['close'],2.)
         self.bot.schwab.obtener_multitemporal.assert_not_called()
-        self.bot.schwab.obtener_1m_reciente.assert_called_once_with('TSLA')
+        self.bot.schwab.obtener_1m_reciente.assert_called_once_with('TSLA',
+            since=self.data.tf('1m').index[-1]-pd.Timedelta(minutes=10))
         self.assertFalse(refresher.request('TSLA'))
 
     def test_old_background_micro_cannot_replace_fresher_main_thread_prices(self):
@@ -74,7 +75,8 @@ class MacroRefreshTests(unittest.TestCase):
         self.assertEqual(self.bot._mtf_cache['TSLA'][0],1399)
         self.assertEqual(result.tf('1m').iloc[-1]['close'],2.)
         self.bot._macro_refresh.result.assert_called_once_with('TSLA')
-        self.bot.schwab.obtener_1m_reciente.assert_called_once_with('TSLA')
+        self.bot.schwab.obtener_1m_reciente.assert_called_once_with('TSLA',
+            since=self.data.tf('1m').index[-1]-pd.Timedelta(minutes=10))
         self.bot.schwab.obtener_multitemporal.assert_not_called()
 
     def test_expiry_and_background_share_one_fetch(self):

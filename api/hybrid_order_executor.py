@@ -710,7 +710,7 @@ class EjecutorHibridoDeOrdenes:
         return result
 
     def _submitted_limit_price(
-        self, orden: OrdenTradingCalculada, tipo_orden: str
+        self, orden: OrdenTradingCalculada, tipo_orden: str, *, quote=None, reactive_entry=False
     ) -> Optional[float]:
         """Return the actual LIMIT sent to Schwab, including the buffer cap."""
 
@@ -727,6 +727,31 @@ class EjecutorHibridoDeOrdenes:
             ) or 0.0)
             if not math.isfinite(tolerance) or not (0.0 <= tolerance <= 0.10):
                 raise ValueError("entry_limit_tolerance_usd must be 0.00–0.10")
+            # Preserve reactive entry intent when forcing broker orders to LIMIT.
+            # A fresh executable quote is bounded by the existing slippage cap.
+            if (reactive_entry and quote and float(self.max_slippage_pct) > 0
+                    and ('entry_limit_tolerance_usd' not in self.execution_v2_config or tolerance > 0)):
+                from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+                bid, ask = float(quote.get('bid', 0)), float(quote.get('ask', 0))
+                slippage = float(self.max_slippage_pct)
+                if (not all(math.isfinite(v) for v in (price, bid, ask, slippage))
+                        or not 0 < bid <= ask or price <= 0):
+                    raise ValueError('Invalid reactive LIMIT quote or slippage')
+                buy = orden.tipo == 'BUY'
+                rate = Decimal(str(slippage)) / 100
+                cap = (Decimal(str(price)) * (1 + rate if buy else 1 - rate)).quantize(
+                    Decimal('.01'), rounding=ROUND_FLOOR if buy else ROUND_CEILING)
+                if tolerance > 0:
+                    dollar_cap = (Decimal(str(price)) + (Decimal(str(tolerance)) if buy
+                        else -Decimal(str(tolerance)))).quantize(Decimal('.01'),
+                        rounding=ROUND_FLOOR if buy else ROUND_CEILING)
+                    cap = min(cap, dollar_cap) if buy else max(cap, dollar_cap)
+                target = Decimal(str(ask if buy else bid)).quantize(
+                    Decimal('.01'), rounding=ROUND_CEILING if buy else ROUND_FLOOR)
+                limit = min(target, cap) if buy else max(target, cap)
+                if limit <= 0:
+                    raise ValueError('Invalid reactive LIMIT price')
+                return float(limit)
             if tolerance > 0:
                 price = price + tolerance if orden.tipo == "BUY" else price - tolerance
             if not math.isfinite(price) or price <= 0:
@@ -744,7 +769,7 @@ class EjecutorHibridoDeOrdenes:
 
     def _enviar_orden_real(self, orden: OrdenTradingCalculada,
                             tipo_orden: str, account_number: str,
-                            motivo: str) -> dict:
+                            motivo: str, *, reactive_entry=False) -> dict:
         """
         Envía SOLO la orden de ENTRADA a Schwab API (SINGLE, sin protección
         adjunta). La protección 70/30 (TP1 + SL) la coloca por separado
@@ -780,7 +805,14 @@ class EjecutorHibridoDeOrdenes:
 
         # LIMIT includes its price. Reactive MARKET intent is converted to a
         # marketable LIMIT with a hard buffer whenever max_slippage_pct > 0.
-        submitted_limit = self._submitted_limit_price(orden, tipo_orden)
+        submitted_limit = self._submitted_limit_price(
+            orden, tipo_orden, quote=quote, reactive_entry=reactive_entry)
+        quote_priced = bool(reactive_entry and quote and float(self.max_slippage_pct) > 0
+            and ('entry_limit_tolerance_usd' not in self.execution_v2_config
+                 or float(self.execution_v2_config.get('entry_limit_tolerance_usd') or 0) > 0))
+        if self.execution_v2_config.get('enabled', False):
+            motivo = motivo.replace('MARKET (marketable limit)',
+                'LIMIT con cotización actual y tope vigente' if quote_priced else 'LIMIT de referencia de señal')
         submitted_type = "MARKET"
         if submitted_limit is not None:
             cuerpo["orderType"] = "LIMIT"
@@ -814,6 +846,10 @@ class EjecutorHibridoDeOrdenes:
                     "submitted_limit_price": submitted_limit,
                     "requested_price": submitted_limit,
                     "bid": quote.get('bid'), "ask": quote.get('ask'),
+                    "entry_price_policy": ('FRESH_QUOTE_LIMIT_WITH_EXISTING_SLIPPAGE_CAP'
+                        if quote_priced
+                        else 'SIGNAL_REFERENCE_LIMIT'),
+                    "max_slippage_pct": self.max_slippage_pct,
                 },
             )
             # ID vacío = la orden pudo enviarse pero no podemos rastrearla: estado a reconciliar
@@ -961,7 +997,8 @@ class EjecutorHibridoDeOrdenes:
         if self.paper_trading:
             res = self._simular_hibrido(orden_ajustada, tipo_orden, motivo)
         else:
-            res = self._enviar_orden_real(orden_ajustada, tipo_orden, account_number, motivo)
+            res = self._enviar_orden_real(orden_ajustada, tipo_orden, account_number, motivo,
+                reactive_entry=bool(getattr(contexto, 'es_entrada_mercado', False)))
         res["orden_ajustada"] = orden_ajustada
         res["tipo_orden"] = tipo_orden
         res["signal_price"] = orden.precio_limite

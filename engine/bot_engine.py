@@ -392,6 +392,7 @@ class ChocoletraBot:
         self._posiciones: Dict[str, dict] = {}
         # Caché multi-temporal: ticker -> (epoch, DatosMultiTemporal)
         self._mtf_cache: Dict[str, tuple] = {}
+        self._full_micro_refresh_at: Dict[str, float] = {}
         self._ultima_vela_procesada: Dict[str, object] = {}
         self._gala10_contexto: Dict[str, dict] = {}
         # Exact closed 1m bar that originated the latest GALA10 signal.
@@ -1675,6 +1676,8 @@ class ChocoletraBot:
 
     def _procesar_ticker(self, ticker: str):
         """Pipeline completo para un ticker (se ejecuta en un hilo)."""
+        if not getattr(self, '_activo', True):
+            return
         pipeline_started = time.monotonic()
         paper_ticker = self._is_paper_ticker(ticker)
         # 1) Datos multi-temporal (con caché)
@@ -1682,6 +1685,8 @@ class ChocoletraBot:
             datos = self._obtener_mtf(ticker)
         except Exception:
             self._quarantine_real_ticker(ticker, 'Market data request failed')
+            return
+        if not getattr(self, '_activo', True):
             return
         data_elapsed_ms = (time.monotonic() - pipeline_started) * 1000
         datos_confirmados = self._datos_micro_confirmados(datos)
@@ -2736,13 +2741,25 @@ class ChocoletraBot:
             datos = ent[1]
             if (ahora - ent[2]) >= self._mtf_ttl:
                 m1 = None
+                previous = datos.velas.get('1m')
+                full_times = getattr(self, '_full_micro_refresh_at', None)
+                if full_times is None:
+                    full_times = self._full_micro_refresh_at = {}
+                full_due = (ahora - full_times.get(ticker, ent[0])) >= self._mtf_ttl_macro
+                incremental = previous is not None and len(previous) > 40 and not full_due
                 try:
-                    m1 = self.schwab.obtener_1m_reciente(ticker)
+                    if incremental:
+                        # Retain full warmup locally; re-read ten minutes of
+                        # overlap plus any gap. Periodic full reads below also
+                        # pick up older broker corrections.
+                        since = pd.Timestamp(previous.index[-1]) - pd.Timedelta(minutes=10)
+                        m1 = self.schwab.obtener_1m_reciente(ticker, since=since)
+                    else:
+                        m1 = self.schwab.obtener_1m_reciente(ticker)
                 except Exception as e:
                     self._emit_log("WARN", f"[{ticker}] Error refrescando el precio 1m: {e}")
-                if m1 is not None and len(m1) > 40:
+                if m1 is not None and len(m1) and (incremental or len(m1) > 40):
                     from api.schwab_client import SchwabClient
-                    previous = datos.velas.get('1m')
                     if previous is not None and len(previous):
                         m1 = pd.concat([previous, m1])
                         m1 = m1[~m1.index.duplicated(keep='last')].sort_index()
@@ -2752,6 +2769,8 @@ class ChocoletraBot:
                         datos.velas["5m"] = m5
                     # Solo marcar el micro como FRESCO si el 1m se actualizó de verdad.
                     self._mtf_cache[ticker] = (ent[0], datos, ahora)
+                    if not incremental:
+                        full_times[ticker] = ahora
                 else:
                     # Fetch falló o vino corto: NO se toca t_micro, así el próximo ciclo
                     # REINTENTA (no se congela el precio en silencio) y se avisa. La
@@ -2764,6 +2783,9 @@ class ChocoletraBot:
             combined = pd.concat([ent[1].velas['1m'], datos.velas['1m']])
             datos.velas['1m'] = combined[~combined.index.duplicated(keep='last')].sort_index()
         self._mtf_cache[ticker] = (time.time(), datos, time.time())
+        if not hasattr(self, '_full_micro_refresh_at'):
+            self._full_micro_refresh_at = {}
+        self._full_micro_refresh_at[ticker] = time.time()
         return datos
 
     # ==========================================================

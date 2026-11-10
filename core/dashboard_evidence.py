@@ -137,8 +137,15 @@ def annotate_history(history_rows, audit_rows=()):
         row["performance_exclusion_reason"] = reason
         exclusion = paper_quarantine.get(_identity(row))
         row['performance_intentionally_excluded'] = bool(
-            mode == 'PAPER' and is_close and pnl is not None and exclusion
-            and exclusion[1] and reason == exclusion[0])
+            is_close and pnl is not None and (
+                (mode == 'PAPER' and exclusion and exclusion[1] and reason == exclusion[0])
+                or (mode == 'REAL' and manual_exit and not risk_reason
+                    and reason == 'Cierre manual verificado; excluido del rendimiento GALA')
+            ))
+        row['performance_exclusion_kind'] = (
+            'MAINTENANCE' if row['performance_intentionally_excluded'] and mode == 'PAPER' else
+            'VERIFIED_MANUAL_EXIT' if row['performance_intentionally_excluded'] else
+            'UNVERIFIED' if reason else 'NONE')
         row["pnl_source"] = (
             "MANUAL_BROKER_FILL_GROSS" if manual_exit and row["accounting_verified"] else
             "UNVERIFIED" if reason else

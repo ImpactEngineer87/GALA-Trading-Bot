@@ -1,7 +1,17 @@
 """Read-only signal attribution. An AI score is never broker fill evidence."""
 from collections import defaultdict
+from datetime import datetime, timezone
+import json
 import re
-from core.dashboard_evidence import session_date
+from core.dashboard_evidence import session_date, number
+
+
+def _stamp(value):
+    try:
+        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        return dt.astimezone(timezone.utc) if dt.tzinfo is not None else None
+    except (ValueError, TypeError):
+        return None
 
 
 def _key(row, *, signal=False):
@@ -110,6 +120,29 @@ def annotate_signals(signals, audit_rows=(), *, audit_available=True):
             'source': 'LOCAL_ORDER_AUDIT', 'is_live_broker_query': False,
             'is_price_or_quantity_verification': False,
         }
+        evidence = row['execution_evidence']
+        analyzed = _stamp(row.get('timestamp_iso'))
+        bar = number(row.get('signal_bar_epoch_ms'))
+        if analyzed and bar is not None and 0 < bar < 4e12:
+            closed = datetime.fromtimestamp(bar/1000+60, tz=timezone.utc)
+            evidence.update(source_bar_closed_at_utc=closed.isoformat(),
+                analysis_recorded_at_utc=analyzed.isoformat(),
+                analysis_delay_seconds=round((analyzed-closed).total_seconds(), 3))
+        submitted = named.get('ENTRY_SUBMITTED') or {}
+        at = _stamp(submitted.get('timestamp_utc'))
+        if at:
+            evidence['submitted_at_utc'] = at.isoformat()
+            if analyzed and at >= analyzed:
+                evidence['submission_delay_seconds'] = round((at-analyzed).total_seconds(), 3)
+            try:
+                detail = json.loads(submitted.get('detalle') or '{}')
+            except (ValueError, TypeError):
+                detail = {}
+            if not isinstance(detail, dict):
+                detail = {}
+            evidence['submitted_limit_price'] = number(detail.get('submitted_limit_price') or submitted.get('precio'))
+            evidence['bid_at_submission'] = number(detail.get('bid'))
+            evidence['ask_at_submission'] = number(detail.get('ask'))
         row['signal_price_source'] = 'STRATEGY_SIGNAL_REFERENCE'
         output.append(row)
     return output

@@ -54,7 +54,8 @@ vm.runInContext(html.slice(a,b),context);
   assert.match(elements.tickerPerfSummary.textContent,/REAL cierres con fills \(bruto\) N\/D/);
   assert.match(elements.tickerPerformanceGrid.innerHTML,/Simulación PAPER/);
   assert.match(elements.tickerPerformanceGrid.innerHTML,/no P\/L Schwab/);
-  assert.match(elements.tickerPerformanceGrid.innerHTML,/Sin verificar \/ excluidos <b>1/);
+  assert.match(elements.tickerPerformanceGrid.innerHTML,/Sin verificar <b>1/);
+  assert.match(elements.tickerPerformanceGrid.innerHTML,/fuera del rendimiento <b>0/);
   context.renderPositions('positions',[{ticker:'META',mode:'REAL',status:'OPEN',
     entry_price:null,last_price:0,floating_pnl:null,valuation_available:false,
     initial_quantity:5,remaining_quantity:5}],false);

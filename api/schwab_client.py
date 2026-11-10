@@ -794,12 +794,21 @@ class SchwabClient:
         tope_dias = {"30m": 60, "15m": 40, "5m": 20, "1m": 10}.get(intervalo, 10)
         return self._fetch_minutos_chunked(ticker, freq, min(dias, tope_dias))
 
-    def obtener_1m_reciente(self, ticker: str, dias: int = 2) -> Optional[pd.DataFrame]:
+    def obtener_1m_reciente(self, ticker: str, dias: int = 2, *, since=None) -> Optional[pd.DataFrame]:
         """Fetch LIGERO de solo las últimas velas de 1m (últimos 'dias' días). Se usa
         para refrescar el precio y la señal en cada ciclo, sin re-descargar todas las
         temporalidades: mantiene el precio al día como la pantalla del bróker
         (ThinkOrSwim) y no satura la API cuando hay muchos tickers."""
-        return self._fetch_minutos_chunked(ticker, 1, dias)
+        if since is None:
+            return self._fetch_minutos_chunked(ticker, 1, dias)
+        end = int(datetime.now(timezone.utc).timestamp() * 1000)
+        start = int(pd.Timestamp(since).timestamp() * 1000)
+        start = max(end - int(dias * 86400000), min(start, end - 60000))
+        return self._pedir_pricehistory({
+            'symbol': ticker, 'periodType': 'day', 'frequencyType': 'minute',
+            'frequency': 1, 'startDate': start, 'endDate': end,
+            'needExtendedHoursData': self.include_extended_hours_data,
+        })
 
     def obtener_multitemporal(self, ticker: str, config: Optional[dict] = None):
         """

@@ -8,6 +8,7 @@ from core.dashboard_evidence import mode_of, number, session_date as row_date
 def _bucket():
     return dict(closed_trades=0, wins=0, losses=0, realized_pnl=0.0,
                 unrealized_pnl=0.0, open_positions=0, excluded_closed_trades=0,
+                intentionally_excluded_closed_trades=0, unverified_closed_trades=0,
                 unknown_open_pnl=0)
 
 
@@ -51,6 +52,10 @@ def build_ticker_performance(tickers, *, signal_rows=(), history_rows=(),
         valid = row.get("performance_verified", mode == "PAPER") is True
         if not valid or pnl is None:
             s["excluded_closed_trades"] += 1
+            if pnl is not None and row.get('performance_intentionally_excluded') is True:
+                s['intentionally_excluded_closed_trades'] += 1
+            else:
+                s['unverified_closed_trades'] += 1
             continue
         s["closed_trades"] += 1
         s["realized_pnl"] += pnl
@@ -79,9 +84,11 @@ def build_ticker_performance(tickers, *, signal_rows=(), history_rows=(),
         breakdown = {}
         for mode in ("PAPER", "REAL", "UNKNOWN"):
             s = dict(stats[t, mode])
+            s['recorded_realized_pnl_sum'] = s['realized_pnl']
+            s['recorded_unrealized_pnl_sum'] = s['unrealized_pnl']
             s["known_realized_pnl"] = round(s["realized_pnl"], 2)
             s["known_unrealized_pnl"] = round(s["unrealized_pnl"], 2)
-            s["realized_pnl"] = None if s["excluded_closed_trades"] else s["known_realized_pnl"]
+            s["realized_pnl"] = None if s["unverified_closed_trades"] else s["known_realized_pnl"]
             s["unrealized_pnl"] = None if s["unknown_open_pnl"] else s["known_unrealized_pnl"]
             s["total_pnl"] = (
                 round(s["realized_pnl"] + s["unrealized_pnl"], 2)
@@ -104,5 +111,26 @@ def build_ticker_performance(tickers, *, signal_rows=(), history_rows=(),
             ticker=t, mode=mode, configured_shares=shares.get(t, 1),
             **signals[t], **breakdown[mode], mode_breakdown=breakdown,
         ))
+    return result
+
+
+def summarize_modes(rows):
+    """Do not let inactive REAL buckets invalidate unrelated verified closes."""
+    result = {}
+    for mode in ('PAPER', 'REAL', 'UNKNOWN'):
+        buckets = [r['mode_breakdown'][mode] for r in rows]
+        closed = sum(r['closed_trades'] for r in buckets)
+        opened = sum(r['open_positions'] for r in buckets)
+        excluded = sum(r['excluded_closed_trades'] for r in buckets)
+        unknown = sum(r['unverified_closed_trades'] for r in buckets)
+        unknown_open = sum(r['unknown_open_pnl'] for r in buckets)
+        realized = None if unknown else round(sum(r['recorded_realized_pnl_sum'] for r in buckets), 2)
+        floating = None if unknown_open else round(sum(r['recorded_unrealized_pnl_sum'] for r in buckets), 2)
+        if mode == 'REAL' and not (closed or opened or excluded):
+            realized = floating = None
+        result[mode] = dict(closed_trades=closed, excluded_closed_trades=excluded,
+            intentionally_excluded_closed_trades=sum(r['intentionally_excluded_closed_trades'] for r in buckets),
+            unverified_closed_trades=unknown, realized_pnl=realized, unrealized_pnl=floating,
+            total_pnl=round(realized+floating, 2) if realized is not None and floating is not None else None)
     return result
 

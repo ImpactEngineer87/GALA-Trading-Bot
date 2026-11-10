@@ -26,6 +26,19 @@ def event(kind, **change):
 
 
 class ExecutionVisibilityTests(unittest.TestCase):
+    def test_source_candle_analysis_and_submission_times_are_separate(self):
+        row=signal();row.update(timestamp_iso='2026-11-10T10:03:46-05:00',
+            signal_bar_epoch_ms=1794322800000,date='2026-11-10')
+        submitted=event('ENTRY_SUBMITTED',fecha='2026-11-10',order_id='private',
+            timestamp_utc='2026-11-10T15:03:48.500Z',precio='172.40',
+            detalle=json.dumps({'submitted_limit_price':172.40,'bid':172.07,'ask':172.40}))
+        result=annotate_signals([row],[submitted])[0]['execution_evidence']
+        self.assertEqual(result['source_bar_closed_at_utc'],'2026-11-10T15:01:00+00:00')
+        self.assertEqual(result['analysis_delay_seconds'],166)
+        self.assertEqual(result['submission_delay_seconds'],2.5)
+        self.assertEqual(result['submitted_limit_price'],172.4)
+        self.assertNotIn('private',json.dumps(result))
+
     def state(self, rows, value=None):
         return annotate_signals([value or signal()], rows)[0]['execution_evidence']
 
@@ -185,6 +198,30 @@ c.updateBotUI(false,{state:'FAILED'});assert.equal(elements.botStatus.textConten
         result = subprocess.run([shutil.which('node'), '-e', js, str(dashboard)],
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is required for dashboard checks')
+    def test_pnl_panel_labels_simulation_and_clears_stale_data_on_failure(self):
+        dashboard = Path(__file__).resolve().parents[1]/'dashboard/index.html'
+        js = r"""
+const fs=require('fs'),vm=require('vm'),assert=require('assert'),h=fs.readFileSync(process.argv[1],'utf8');
+const elements={},el=id=>elements[id]??={value:'PAPER'},c=vm.createContext({S:{},el,
+ escHtml:v=>String(v??'').replaceAll('<','&lt;'),api:async()=>({ok:false,json:async()=>({status:'unavailable'})})});
+let a=h.indexOf('function financialNumber('),b=h.indexOf('function renderPositions(',a);vm.runInContext(h.slice(a,b),c);
+a=h.indexOf('async function fetchPnlBreakdown(');b=h.indexOf('\nsetInterval(',a);vm.runInContext(h.slice(a,b),c);
+c.S.pnlBreakdown={date_ny:'2026-11-10',as_of_utc:'2026-11-10T19:00Z',note:'PAPER es simulación; no es P/L de cuenta Schwab',modes:{PAPER:{
+ closed_pnl:-397.05,open_pnl:25.09,total_pnl:-371.96,closed_count:1,open_count:1,maintenance_excluded_count:8,
+ unverified_closed_count:0,tickers:[],closes:[]},REAL:{closed_pnl:20.01,open_pnl:null,total_pnl:null,
+ verified_manual_closed_count:4,verified_manual_closed_pnl:-11.26,tickers:[],closes:[]}}};
+c.renderPnlBreakdown();assert.match(el('pnlBreakdownContent').innerHTML,/SIMULACIÓN PAPER/);
+assert.match(el('pnlBreakdownContent').innerHTML,/371.96/);assert.match(el('pnlBreakdownContent').innerHTML,/397.05/);
+el('pnlBreakdownMode').value='REAL';c.renderPnlBreakdown();assert.match(el('pnlBreakdownContent').innerHTML,/11.26/);
+assert.match(el('pnlBreakdownContent').innerHTML,/REAL GALA/);
+(async()=>{await c.fetchPnlBreakdown();assert.equal(c.S.pnlBreakdown,null);
+ assert.match(el('pnlBreakdownContent').textContent,/no verificable/);assert.equal(c.S.pnlBreakdownBusy,false);
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+        result = subprocess.run([shutil.which('node'), '-e', js, str(dashboard)],capture_output=True,text=True,timeout=15)
+        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
 
     @unittest.skipUnless(shutil.which('node'), 'Node.js is required for dashboard checks')
     def test_signal_polling_has_backpressure_and_downloads_history_only_when_visible(self):

@@ -3826,7 +3826,7 @@ def get_ticker_performance():
     POSITION_CLOSE rows; unrealized PnL comes from the engine's active-position
     snapshot, so the table never infers an open position from old history.
     """
-    from core.ticker_performance import build_ticker_performance
+    from core.ticker_performance import build_ticker_performance, summarize_modes
 
     cfg = _read_config_runtime()
     selected_date = str(
@@ -3865,22 +3865,24 @@ def get_ticker_performance():
         "rows": rows,
         "summary": {
             "signals": sum(int(row.get("signals", 0)) for row in rows),
-            "by_mode": {
-                mode: {
-                    "closed_trades": sum(row["mode_breakdown"][mode]["closed_trades"] for row in rows),
-                    "excluded_closed_trades": sum(row["mode_breakdown"][mode]["excluded_closed_trades"] for row in rows),
-                    **{
-                        field: (
-                            round(sum(row["mode_breakdown"][mode][field] for row in rows), 2)
-                            if all(row["mode_breakdown"][mode][field] is not None for row in rows)
-                            else None
-                        ) for field in ("realized_pnl", "unrealized_pnl", "total_pnl")
-                    },
-                } for mode in ("PAPER", "REAL", "UNKNOWN")
-            },
+            "by_mode": summarize_modes(rows),
             "is_broker_reported": False,
         },
     })
+
+
+@app.route('/api/pnl-breakdown')
+def get_pnl_breakdown():
+    """Session P/L components and contributing closes, without broker mutations."""
+    from core.pnl_breakdown import build_pnl_breakdown
+    try:
+        rows = _dashboard_history_rows(newest_first=False)
+        positions = _engine_positions_snapshot()
+        day = _ahora_ny_datetime().strftime('%Y-%m-%d')
+        result = build_pnl_breakdown(rows, positions, day)
+    except Exception:
+        return jsonify(status='unavailable', message='Desglose no verificable; no se infieren importes'), 503
+    return jsonify(status='ok', **result)
 
 
 @app.route('/api/ticker-analysis')
