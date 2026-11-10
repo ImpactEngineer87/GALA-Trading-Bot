@@ -100,9 +100,18 @@ Live observations through **10:53 New York**:
 
 The refresh observation shows the shorter cycles continuing beyond the initial
 cache-expiry window. These samples do not establish a guaranteed latency or a
-limit-order fill time. REAL order submission/fill after the upgrade is a separate
-verification item; no artificial REAL test order was placed. The maintenance
-audit contains no REAL entry, exit, protective-order submission, or close event.
+limit-order fill time.
+
+An ordinary **BA REAL** signal at **10:54:02** produced an entry submission at
+**10:54:04.529**: **2.529 seconds after the recorded signal**, approximately
+4.5 seconds after candle close. The broker acknowledged the limit order as
+`WORKING` at 10:54:05.059. It remained unfilled and was confirmed `CANCELED` at
+10:54:28.451 through the existing timeout policy. This verifies submission;
+it is not a confirmed fill. Entry pricing/repricing policy was not changed by
+this latency release.
+
+No artificial REAL test order was placed. The maintenance audit contains no REAL
+entry, exit, protective-order submission, or close event.
 
 Private VPS evidence: `data/latency-review-20261110-kdji1qcf/`; offline source and
 regression logs: `/tmp/gala-latency-3324-ymvp2k9t/`. Credentials and broker identities
