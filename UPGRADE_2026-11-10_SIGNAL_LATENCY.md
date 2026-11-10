@@ -73,9 +73,36 @@ elsewhere. A separate earlier META entry was submitted at 09:34:17 after its
 
 ## Rollout status
 
-Prepared for a controlled restart after open REAL positions close normally.
-The latency improvement requires loading the new source into the running process.
-Post-deployment end-to-end timings and live fills remain to be measured.
+Deployed source revision `0155821` to the VPS at **10:44 New York**, after the REAL
+position closed normally and Schwab verified zero positions and pending orders.
+The engine resumed through the authenticated dashboard control with the existing
+seven REAL selections: AAPL, BA, META, NVDA, TSLA, NKE, PYPL. Runtime checks show
+the engine thread alive, with no global accounting hold or daily-loss latch.
+
+Eight PAPER positions closed through the normal Stop procedure. Their exact
+position/execution identities were marked as controlled maintenance, excluded
+from training and performance using append-only evidence. After that maintenance,
+**all 63 protected files were byte-identical across the source deployment and web
+restart**, including models, thresholds, routing, guards, and ledgers.
+
+Live observations through **10:53 New York**:
+
+- Startup history loading: **68.574 seconds** for 17 tickers.
+- First warm cycle: **6.383 seconds** for all 17 tickers.
+- Six warm cycles, spanning the initial five-minute historical-cache period:
+  **6.383, 13.804, 8.207, 12.545, 15.554, 7.510 seconds**. The latest cycle
+  analyzed META **3 seconds** after candle close; its 17-ticker median delay was
+  **4 seconds**, maximum **7 seconds**.
+- That warm cycle's analysis delay after candle close: median **3 seconds**,
+  maximum **6 seconds**; META **2 seconds** (649 ms within its analysis pipeline).
+- Live loopback API sample: status **76 ms**, trades **60 ms**, recent signals
+  **187 ms**. These are individual samples, not latency guarantees.
+
+The refresh observation shows the shorter cycles continuing beyond the initial
+cache-expiry window. These samples do not establish a guaranteed latency or a
+limit-order fill time. REAL order submission/fill after the upgrade is a separate
+verification item; no artificial REAL test order was placed. The maintenance
+audit contains no REAL entry, exit, protective-order submission, or close event.
 
 Private VPS evidence: `data/latency-review-20261110-kdji1qcf/`; offline source and
 regression logs: `/tmp/gala-latency-3324-ymvp2k9t/`. Credentials and broker identities
