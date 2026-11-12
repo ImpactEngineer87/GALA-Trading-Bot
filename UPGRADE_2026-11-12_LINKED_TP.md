@@ -4,23 +4,25 @@
 
 The upgrade is implemented, tested, and published on GitHub `master`.
 The source changes are in commits `c595aef` and `4ba34fa`; the latter passed the
-final Linux regression run. VPS deployment is pending SSH access.
+final Linux regression run. The tested release is pinned at `dc21c1b` (its
+additional change is documentation).
 
-On November 12 this workspace can establish TCP to `204.168.175.19:22`,
-but SSH times out waiting for the server identification banner, before
-authentication. The dashboard also times out from this workspace. The user
-reports that the dashboard opens from their connection. This does not establish
-whether the cause is a provider firewall, fail2ban, routing, or the SSH service.
-This workspace's public IP was `172.111.36.128` when checked.
+SSH access was restored at approximately **10:26 New York on November 12**.
+Earlier attempts timed out before authentication; their network cause has not
+been established. Live source remains `cd12c70`, version **3.3.25**. The engine
+is actively trading, so the running source and exit configuration have not yet
+been changed.
 
-No VPS files, configuration, orders, or engine state have been changed for this
-upgrade. November 11 live order receipts and current broker exposure have not
-been inspected. The diagnosis below comes from repository code and the last
-verified deployment, rather than a fresh inspection of yesterday's orders.
+The VPS has an isolated 3.3.26 checkout, verified tests, private incident
+evidence, and a guarded one-time deployment scheduled for **November 12 at
+15:50 New York (20:50 UTC)**. Deployment proceeds only after the engine has
+already stopped and strict broker-flat checks succeed. It never invokes the
+engine Stop or Start action. This is a scheduled attempt, not a completed
+deployment.
 
 ## Why REAL sold the whole position
 
-The last verified VPS configuration used
+The live VPS configuration inspected on November 12 uses
 `live_trading.real_exit_policy: FULL_POSITION`. In
 `core/exit_policy.py:15`, `effective_partial_enabled()` explicitly disables
 partials for REAL under that policy. PAPER retains its configured partial plan.
@@ -34,6 +36,26 @@ three-share STOP plus a two-share TP1 caused an exit rejection. Simply enabling
 the old unlinked plan would reintroduce that conflict.
 
 This is execution policy, not an AI decision to sell all shares.
+
+### Live evidence from November 11
+
+- The history records **41 REAL closes**, including **8 labelled `TP final`**.
+- All eight final-target closes match exact Schwab order IDs: the broker
+  reports filled **LIMIT** orders for the full recorded position quantity.
+  Examples are NVDA 5 shares at 10:38:10 NY, META 3 shares at 13:05:11 NY,
+  and PYPL 3 shares at 13:31:31 NY.
+- The REAL audit contains **zero TP1 events** for that session.
+- At 10:28 NY on November 12, Schwab and GALA agreed on an NVDA long of 5
+  shares and a PYPL short of 3 shares; each local plan had a planned partial
+  quantity of zero. REAL entries and the daily risk gate were not blocked at
+  that snapshot. Subsequent reads showed those trades close and another ticker
+  open; these are time-specific observations.
+- The broker returned 117 orders for the November 11 session and 375 in the
+  broader 59-day verification window at review time. Neither response reached
+  the 500-order truncation guard.
+
+Private evidence is retained under
+`/opt/gala/backups/upgrade-3.3.26-review-s1e3diy3/`, with restricted permissions.
 
 ## What changes
 
@@ -97,8 +119,13 @@ claimed by this release. Deployment and rollback require a broker-flat window.
   pipeline failure propagation in CI. All **714 Linux regression tests passed**:
   [final GitHub run](https://github.com/ImpactEngineer87/GALA-Trading-Bot/actions/runs/43240474202),
   source `4ba34fa4c43affa59174bd515bf6d4c27da9359f`.
+- All **714 tests also passed on the VPS**, in the isolated checkout
+  `/tmp/gala-3326-tests-1vsu3la2/`, running as `gala` with external networking
+  disabled. The active application was not restarted for this verification.
 - A full Windows run exposed existing POSIX-only locking/mode tests and a
   Windows file-replacement fixture limitation. Linux is the production gate.
+- The deployment readiness check correctly refused with `ENGINE_STILL_RUNNING`
+  before any source, configuration, or service changes.
 - No artificial REAL test order has been placed. Live Schwab acceptance of the
   two-allocation plan remains to be verified after deployment.
 
@@ -110,20 +137,34 @@ zero positions and zero pending orders. It creates a private backup and proves
 that the only parsed configuration change is
 `live_trading.real_exit_policy: LINKED_70_30`.
 
-Wait for REAL positions to close normally before maintenance; do not use Stop
-to force-close positions for deployment. Verify current live configuration and
-yesterday's receipts when access returns, back up protected state, deploy the
-tested source, run the guarded migration, and verify the service/version and
-preservation of models, history, routing, risk limits, and quantities. Do not
-start the engine or submit test orders as a deployment check.
+Wait for the engine to stop normally and for REAL positions and pending orders
+to clear before maintenance. Back up protected state, deploy the tested source,
+run the guarded migration, and verify the service/version and preservation of
+models, history, routing, risk limits, and quantities. Do not start the engine
+or submit test orders as a deployment check.
 
 Rollback likewise requires a broker-flat window and restoration of the source
 and its matching previous exit policy. Do not downgrade over live native exits.
 
-### Restoring maintenance access
+### Scheduled maintenance
 
-Use the VPS provider console to check the SSH service, provider firewall, host
-firewall, and fail2ban for source IP `172.111.36.128`. The SSH target is already
-confirmed as `root@204.168.175.19`; resending credentials cannot resolve a timeout
-that occurs before authentication. A firewall block has not been established
-as the cause.
+- Timer: `gala-upgrade-3326.timer`, verified active, next run
+  `2026-11-12 20:50:00 UTC`.
+- Service: `gala-upgrade-3326.service`.
+- Private deployment helper: incident folder's `deploy_when_stopped.py`.
+- Helper SHA-256:
+  `f01749418074e6782ca6698e985bd9f9131b407a68685f5124fe66119718e598`.
+- A changed source baseline, dirty source, running engine, local positions,
+  unknown broker state, non-flat broker account, truncated order response, or
+  changed exit-policy baseline prevents deployment.
+- The helper checks again immediately before stopping the web service. It
+  backs up source/configuration/runtime state, applies only the exit-policy
+  configuration change, restarts the web service, and checks version, stopped
+  engine, protected hashes, routing, risk state, and fresh broker-flat evidence.
+- The helper does not stop/start the trading engine, place/cancel broker
+  orders, or force-close positions. Normal existing session-end behavior
+  remains responsible for ending trading.
+- Successful completion writes
+  `data/upgrade_verification_20261112_3326.json`. Failure writes a private
+  `deployment_pending.json`; a scheduled timer alone does not prove success.
+- To cancel the pending attempt: `systemctl disable --now gala-upgrade-3326.timer`.
