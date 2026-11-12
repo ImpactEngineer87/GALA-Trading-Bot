@@ -2,8 +2,9 @@
 
 ## Status
 
-The upgrade is implemented and published on the candidate branch
-`upgrade/native-tp-3.3.26`. VPS deployment is pending SSH access.
+The upgrade is implemented, tested, and published on GitHub `master`.
+The source changes are in commits `c595aef` and `4ba34fa`; the latter passed the
+final Linux regression run. VPS deployment is pending SSH access.
 
 On November 12 this workspace can establish TCP to `204.168.175.19:22`,
 but SSH times out waiting for the server identification banner, before
@@ -93,13 +94,13 @@ claimed by this release. Deployment and rollback require a broker-flat window.
 - The initial candidate passed all **710 Linux regression tests**, with external
   networking disabled: [GitHub run](https://github.com/ImpactEngineer87/GALA-Trading-Bot/actions/runs/43239038921).
 - The final candidate adds four exposure-race tests and explicitly uses Bash
-  pipeline failure propagation in CI. Its final Linux result is recorded below.
+  pipeline failure propagation in CI. All **714 Linux regression tests passed**:
+  [final GitHub run](https://github.com/ImpactEngineer87/GALA-Trading-Bot/actions/runs/43240474202),
+  source `4ba34fa4c43affa59174bd515bf6d4c27da9359f`.
 - A full Windows run exposed existing POSIX-only locking/mode tests and a
   Windows file-replacement fixture limitation. Linux is the production gate.
 - No artificial REAL test order has been placed. Live Schwab acceptance of the
   two-allocation plan remains to be verified after deployment.
-
-Final Linux verification: pending candidate push.
 
 ## Deployment
 
@@ -118,3 +119,11 @@ start the engine or submit test orders as a deployment check.
 
 Rollback likewise requires a broker-flat window and restoration of the source
 and its matching previous exit policy. Do not downgrade over live native exits.
+
+### Restoring maintenance access
+
+Use the VPS provider console to check the SSH service, provider firewall, host
+firewall, and fail2ban for source IP `172.111.36.128`. The SSH target is already
+confirmed as `root@204.168.175.19`; resending credentials cannot resolve a timeout
+that occurs before authentication. A firewall block has not been established
+as the cause.
