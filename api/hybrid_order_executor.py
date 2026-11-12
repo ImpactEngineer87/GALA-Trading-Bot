@@ -343,6 +343,8 @@ class EjecutorHibridoDeOrdenes:
 
         # --- Configuración de persecución activa (chase) ---
         cfg = config or {}
+        self.native_exit_path = (cfg.get('execution_engine') or {}).get(
+            'native_exit_path', 'data/native_exit_plans')
         self.execution_v2_config = cfg.get('execution_engine', {}) or {}
         self._quote_provider = None
         self._smart_exit = None
@@ -399,6 +401,7 @@ class EjecutorHibridoDeOrdenes:
         Absence from this snapshot never establishes a terminal order state.
         """
         previous = getattr(self._order_observation_local, "scope", None)
+        previous_orders = getattr(self._order_observation_local, 'scope_orders', None)
         # Capture before traversing: a mutation during construction must expire
         # this observation. The monitor can pass its version from before the GET.
         if generation is None:
@@ -413,10 +416,23 @@ class EjecutorHibridoDeOrdenes:
         self._order_observation_local.scope = (
             str(account_number), working_ids, generation
         )
+        self._order_observation_local.scope_orders = orders
         try:
             yield
         finally:
             self._order_observation_local.scope = previous
+            self._order_observation_local.scope_orders = previous_orders
+
+    def native_order_snapshot(self, account_number):
+        """Reuse the monitor's complete OCO trees until a broker mutation."""
+        scope = getattr(self._order_observation_local, 'scope', None)
+        if scope:
+            account, _, generation = scope
+            with self._order_observation_lock:
+                current = self._order_observation_generation
+            if account == str(account_number) and generation == current:
+                return getattr(self._order_observation_local, 'scope_orders', None)
+        return self._working_orders_snapshot(account_number)
 
     def _invalidate_order_observations(self):
         """Expire every worker's observation before any broker mutation."""
@@ -2220,4 +2236,14 @@ class EjecutorHibridoDeOrdenes:
     def cancelar_orden(self, account_number: str, order_id: str) -> bool:
         """Compatibilidad: True únicamente tras confirmación terminal real."""
         return bool(self.cancelar_orden_confirmada(account_number, order_id).get("confirmado"))
+
+    def native_exits(self, account_number):
+        from core.native_exits import NativeExits
+        return NativeExits(self, account_number, self.native_exit_path)
+
+    def montar_proteccion_enlazada(self, orden, account_number, entry_order_id):
+        if self.paper_trading:
+            raise ValueError('Native broker protection requires REAL execution')
+        with self.secuencia_simbolo(orden.ticker):
+            return self.native_exits(account_number).install(orden, entry_order_id)
 

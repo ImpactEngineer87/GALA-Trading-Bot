@@ -7,7 +7,7 @@ The validator itself is side-effect free; broker callbacks must be read-only.
 
 from __future__ import annotations
 from core.live_capacity import max_real_tickers
-from core.exit_policy import effective_partial_enabled, real_exit_policy
+from core.exit_policy import effective_partial_enabled, real_exit_policy, linked_partial_enabled
 
 from typing import Callable, Iterable, Optional, Tuple
 
@@ -27,7 +27,8 @@ def _unsupported_real_partial_exit(cfg: dict, shares: int) -> bool:
     preflight consistent with its default and fail closed until a vetted
     broker-linked 70/30 protective-order strategy replaces the SINGLE orders.
     """
-    return effective_partial_enabled(cfg, paper=False) and int(shares) >= 3
+    return (effective_partial_enabled(cfg, paper=False) and int(shares) >= 3
+            and not linked_partial_enabled(cfg))
 
 
 def validate_live_start(

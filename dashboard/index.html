@@ -2629,6 +2629,7 @@ function renderPositions(id, positions, compact=false){
         <span>TP1: ${plannedPartial || '—'} acc @ ${positiveMoney(p.tp1_price)}</span>
         <span>Parcial ejecutado: ${partialDone} acc</span>
         <span>Plan restante: ${plannedRemaining || '—'} acc</span>
+        ${p.exit_policy==='LINKED_70_30'?`<span>TP1 / TP final en Schwab: ${p.exit_plan_status==='VERIFIED'?'órdenes verificadas':'verificación pendiente'}</span>`:''}
         <span class="${be?'be-active':''}">Protección: ${be?'BREAK-EVEN':escHtml(p.protection_mode||'Stop inicial')}</span>
         <span>Realizado local (bruto): ${String(p.mode).toUpperCase()==='REAL'?'N/D · verificar fills':money(p.realized_pnl)}</span>
       </div>

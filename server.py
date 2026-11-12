@@ -4186,7 +4186,7 @@ def get_ticker_execution():
     partial_pct = float(partial_cfg.get("pct_primer_objetivo", 0.70) or 0.70)
     from core.ticker_analysis import partial_share_plan
     from core.live_guard import _unsupported_real_partial_exit
-    from core.exit_policy import effective_partial_enabled, real_exit_policy
+    from core.exit_policy import effective_partial_enabled, real_exit_policy, linked_partial_enabled
     risk = _engine_daily_risk_snapshot()
     accounting = risk.get("real_accounting")
     accounting = accounting if isinstance(accounting, dict) else {}
@@ -4241,7 +4241,7 @@ def get_ticker_execution():
         "capacity": getattr(getattr(_ENGINE, "real_capacity", None), "last", {}),
         "quarantine": quarantine,
         "real_accounting": accounting,
-        "real_partial_exit_supported": False,
+        "real_partial_exit_supported": linked_partial_enabled(cfg),
         "real_exit_policy": real_exit_policy(cfg),
         "max_real_shares": max_real_shares,
         "max_paper_shares": max_paper_shares,

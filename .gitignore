@@ -64,6 +64,8 @@ data/*.sqlite3-wal
 data/*.open.json
 
 data/execution_pending.json
+data/native_exit_plans.json
+data/native_exit_plans/
 data/broker_reconciliation_state.json
 data/retraining_state*.json
 data/shadow_decisions*

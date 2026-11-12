@@ -56,6 +56,8 @@ from core.project_paths import resolve_runtime_path
 from core.memory_diagnostics import memory_usage_mib
 from core.symbol_work import SymbolWork, causal_snapshot
 from core.macro_refresh import MacroRefresh
+from core.exit_policy import linked_partial_enabled
+from core.native_exits import ACTIVE as NATIVE_ACTIVE, execution_summary, new_plan, plan_ids
 from core.ticker_execution import TickerExecutionRegistry
 from core.live_capacity import RealCapacityManager, max_real_tickers
 from core.runtime_reliability import effective_ai_threshold
@@ -3322,6 +3324,15 @@ class ChocoletraBot:
             )
             return False
 
+        if not paper_ticker and orden.salida_parcial_activa and linked_partial_enabled(self.config):
+            try:
+                new_plan(orden, 'preflight-only')
+            except (ValueError, TypeError, AttributeError):
+                decision.execution_skip_reason = 'INVALID_LINKED_EXIT_PLAN'
+                self._audit_event('ENTRY_BLOCKED', ticker=ticker, lado=prop.tipo,
+                    estado='INVALID_LINKED_EXIT_PLAN', motivo='TP1, TP final o cantidades incompatibles')
+                return False
+
         # Schwab rejected TSLA's standalone TP1 BUY_TO_COVER 2 while a
         # standalone BUY_TO_COVER STOP for all 3 shares was still WORKING.
         # Do not create another REAL position whose 70/30 exit plan would
@@ -3329,7 +3340,8 @@ class ChocoletraBot:
         # Only a separately verified linked/quantity-safe broker strategy may
         # remove this fail-closed gate.
         if (not paper_ticker and bool(orden.salida_parcial_activa)
-                and int(getattr(orden, "cantidad_parcial", 0) or 0) > 0):
+                and int(getattr(orden, "cantidad_parcial", 0) or 0) > 0
+                and not linked_partial_enabled(self.config)):
             decision.execution_skip_reason = "REAL_PARTIAL_EXIT_UNSUPPORTED"
             self._audit_event(
                 "ENTRY_BLOCKED", ticker=ticker, lado=prop.tipo,
@@ -3598,7 +3610,26 @@ class ChocoletraBot:
         tp1_id = ""
         sl_reconcile_pending = False
         tp1_reconcile_pending = False
-        if not paper_ticker:
+        native_plan = None
+        if not paper_ticker and orden.salida_parcial_activa and linked_partial_enabled(self.config):
+            native_plan = {'schema': 1, 'ticker': ticker, 'side': orden.tipo,
+                'entry_order_id': str(entry_order_id), 'quantity': orden.cantidad,
+                'groups': [], 'retired': [], 'status': 'RECONCILE'}
+            try:
+                native_plan = new_plan(orden, entry_order_id)
+                native_plan = self.ejecutor_hibrido.montar_proteccion_enlazada(
+                    orden, self.account_number, entry_order_id)
+            except Exception as exc:
+                controller = self.ejecutor_hibrido.native_exits(self.account_number)
+                saved = controller.load(entry_order_id)
+                native_plan = saved or native_plan
+                native_plan['status'] = 'RECONCILE'
+                self._emit_log('ERROR', f'[{ticker}] Protección enlazada pendiente: {type(exc).__name__}')
+            for group in native_plan['groups']:
+                if group['stage'] == 'TP1':
+                    sl_id = (group.get('leaves', {}).get('STOP') or {}).get('order_id', '')
+                    tp1_id = (group.get('leaves', {}).get('LIMIT') or {}).get('order_id', '')
+        elif not paper_ticker:
             if orden.salida_parcial_activa:
                 prot = self.ejecutor_hibrido.montar_proteccion_parcial(
                     orden, self.account_number
@@ -3754,7 +3785,7 @@ class ChocoletraBot:
             "entry_action": entry_action_for_state(target_state),
             "transition_ok": transition_ok,
         }
-        sl_id_value = sl_id if prot else ""
+        sl_id_value = sl_id if prot or native_plan else ""
         with self._lock:
             self._posiciones[ticker] = {
                 "execution_mode": execution_mode,
@@ -3783,8 +3814,9 @@ class ChocoletraBot:
                 "decision": decision,
                 "sl_order_id": sl_id_value,
                 "sl_reconcile_pending": bool(sl_reconcile_pending),
-                "tp1_order_id": tp1_id if prot else "",
+                "tp1_order_id": tp1_id if prot or native_plan else "",
                 "tp1_reconcile_pending": bool(tp1_reconcile_pending),
+                "native_exit_plan": native_plan,
                 "abierta_ts": self._ahora_et(),
             }
             if orden.tipo == "BUY":
@@ -3817,10 +3849,11 @@ class ChocoletraBot:
                 "stop_loss": orden.stop_loss,
                 "tp1": orden.take_profit_parcial,
                 "tp_final": orden.take_profit,
-                "sl_order_id": sl_id if prot else "",
+                "sl_order_id": sl_id if prot or native_plan else "",
                 "sl_reconcile_pending": bool(sl_reconcile_pending),
-                "tp1_order_id": tp1_id if prot else "",
+                "tp1_order_id": tp1_id if prot or native_plan else "",
                 "tp1_reconcile_pending": bool(tp1_reconcile_pending),
+                "native_exit_plan": native_plan,
                 "signal_price": quality_context.get("signal_price", entrada),
                 "submitted_limit_price": quality_context.get(
                     "submitted_limit_price", entrada
@@ -3886,6 +3919,8 @@ class ChocoletraBot:
                 f"| {decision.resumen}", prioridad="alta")
         except Exception:
             pass
+        if native_plan and (not native_plan['groups'] or any(not g.get('root_id') for g in native_plan['groups'])):
+            self._cerrar_posicion(ticker, entrada, motivo='sin proteccion enlazada identificada')
         return True
 
     def _pending_entry_timeout(self, ticker: str, pos: dict) -> float:
@@ -4973,7 +5008,24 @@ class ChocoletraBot:
         nuevo_sl_id = pos["sl_order_id"]
         reproteccion_ok = True
 
-        if not paper_ticker:
+        if not paper_ticker and pos.get('native_exit_plan'):
+            summary = execution_summary(pos['native_exit_plan'])
+            fills = [leg for leg in (summary or {}).get('legs', []) if leg['stage'] == 'TP1']
+            qty = sum(leg['filled'] for leg in fills)
+            if (qty != cant_parcial or not fills or any(leg['kind'] != 'LIMIT' for leg in fills)):
+                return
+            actual_tp1_price = sum(leg['filled'] * leg['avg_price'] for leg in fills) / qty
+            tp1 = actual_tp1_price
+            pos['tp1_order_id'] = fills[-1]['order_id']
+            runner_groups = [g for g in pos['native_exit_plan']['groups'] if g['stage'] == 'FINAL']
+            runner_stops = [g.get('leaves', {}).get('STOP') or {} for g in runner_groups]
+            reproteccion_ok = (all(s.get('status') in NATIVE_ACTIVE for s in runner_stops)
+                and bool(runner_stops)) or self._cantidad_real_broker(ticker, pos['tipo']) == 0
+            if not reproteccion_ok:
+                return
+            nuevo_sl_id = runner_stops[-1].get('order_id', '') if runner_stops else ''
+            nuevo_sl_price = runner_groups[-1]['stop'] if runner_groups else pos['sl_actual']
+        elif not paper_ticker:
             if not self._asegurar_token_trading():
                 return
             detail_reader = getattr(self.ejecutor_hibrido, 'detalle_orden', None)
@@ -5098,6 +5150,18 @@ class ChocoletraBot:
         intentionally ignored because it can be a partial fill and therefore is
         not sufficient evidence of the final position close.
         """
+        if pos.get('native_exit_plan'):
+            try:
+                plan = self.ejecutor_hibrido.native_exits(self.account_number).refresh(pos['native_exit_plan'], force=True)
+                evidence = execution_summary(plan, exclude_tp1=bool(pos.get('tp1_hit')))
+                if (plan['status'] == 'VERIFIED' and evidence is not None
+                        and evidence['quantity'] == cantidad_esperada and evidence['legs']):
+                    return {'order_id': evidence['legs'][-1]['order_id'], 'filled': evidence['quantity'],
+                        'avg_price': evidence['avg_price'], 'broker_status': 'FILLED',
+                        'execution_details': evidence}
+            except Exception:
+                pass
+            return {}
         oid = str((pos or {}).get("sl_order_id", "") or "").strip()
         if not oid:
             return {}
@@ -5178,15 +5242,24 @@ class ChocoletraBot:
             orders = reader(self.account_number)
             from core.manual_close_reconciliation import verified_manual_close
 
+            native = None
+            manual_quantity = cantidad_esperada
+            if pos.get('native_exit_plan'):
+                self.ejecutor_hibrido.native_exits(self.account_number).refresh(pos['native_exit_plan'], force=True)
+                native = execution_summary(pos['native_exit_plan'], exclude_tp1=bool(pos.get('tp1_hit')))
+                if native is None or native['quantity'] >= cantidad_esperada:
+                    return {}
+                manual_quantity -= native['quantity']
             proof = verified_manual_close(
                 orders, ticker=ticker, side=pos.get("tipo"),
-                quantity=cantidad_esperada,
+                quantity=manual_quantity,
                 total_quantity=pos.get("orden").cantidad,
                 entry_order_id=pos.get("entry_order_id"),
                 entry_price=pos.get("entrada"),
                 managed_order_ids={pos.get("entry_order_id"),
                                    pos.get("sl_order_id"), pos.get("tp1_order_id")}
-                                  | self._gala_audited_order_ids(ticker),
+                                  | self._gala_audited_order_ids(ticker)
+                                  | set(plan_ids(pos.get('native_exit_plan') or {})),
                 session_ny=self._ahora_et().date().isoformat(),
             )
         except Exception:
@@ -5212,6 +5285,11 @@ class ChocoletraBot:
                 detalle={"order_type": proof["order_type"], "tag": proof["tag"],
                          "broker_fill_time": proof["filled_at"]},
             )
+            if native is not None and native['quantity']:
+                proof = {**proof, 'quantity': cantidad_esperada,
+                    'avg_price': (native['quantity'] * native['avg_price']
+                        + proof['quantity'] * proof['avg_price']) / cantidad_esperada,
+                    'native_execution_legs': native['legs']}
         return proof
 
     def _defer_flat_manual_close(self, ticker, pos, quantity):
@@ -5380,6 +5458,15 @@ class ChocoletraBot:
             # llamador (kill switch) la re-vea y la cierre por la vía normal.
             return self._cancelar_pendiente(ticker)
 
+        if not paper_ticker and pos.get('native_exit_plan'):
+            controller = self.ejecutor_hibrido.native_exits(self.account_number)
+            controller.refresh(pos['native_exit_plan'], force=True)
+            evidence = execution_summary(pos['native_exit_plan'])
+            tp1_fills = [leg for leg in (evidence or {}).get('legs', []) if leg['stage'] == 'TP1']
+            if (not pos['tp1_hit'] and tp1_fills and all(x['kind'] == 'LIMIT' for x in tp1_fills)
+                    and sum(x['filled'] for x in tp1_fills) == pos['orden'].cantidad_parcial):
+                self._ejecutar_parcial(ticker, pos)
+
         tipo = pos["tipo"]
         entrada = pos["entrada"]
         cantidad_total = pos["orden"].cantidad
@@ -5436,8 +5523,13 @@ class ChocoletraBot:
             # 1) Cancelar SIEMPRE las protecciones que sigan vivas (TP1 y/o SL).
             #    El DELETE no basta: cada orden debe quedar terminal/no visible como
             #    WORKING antes de enviar una liquidación o soltar el estado local.
-            for oid_key in ("tp1_order_id", "sl_order_id"):
-                oid = pos.get(oid_key)
+            protection_ids = [(name, pos.get(name)) for name in ('tp1_order_id', 'sl_order_id')]
+            protection_ids.extend(('native_exit', oid) for oid in plan_ids(pos.get('native_exit_plan') or {}))
+            seen_protection_ids = set()
+            for oid_key, oid in protection_ids:
+                if oid in seen_protection_ids:
+                    continue
+                seen_protection_ids.add(oid)
                 if oid:
                     cancel_result = cancelar_orden_compatible(self.ejecutor_hibrido,
                         self.account_number, oid, ticker=ticker)
@@ -5487,6 +5579,7 @@ class ChocoletraBot:
                         ticker, pos, expected_close_qty, sl_cancel_result
                     )
                     if recovered:
+                        exit_execution = recovered.get('execution_details') or {}
                         close_order_id = str(recovered.get("order_id", "") or "")
                         recovered_price = float(recovered.get("avg_price", 0) or 0)
                         if recovered_price > 0:
@@ -5585,6 +5678,7 @@ class ChocoletraBot:
                                 sl_cancel_result,
                             )
                             if recovered:
+                                exit_execution = recovered.get('execution_details') or {}
                                 close_order_id = str(
                                     recovered.get("order_id", "") or ""
                                 )
@@ -5650,6 +5744,24 @@ class ChocoletraBot:
                 precio=actual_exit_price,
                 motivo=motivo,
             )
+
+        # A native stop/target can fill one allocation before an explicit full
+        # close fills the other. Account for both actual executions, exactly once.
+        if (not paper_ticker and pos.get('native_exit_plan') and exit_confirmed and exit_price_verified):
+            expected = pos['cantidad_resto'] if pos['tp1_hit'] else cantidad_total
+            if cant_rest < expected:
+                try:
+                    controller = self.ejecutor_hibrido.native_exits(self.account_number)
+                    controller.refresh(pos['native_exit_plan'], force=True)
+                    prior = execution_summary(pos['native_exit_plan'], exclude_tp1=bool(pos['tp1_hit']))
+                    if (prior is not None and prior['quantity'] + cant_rest == expected
+                            and close_order_id not in {leg['order_id'] for leg in prior['legs']}):
+                        actual_exit_price = (prior['quantity'] * prior['avg_price'] + cant_rest * actual_exit_price) / expected
+                        exit_execution = {'native_legs': prior['legs'], 'remaining_exit': exit_execution,
+                            'quantity': expected, 'avg_price': actual_exit_price}
+                        cant_rest = expected
+                except Exception:
+                    pass
 
         # PnL del remanente. El parcial 70% ya fue agregado al acumulado diario
         # cuando se ejecutó TP1; aquí se suma SOLO el remanente para no duplicarlo.
@@ -5852,6 +5964,82 @@ class ChocoletraBot:
             motivo=motivo,
         )
 
+    def _gestionar_salida_enlazada(self, ticker, pos, precio_actual):
+        controller = self.ejecutor_hibrido.native_exits(self.account_number)
+        plan = controller.refresh(pos['native_exit_plan'])
+        progress = pos.get('normal_exit_progress') or {}
+        if progress:
+            if (progress.get('attempts', 0) < 3
+                    and time.time() >= progress.get('retry_after', float('inf'))):
+                progress['retry_after'] = time.time() + 10
+                self._cerrar_posicion(ticker, precio_actual,
+                    motivo=progress.get('reason') or 'cierre LIMIT pendiente')
+            return
+        if plan['status'] != 'VERIFIED':
+            if not plan['groups'] or any(not g.get('root_id') for g in plan['groups']):
+                self._cerrar_posicion(ticker, precio_actual, motivo='sin proteccion enlazada identificada')
+            return
+        summary = execution_summary(plan)
+        if getattr(self, '_manual_observation_lock', None) is not None:
+            remaining = self._manual_broker_quantity(ticker, pos['tipo'])
+            if (remaining == 0 or (remaining is not None and summary is not None
+                    and summary['quantity'] + remaining != plan['quantity'])):
+                remaining = self._cantidad_real_broker(ticker, pos['tipo'])
+        else:
+            remaining = self._cantidad_real_broker(ticker, pos['tipo'])
+        if remaining is None:
+            return
+        if summary is None or summary['quantity'] + remaining != plan['quantity']:
+            controller.refresh(plan, force=True)
+            summary = execution_summary(plan)
+        if summary is None or summary['quantity'] + remaining != plan['quantity']:
+            # Manual closes and delayed execution receipts use the existing
+            # exact-fill reconciliation. Never invent a native fill from price.
+            if remaining == 0:
+                self._cerrar_posicion(ticker, precio_actual, motivo='reconciliacion salida enlazada: broker plano')
+            return
+        tp1 = [leg for leg in summary['legs'] if leg['stage'] == 'TP1']
+        if (not pos['tp1_hit'] and tp1 and all(leg['kind'] == 'LIMIT' for leg in tp1)
+                and sum(leg['filled'] for leg in tp1) == pos['orden'].cantidad_parcial):
+            self._ejecutar_parcial(ticker, pos)
+        if remaining == 0:
+            reason = 'SL nativo' if any(leg['kind'] == 'STOP' for leg in summary['legs']) else 'TP final nativo'
+            self._cerrar_posicion(ticker, precio_actual, motivo=reason)
+            return
+        if any(leg['kind'] == 'STOP' for leg in summary['legs']):
+            self._cerrar_posicion(ticker, precio_actual, motivo='SL nativo: cerrar remanente')
+            return
+        # Any partial LIMIT fill requires confirmed cancellation and exact
+        # exposure reconciliation before changing its outstanding allocation.
+        partial_fill = any(0 < leaf.get('filled', 0) < group['quantity']
+            for group in plan['groups'] for leaf in group['leaves'].values())
+        uncovered = any(sum(x.get('filled', 0) for x in g['leaves'].values()) < g['quantity']
+            and (g['leaves'].get('STOP') or {}).get('status') not in NATIVE_ACTIVE for g in plan['groups'])
+        stop = None
+        if pos.get('tp1_hit') and pos.get('modo_resto') == 'breakeven':
+            offset = pos['entrada'] * self.breakeven_offset_pct / 100.
+            stop = round(pos['entrada'] - offset if pos['tipo'] == 'BUY' else pos['entrada'] + offset, 2)
+        move_stop = stop is not None and any(g['stage'] == 'FINAL' and g['stop'] != stop for g in plan['groups'])
+        if partial_fill or uncovered or move_stop:
+            repaired = controller.repair(plan, stop=stop)
+            if not repaired:
+                # A failed cancellation preserves existing protection; an
+                # unprotected/ambiguous replacement uses the existing guarded
+                # emergency close, which independently verifies every cancel.
+                controller.refresh(plan)
+                protected = (plan['status'] == 'VERIFIED' and all(
+                    sum(x.get('filled', 0) for x in g['leaves'].values()) == g['quantity']
+                    or (g['leaves'].get('STOP') or {}).get('status') in NATIVE_ACTIVE
+                    for g in plan['groups']))
+                if not protected:
+                    self._cerrar_posicion(ticker, precio_actual, motivo='sin proteccion enlazada confirmada')
+                return
+        for group in plan['groups']:
+            stop_leaf = group['leaves'].get('STOP') or {}
+            if group['stage'] == ('FINAL' if pos['tp1_hit'] else 'TP1'):
+                pos['sl_order_id'] = stop_leaf.get('order_id', '')
+                pos['sl_actual'] = group['stop']
+
     def _gestionar_real(self, ticker: str, pos: dict, precio_actual: float):
         """
         Monitor en modo real: detecta el llenado del TP1 (70%) para mover el
@@ -5863,6 +6051,14 @@ class ChocoletraBot:
             if self._posiciones.get(ticker) is not pos or pos.get("pendiente"):
                 return
         if not self._asegurar_token_trading():
+            return
+
+        if pos.get('native_exit_plan') is not None:
+            try:
+                self._gestionar_salida_enlazada(ticker, pos, precio_actual)
+            except Exception as exc:
+                self._emit_log('ERROR', f'[{ticker}] Salida enlazada requiere recuperación: {type(exc).__name__}')
+                self._cerrar_posicion(ticker, precio_actual, motivo='sin proteccion enlazada verificable')
             return
 
         if getattr(self, 'manual_close_pending', None) is not None:
@@ -7075,6 +7271,8 @@ class ChocoletraBot:
                     float(getattr(order, "take_profit_atr_factor", 0.0) or 0.0), 4
                 ),
                 "partial_exit_at": partial_exit_at,
+                "exit_policy": 'LINKED_70_30' if pos.get('native_exit_plan') is not None else None,
+                "exit_plan_status": (pos.get('native_exit_plan') or {}).get('status'),
                 "partial_exit_price": round(
                     float(pos.get("partial_exit_price", 0.0) or 0.0), 4
                 ),
