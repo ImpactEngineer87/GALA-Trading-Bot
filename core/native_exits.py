@@ -184,19 +184,45 @@ class NativeExits:
                 raise ValueError('Entry identity already owns a different native exit plan')
             return self.refresh(plan)
         plan = new_plan(order, entry_id)
-        snap = self.executor._position_snapshot(self.account, order.ticker)
-        wanted = 'long' if order.tipo == 'BUY' else 'short'
-        opposite = 'short' if wanted == 'long' else 'long'
-        if (snap is None or _number(snap.get(wanted, 0)) != plan['quantity']
-                or _number(snap.get(opposite, 0)) != 0
-                or self.executor.ordenes_trabajando_ticker(self.account, order.ticker) != []):
-            raise ValueError('Fresh exact position and empty working-order snapshot required')
         self.save(plan)
         for group in plan['groups']:
+            if not self._can_submit_group(plan, group):
+                break
             self.submit_group(plan, group)
             if not group['root_id']:
                 break
         return self.refresh(plan)
+
+    def _can_submit_group(self, plan, candidate):
+        """Recheck external fills/manual trades between allocation submissions."""
+        try:
+            reserved = 0
+            for group in plan.get('retired', []) + plan['groups']:
+                if not group.get('attempted'):
+                    continue
+                if not group.get('root_id'):
+                    return False
+                raw = self.executor._buscar_orden_en_listado(self.account, group['root_id'])
+                leaves = read_group(raw, group, plan['ticker'], plan['side'],
+                                    self.executor._detalle_desde_orden)
+                group['leaves'] = leaves
+                # A stop execution requires the normal close/reconciliation path.
+                if leaves['STOP'].get('filled', 0):
+                    return False
+                reserved += max((group['quantity'] - leaf.get('filled', 0)
+                    for leaf in leaves.values() if leaf.get('status') in ACTIVE), default=0)
+            summary = execution_summary(plan)
+            snap = self.executor._position_snapshot(self.account, plan['ticker'])
+            wanted = 'long' if plan['side'] == 'BUY' else 'short'
+            opposite = 'short' if wanted == 'long' else 'long'
+            working = self.executor.ordenes_trabajando_ticker(self.account, plan['ticker'])
+            return (summary is not None and snap is not None and working is not None
+                and _number(snap.get(opposite, 0)) == 0
+                and _number(snap.get(wanted, 0)) == plan['quantity'] - summary['quantity']
+                and candidate['quantity'] + reserved <= _number(snap.get(wanted, 0))
+                and set(map(str, working)).issubset(set(plan_ids(plan))))
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return False
 
     def refresh(self, plan, *, force=False):
         plan['status'] = 'VERIFIED'
@@ -299,6 +325,10 @@ class NativeExits:
         plan['groups'].sort(key=lambda g: g['stage'] != 'TP1')
         self.save(plan)
         for group in replacements:
+            if not self._can_submit_group(plan, group):
+                plan['status'] = 'RECONCILE'
+                self.save(plan)
+                return False
             self.submit_group(plan, group)
             if not group['root_id']:
                 return False

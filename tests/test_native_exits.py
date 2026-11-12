@@ -109,6 +109,49 @@ class NativeExitTests(unittest.TestCase):
         with self.assertRaises(ValueError):self.control.install(order(quantity=9), 'entry-1')
         self.assertEqual(len(self.broker.posts), 2)
 
+    def test_manual_close_between_initial_allocations_prevents_second_submission(self):
+        broker=Broker();control=NativeExits(broker,'offline-account',Path(self.tmp.name)/'manual-between')
+        submit=broker._submit_order_request
+        def manual_close(*args,**kwargs):
+            response=submit(*args,**kwargs);broker.quantity=0
+            return response
+        broker._submit_order_request=manual_close
+        plan=control.install(order(),'manual-between')
+        self.assertEqual(len(broker.posts),1)
+        self.assertFalse(plan['groups'][1]['attempted'])
+        self.assertEqual(plan['status'],'RECONCILE')
+
+    def test_first_target_filled_during_install_allows_only_three_runner_shares(self):
+        broker=Broker();control=NativeExits(broker,'offline-account',Path(self.tmp.name)/'fast-first')
+        submit=broker._submit_order_request
+        def immediate_target(*args,**kwargs):
+            response=submit(*args,**kwargs)
+            if len(broker.posts)==1:broker.fill('oco-1','LIMIT')
+            return response
+        broker._submit_order_request=immediate_target
+        plan=control.install(order(),'fast-first')
+        self.assertEqual(broker.quantity,3);self.assertEqual(len(broker.posts),2)
+        self.assertEqual(plan['status'],'VERIFIED')
+        self.assertEqual(broker.posts[1]['childOrderStrategies'][0]['orderLegCollection'][0]['quantity'],3)
+
+    def test_missing_first_receipt_prevents_another_allocation_submission(self):
+        broker=Broker();control=NativeExits(broker,'offline-account',Path(self.tmp.name)/'missing-first')
+        broker._buscar_orden_en_listado=Mock(return_value=None)
+        plan=control.install(order(),'missing-first')
+        self.assertEqual(len(broker.posts),1)
+        self.assertEqual(plan['status'],'RECONCILE')
+
+    def test_manual_close_between_two_repair_submissions_preserves_remaining_intent(self):
+        self.control.cancel(self.plan);self.control.refresh(self.plan,force=True)
+        submit=self.broker._submit_order_request
+        def manual_close(*args,**kwargs):
+            response=submit(*args,**kwargs);self.broker.quantity=0
+            return response
+        self.broker._submit_order_request=manual_close
+        self.assertFalse(self.control.repair(self.plan))
+        self.assertEqual(len(self.broker.posts),3)
+        self.assertFalse(self.plan['groups'][1]['attempted'])
+
     def test_partial_target_repairs_only_unfilled_shares_and_keeps_original_fill_price(self):
         self.broker.fill('oco-1', 'LIMIT', quantity=2, price=102.125)
         self.control.refresh(self.plan)

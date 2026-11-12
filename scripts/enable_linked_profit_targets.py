@@ -3,6 +3,7 @@ import argparse
 import copy
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -21,7 +22,8 @@ def updated_config(text):
     if not isinstance(original, dict) or not isinstance(original.get('live_trading'), dict):
         raise ValueError('Existing live_trading configuration required')
     partial = original.get('salida_parcial') or {}
-    if partial.get('activo', True) is not True or abs(float(partial.get('pct_primer_objetivo', .70)) - .70) > 1e-9:
+    fraction = float(partial.get('pct_primer_objetivo', .70))
+    if partial.get('activo', True) is not True or not math.isfinite(fraction) or abs(fraction - .70) > 1e-9:
         raise ValueError('An enabled 70/30 partial plan is required')
     if original['live_trading'].get('real_exit_policy') == 'LINKED_70_30':
         return text, original, original

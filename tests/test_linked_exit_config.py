@@ -20,5 +20,5 @@ class LinkedExitConfigTests(unittest.TestCase):
         self.assertEqual(updated_config(result)[0],result)
 
     def test_disabled_or_different_fraction_requires_configuration_review(self):
-        for partial in ['activo: false','pct_primer_objetivo: 0.5']:
+        for partial in ['activo: false','pct_primer_objetivo: 0.5','pct_primer_objetivo: .nan']:
             with self.assertRaises(ValueError):updated_config('live_trading: {}\nsalida_parcial:\n  '+partial+'\n')
