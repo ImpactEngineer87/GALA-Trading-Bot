@@ -2,6 +2,16 @@
 
 ## Status
 
+**Completed:** the guarded deployment succeeded at **15:50 NY on November 12**
+(receipt timestamp `2026-11-12T20:50:17.906900+00:00`). The broker was flat, the
+engine was already stopped, and no position was force-closed. The sole
+configuration change enabled `LINKED_70_30`; 64 protected files were checked.
+Receipt: `data/upgrade_verification_20261112_3326.json`.
+
+The VPS subsequently advanced to **3.3.27** for the AI evaluation repair,
+retaining this exit policy. See `INCIDENT_AI_2026-11-13.md` for current status.
+The remaining text records this release's investigation and deployment plan.
+
 The upgrade is implemented, tested, and published on GitHub `master`.
 The source changes are in commits `c595aef` and `4ba34fa`; the latter passed the
 final Linux regression run. The tested release is pinned at `dc21c1b` (its
@@ -9,20 +19,18 @@ additional change is documentation).
 
 SSH access was restored at approximately **10:26 New York on November 12**.
 Earlier attempts timed out before authentication; their network cause has not
-been established. Live source remains `cd12c70`, version **3.3.25**. The engine
-is actively trading, so the running source and exit configuration have not yet
-been changed.
+been established. At that inspection the source was `cd12c70`, version
+**3.3.25**. The engine was actively trading, so the source/configuration change
+was deferred until the completed maintenance window described above.
 
-The VPS has an isolated 3.3.26 checkout, verified tests, private incident
-evidence, and a guarded one-time deployment scheduled for **November 12 at
-15:50 New York (20:50 UTC)**. Deployment proceeds only after the engine has
-already stopped and strict broker-flat checks succeed. It never invokes the
-engine Stop or Start action. This is a scheduled attempt, not a completed
-deployment.
+The VPS preparation included an isolated 3.3.26 checkout, verified tests,
+private incident evidence, and a one-time deployment scheduled for **November
+12 at 15:50 New York (20:50 UTC)**. Its engine-stopped and strict broker-flat
+checks passed, and deployment completed without an engine Stop/Start action.
 
 ## Why REAL sold the whole position
 
-The live VPS configuration inspected on November 12 uses
+The VPS configuration inspected before the November 12 deployment used
 `live_trading.real_exit_policy: FULL_POSITION`. In
 `core/exit_policy.py:15`, `effective_partial_enabled()` explicitly disables
 partials for REAL under that policy. PAPER retains its configured partial plan.
@@ -146,9 +154,9 @@ or submit test orders as a deployment check.
 Rollback likewise requires a broker-flat window and restoration of the source
 and its matching previous exit policy. Do not downgrade over live native exits.
 
-### Scheduled maintenance
+### Scheduled maintenance (completed)
 
-- Timer: `gala-upgrade-3326.timer`, verified active, next run
+- Timer: `gala-upgrade-3326.timer`, scheduled for and executed at
   `2026-11-12 20:50:00 UTC`.
 - Service: `gala-upgrade-3326.service`.
 - Private deployment helper: incident folder's `deploy_when_stopped.py`.
@@ -167,4 +175,5 @@ and its matching previous exit policy. Do not downgrade over live native exits.
 - Successful completion writes
   `data/upgrade_verification_20261112_3326.json`. Failure writes a private
   `deployment_pending.json`; a scheduled timer alone does not prove success.
-- To cancel the pending attempt: `systemctl disable --now gala-upgrade-3326.timer`.
+- The successful deployment receipt, rather than the timer's existence,
+  confirms completion. The maintenance helper and backup remain available.
