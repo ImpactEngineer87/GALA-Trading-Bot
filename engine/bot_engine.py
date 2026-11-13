@@ -5150,6 +5150,7 @@ class ChocoletraBot:
         intentionally ignored because it can be a partial fill and therefore is
         not sufficient evidence of the final position close.
         """
+        native_evidence = None
         if pos.get('native_exit_plan'):
             try:
                 plan = self.ejecutor_hibrido.native_exits(self.account_number).refresh(pos['native_exit_plan'], force=True)
@@ -5159,11 +5160,19 @@ class ChocoletraBot:
                     return {'order_id': evidence['legs'][-1]['order_id'], 'filled': evidence['quantity'],
                         'avg_price': evidence['avg_price'], 'broker_status': 'FILLED',
                         'execution_details': evidence}
+                # A deferred LIMIT close can cancel the OCOs and install one
+                # standalone STOP. Keep the verified old fills and also read
+                # that replacement instead of treating the close as manual.
+                if (plan['status'] != 'VERIFIED' or evidence is None
+                        or evidence['quantity'] >= cantidad_esperada):
+                    return {}
+                native_evidence = evidence
             except Exception:
-                pass
-            return {}
+                return {}
         oid = str((pos or {}).get("sl_order_id", "") or "").strip()
         if not oid:
+            return {}
+        if native_evidence is not None and oid in plan_ids(pos['native_exit_plan']):
             return {}
         try:
             expected = max(1, int(cantidad_esperada or 1))
@@ -5203,7 +5212,8 @@ class ChocoletraBot:
                     and self._positive_broker_fill_price(detail_avg)):
                 avg_price = detail_avg
 
-        if status != "FILLED" or filled != expected or avg_price <= 0:
+        prior_quantity = native_evidence['quantity'] if native_evidence is not None else 0
+        if status != "FILLED" or filled + prior_quantity != expected or avg_price <= 0:
             # Do not make the row trainable unless both broker identity and the
             # actual fill price are available. Otherwise PnL/labels could be wrong.
             return {}
@@ -5214,6 +5224,13 @@ class ChocoletraBot:
             "avg_price": avg_price,
             "broker_status": "FILLED",
         }
+        if native_evidence is not None:
+            legs = native_evidence['legs'] + [{'order_id': oid, 'filled': filled,
+                'avg_price': avg_price, 'stage': 'REPLACEMENT', 'kind': 'STOP',
+                'status': 'FILLED'}]
+            average = sum(leg['filled'] * leg['avg_price'] for leg in legs) / expected
+            recovered.update(filled=expected, avg_price=average,
+                execution_details={'quantity': expected, 'avg_price': average, 'legs': legs})
         self._audit_event(
             "EXIT_ORDER_ID_RECOVERED",
             ticker=ticker,
@@ -5969,6 +5986,16 @@ class ChocoletraBot:
         plan = controller.refresh(pos['native_exit_plan'])
         progress = pos.get('normal_exit_progress') or {}
         if progress:
+            # Submission attempts are bounded, but receipt recovery must keep
+            # running after the protective replacement STOP has filled.
+            observed = (self._manual_broker_quantity(ticker, pos['tipo'])
+                if getattr(self, '_manual_observation_lock', None) is not None
+                else self._cantidad_real_broker(ticker, pos['tipo']))
+            if observed == 0 and self._cantidad_real_broker(ticker, pos['tipo']) == 0:
+                if time.monotonic() >= pos.get('manual_close_retry_after', 0):
+                    self._cerrar_posicion(ticker, precio_actual,
+                        motivo='reconciliacion cierre LIMIT: broker plano')
+                return
             if (progress.get('attempts', 0) < 3
                     and time.time() >= progress.get('retry_after', float('inf'))):
                 progress['retry_after'] = time.time() + 10

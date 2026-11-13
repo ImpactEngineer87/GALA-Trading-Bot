@@ -216,6 +216,42 @@ class LearningTrainingTests(unittest.TestCase):
         self.assertFalse(metrics["activado"])
         self.assertFalse(self.trainer.modelo_disponible("AAPL"))
 
+    def test_low_rated_winner_and_loser_both_train_with_lower_weight(self):
+        pd.DataFrame([
+            self.signal(ai_probability=.1, ai_threshold=.55),
+            self.signal(observation_id='loser', resolution='SL', ganadora=0,
+                precio_salida=99., r_multiple=-1., ai_probability=.15, ai_threshold=.55),
+            self.signal(observation_id='future', ai_probability=.1, ai_threshold=.55,
+                resolved_utc='2026-02-01T00:00:00Z'),
+        ]).to_csv(self.trainer.signal_learning_path, index=False)
+        metrics=self.train(); model=FixedClassifier.instances[-1]
+        proof=metrics['supplemental_fit_evidence']
+        self.assertEqual(proof['reason'],'SELECTED_FOR_FIT')
+        self.assertEqual(proof['low_score_winners_available'],2)
+        self.assertEqual(proof['low_score_winners_selected'],1)
+        self.assertEqual(proof['excluded_after_fit_cutoff'],1)
+        self.assertEqual((proof['selected_winners'],proof['selected_losers']),(1,1))
+        np.testing.assert_array_equal(model.fit_y[-2:],[1,0])
+        np.testing.assert_allclose(model.weights[-2:],[.35,.35])
+        self.assertEqual(metrics['muestras_test'],24)
+        self.assertTrue(metrics['validation_test_actual_only'])
+
+    def test_future_missed_winners_have_an_explicit_exclusion_reason(self):
+        pd.DataFrame([self.signal(ai_probability=.1, ai_threshold=.55,
+            resolved_utc='2026-02-01T00:00:00Z')]).to_csv(self.trainer.signal_learning_path,index=False)
+        metrics=self.train();proof=metrics['supplemental_fit_evidence']
+        self.assertEqual(proof['reason'],'NO_RESOLVED_SIGNALS_BEFORE_FIT_CUTOFF')
+        self.assertEqual(proof['low_score_winners_available'],1)
+        self.assertEqual(proof['low_score_winners_selected'],0)
+        self.assertEqual(metrics['muestras_fit_suplementarias'],0)
+
+    def test_unreadable_signal_ledger_is_an_error_instead_of_zero_samples(self):
+        Path(self.trainer.signal_learning_path).write_text('invalid')
+        with patch('agents.training.pd.read_csv',side_effect=OSError('unreadable ledger')):
+            with self.assertRaisesRegex(RuntimeError,'SIGNAL_LEARNING_READ_FAILED'):
+                self.trainer._supplemental_fit_rows('AAPL',
+                    fit_cutoff='2026-01-06T00:00:00Z',actual_fit_count=10)
+
     def incumbent(self, threshold=.9, version='incumbent-v1'):
         self.trainer._modelos['AAPL'] = FixedClassifier()
         self.trainer._umbrales['AAPL'] = threshold

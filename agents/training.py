@@ -530,6 +530,19 @@ class EntrenadorAgentes:
         leaking future label information into the candidate.
         """
         empty = pd.DataFrame(columns=[*FEATURES, "ganadora", "timestamp", "resolved_utc"])
+        evidence = {"enabled": bool(self.signal_learning_enabled
+            and self.signal_learning_training_enabled and self.signal_learning_weight > 0
+            and self.signal_learning_max_ratio > 0),
+            "sample_weight": self.signal_learning_weight, "resolved_candidates": 0,
+            "complete_candidates": 0, "excluded_after_fit_cutoff": 0,
+            "low_score_winners_available": 0, "low_score_winners_selected": 0,
+            "selected_winners": 0, "selected_losers": 0, "selected_rows": 0,
+            "fit_only": True, "reason": "DISABLED_OR_SOURCE_MISSING"}
+
+        def finish(frame, reason):
+            frame.attrs['selection_evidence'] = {**evidence, "reason": reason}
+            return frame
+
         if (
             not self.signal_learning_enabled
             or not self.signal_learning_training_enabled
@@ -537,17 +550,20 @@ class EntrenadorAgentes:
             or self.signal_learning_max_ratio <= 0
             or not os.path.exists(self.signal_learning_path)
         ):
-            return empty
+            return finish(empty, evidence['reason'])
         try:
             sup = pd.read_csv(self.signal_learning_path)
-        except Exception:
-            return empty
+        except Exception as exc:
+            # A missing optional source is handled above. An existing unreadable
+            # ledger must not silently turn missed winners into zero FIT rows.
+            raise RuntimeError('SIGNAL_LEARNING_READ_FAILED') from exc
         cutoff_utc = self._timestamp_to_utc(fit_cutoff)
         if pd.isna(cutoff_utc):
-            return empty
+            return finish(empty, 'FIT_CUTOFF_UNAVAILABLE')
+        evidence['fit_cutoff_utc'] = cutoff_utc.isoformat()
         required = {"ticker", "event", "training_eligible", "ganadora", "resolution", "resolved_utc"}
         if not required.issubset(sup.columns):
-            return empty
+            return finish(empty, 'SOURCE_SCHEMA_INCOMPLETE')
         sup = sup[
             (sup["ticker"].astype(str).str.upper() == str(ticker).upper())
             & (sup["event"].astype(str).str.upper() == "RESOLVED")
@@ -555,9 +571,10 @@ class EntrenadorAgentes:
             & (sup["resolution"].astype(str).str.upper().isin(["TP", "SL"]))
         ].copy()
         if sup.empty:
-            return empty
+            return finish(empty, 'NO_ELIGIBLE_RESOLVED_SIGNALS')
         if "observation_id" in sup.columns:
             sup = sup.drop_duplicates(subset=["observation_id"], keep="last")
+        evidence['resolved_candidates'] = len(sup)
         for col in FEATURES:
             if col not in sup.columns:
                 sup[col] = np.nan
@@ -570,25 +587,37 @@ class EntrenadorAgentes:
             *GALA10_FEATURE_NAMES,
         ])
         if sup.empty:
-            return empty
-        sup["_resolved_utc"] = pd.to_datetime(
-            sup["resolved_utc"], errors="coerce", utc=True
-        )
-        sup = sup[sup["_resolved_utc"].notna() & (sup["_resolved_utc"] <= cutoff_utc)]
-        if sup.empty:
-            return empty
-        # Re-label small gross winners as losses when the configured fee
-        # reserve consumes their entire return. No synthetic row reaches TEST.
+            return finish(empty, 'NO_COMPLETE_SIGNAL_FEATURES')
+        evidence['complete_candidates'] = len(sup)
+        # Diagnostic only: low scores do not exclude either winners or losers.
+        probabilities = pd.to_numeric(sup.get('ai_probability', pd.Series(index=sup.index, dtype=float)), errors='coerce')
+        thresholds = pd.to_numeric(sup.get('ai_threshold', pd.Series(index=sup.index, dtype=float)), errors='coerce')
+        sup['_below_original_threshold'] = probabilities < thresholds
         sup_returns = net_trade_returns(sup, self.round_trip_cost_bps)
         known = np.isfinite(sup_returns)
         sup.loc[known, "ganadora"] = (sup_returns[known] > 0).astype(int)
+        evidence['low_score_winners_available'] = int(
+            (sup['_below_original_threshold'] & (sup['ganadora'] == 1)).sum())
+        sup["_resolved_utc"] = pd.to_datetime(
+            sup["resolved_utc"], errors="coerce", utc=True
+        )
+        evidence['excluded_after_fit_cutoff'] = int((sup['_resolved_utc'] > cutoff_utc).sum())
+        evidence['excluded_invalid_resolution_time'] = int(sup['_resolved_utc'].isna().sum())
+        sup = sup[sup["_resolved_utc"].notna() & (sup["_resolved_utc"] <= cutoff_utc)]
+        if sup.empty:
+            return finish(empty, 'NO_RESOLVED_SIGNALS_BEFORE_FIT_CUTOFF')
         sup = sup.sort_values("_resolved_utc", kind="stable")
         cap = max(0, int(round(max(0, actual_fit_count) * self.signal_learning_max_ratio)))
+        evidence['row_cap'] = cap
         if cap <= 0:
-            return empty
+            return finish(empty, 'ZERO_SIGNAL_ROW_CAP')
+        evidence['excluded_by_row_cap'] = max(0, len(sup) - cap)
         if len(sup) > cap:
             sup = sup.tail(cap)
-        return sup
+        evidence.update(selected_rows=len(sup), selected_winners=int((sup['ganadora'] == 1).sum()),
+            selected_losers=int((sup['ganadora'] == 0).sum()),
+            low_score_winners_selected=int((sup['_below_original_threshold'] & (sup['ganadora'] == 1)).sum()))
+        return finish(sup, 'SELECTED_FOR_FIT')
 
     def _prepare_training_rows(self, frame: pd.DataFrame) -> pd.DataFrame:
         """Apply the same identity/verification policy as the closed counter."""
@@ -716,6 +745,7 @@ class EntrenadorAgentes:
             ticker, fit_cutoff=fit_cutoff, actual_fit_count=len(y_fit_actual)
         )
         supplemental_count = int(len(supplemental))
+        supplemental_evidence = dict(supplemental.attrs.get('selection_evidence') or {})
         if supplemental_count:
             x_sup = supplemental[FEATURES].values.astype(float)
             y_sup = supplemental["ganadora"].astype(int).values
@@ -880,6 +910,7 @@ class EntrenadorAgentes:
             "muestras_fit": int(len(y_fit_actual)),
             "muestras_fit_reales": int(len(y_fit_actual)),
             "muestras_fit_suplementarias": int(supplemental_count),
+            "supplemental_fit_evidence": supplemental_evidence,
             "muestras_fit_total": int(len(y_fit)),
             "muestras_validation": int(len(y_val)),
             "muestras_train": int(len(y_fit_actual) + len(y_val)),

@@ -23,6 +23,8 @@ REPORT_COLUMNS = [
     "ticker", "muestras", "muestras_fit", "muestras_validation",
     "muestras_train", "muestras_test",
     "muestras_fit_reales", "muestras_fit_suplementarias",
+    "supplemental_selection_reason", "supplemental_low_score_winners_available",
+    "supplemental_low_score_winners_selected", "supplemental_excluded_after_fit_cutoff",
     "validation_test_actual_only", "temporal_integrity_passed",
     "economic_gate_passed", "economic_net_r", "economic_expectancy_r",
     "economic_profit_factor", "economic_max_drawdown_r",
@@ -103,6 +105,7 @@ def guardar_reporte_modelos(metricas: Dict[str, dict],
         confusion = item.get("matriz_confusion") or {}
         economics = item.get("economic_test") or {}
         incumbent_policy = item.get('production_incumbent_policy') or {}
+        supplemental = item.get('supplemental_fit_evidence') or {}
         if not isinstance(economics, dict):
             economics = {}
         item["modelo_existe"] = model_exists
@@ -125,6 +128,10 @@ def guardar_reporte_modelos(metricas: Dict[str, dict],
             "muestras_fit_reales": item.get(
                 "muestras_fit_reales", item.get("muestras_fit", "")),
             "muestras_fit_suplementarias": item.get("muestras_fit_suplementarias", ""),
+            "supplemental_selection_reason": supplemental.get('reason', ''),
+            "supplemental_low_score_winners_available": supplemental.get('low_score_winners_available', ''),
+            "supplemental_low_score_winners_selected": supplemental.get('low_score_winners_selected', ''),
+            "supplemental_excluded_after_fit_cutoff": supplemental.get('excluded_after_fit_cutoff', ''),
             "validation_test_actual_only": item.get("validation_test_actual_only", ""),
             "temporal_integrity_passed": item.get("temporal_integrity_passed", ""),
             "economic_gate_passed": item.get("economic_gate_passed", ""),

@@ -252,6 +252,22 @@ class NativeExitTests(unittest.TestCase):
         self.assertEqual(proof['filled'],10);self.assertEqual(proof['avg_price'],98)
         self.assertEqual(b._cerrar_posicion.call_args.kwargs['motivo'],'SL nativo')
 
+    def test_flat_receipts_retry_after_three_deferred_limit_attempts(self):
+        b,pos=self.engine();self.control.cancel(self.plan)
+        pos['normal_exit_progress']={'attempts':3,'retry_after':float('inf')}
+        self.broker.quantity=0
+        b._gestionar_real('BA',pos,98)
+        b._cerrar_posicion.assert_called_once_with('BA',98,
+            motivo='reconciliacion cierre LIMIT: broker plano')
+        self.assertEqual(len(self.broker.posts),2)
+
+    def test_three_deferred_attempts_do_not_resubmit_a_live_position(self):
+        b,pos=self.engine();self.control.cancel(self.plan)
+        pos['normal_exit_progress']={'attempts':3,'retry_after':0}
+        b._gestionar_real('BA',pos,98)
+        b._cerrar_posicion.assert_not_called()
+        self.assertEqual(len(self.broker.posts),2)
+
     def test_fill_race_at_both_targets_records_partial_then_final_once(self):
         b,pos=self.engine();self.broker.fill('oco-1','LIMIT');self.broker.fill('oco-2','LIMIT')
         b._gestionar_real('BA',pos,105)
@@ -350,6 +366,48 @@ class NativeAccountingTests(unittest.TestCase):
         self.assertAlmostEqual(bot.daily_loss_guard.realized_pnl(False),13.)
         bot.ejecutor_hibrido.liquidar_posicion.assert_not_called()
         self.assertFalse(bot._real_accounting_status()['entry_blocked'])
+
+    def test_replacement_stop_after_canceled_ocos_closes_and_releases_queue(self):
+        from core.runtime_store import JsonState
+        bot,pos,broker,control=self.native_engine();control.cancel(pos['native_exit_plan'])
+        bot._activo=True;bot._ahora_et=lambda:datetime.now(timezone.utc)
+        bot.manual_close_pending=JsonState(self.root/'pending.json')
+        bot.manual_close_pending.put('pending',{'position-1':{'ticker':'NKE'}})
+        pos.update(sl_order_id='replacement-stop',position_id='position-1',
+            normal_exit_progress={'attempts':3})
+        broker.quantity=0
+        bot.ejecutor_hibrido.detalle_orden.return_value={
+            'status':'FILLED','filled':10,'avg_price':36.655,'fill_price_verified':True}
+        self.assertTrue(bot._cerrar_posicion_impl('NKE',999,'broker flat after replacement STOP'))
+        self.assertEqual(self.last_close()['order_id'],'replacement-stop')
+        self.assertAlmostEqual(float(self.last_close()['pnl_usd']),-10.05)
+        self.assertAlmostEqual(bot.daily_loss_guard.realized_pnl(False),-10.05)
+        self.assertFalse(bot._real_accounting_status()['entry_blocked'])
+        self.assertFalse(bot.manual_close_pending.get('pending'))
+        self.assertTrue(bot.orquestador.al_cerrar.call_args.kwargs['lifecycle']['exit_confirmed'])
+        bot.ejecutor_hibrido.liquidar_posicion.assert_not_called()
+
+    def test_native_partial_and_replacement_stop_preserve_both_prices(self):
+        bot,pos,broker,control=self.native_engine()
+        broker.fill('oco-1','STOP',quantity=2,price=36.66)
+        control.cancel(pos['native_exit_plan']);pos['sl_order_id']='replacement-stop'
+        bot.ejecutor_hibrido.detalle_orden.return_value={
+            'status':'FILLED','filled':8,'avg_price':36.60,'fill_price_verified':True}
+        proof=bot._recuperar_cierre_stop_llenado('NKE',pos,10)
+        self.assertEqual(proof['filled'],10)
+        self.assertAlmostEqual(proof['avg_price'],36.612)
+        self.assertEqual(len(proof['execution_details']['legs']),2)
+
+    def test_partial_or_unpriced_replacement_cannot_release_accounting(self):
+        bot,pos,broker,control=self.native_engine();control.cancel(pos['native_exit_plan'])
+        pos['sl_order_id']='replacement-stop'
+        for detail in [
+            {'status':'FILLED','filled':9,'avg_price':36.66,'fill_price_verified':True},
+            {'status':'FILLED','filled':10,'avg_price':36.66,'fill_price_verified':False},
+            {'status':'WORKING','filled':10,'avg_price':36.66,'fill_price_verified':True},
+        ]:
+            bot.ejecutor_hibrido.detalle_orden.return_value=detail
+            self.assertEqual(bot._recuperar_cierre_stop_llenado('NKE',pos,10),{})
 
     def test_native_stop_then_real_remainder_close_keeps_both_fill_prices(self):
         bot,pos,broker,control=self.native_engine();broker.fill('oco-1','STOP')
