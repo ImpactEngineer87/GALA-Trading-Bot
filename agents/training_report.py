@@ -16,6 +16,10 @@ _PUBLISH_LOCK = threading.Lock()
 
 
 REPORT_COLUMNS = [
+    "evaluation_id", "training_dataset_sha256", "evaluation_test_start", "evaluation_test_end",
+    "production_gate_passed", "shadow_candidate_accepted", "shadow_candidate_reason",
+    "incumbent_model_version", "incumbent_model_threshold", "incumbent_effective_threshold",
+    "incumbent_threshold_source",
     "ticker", "muestras", "muestras_fit", "muestras_validation",
     "muestras_train", "muestras_test",
     "muestras_fit_reales", "muestras_fit_suplementarias",
@@ -98,12 +102,20 @@ def guardar_reporte_modelos(metricas: Dict[str, dict],
         model_exists = bool(model_path and os.path.exists(model_path))
         confusion = item.get("matriz_confusion") or {}
         economics = item.get("economic_test") or {}
+        incumbent_policy = item.get('production_incumbent_policy') or {}
         if not isinstance(economics, dict):
             economics = {}
         item["modelo_existe"] = model_exists
         item["modelo_bytes"] = os.path.getsize(model_path) if model_exists else 0
         detalle[ticker] = item
         rows.append({
+            **{key:item.get(key, '') for key in (
+                'evaluation_id','training_dataset_sha256','evaluation_test_start','evaluation_test_end',
+                'production_gate_passed','shadow_candidate_accepted','shadow_candidate_reason')},
+            'incumbent_model_version': incumbent_policy.get('model_version', ''),
+            'incumbent_model_threshold': incumbent_policy.get('model_threshold', ''),
+            'incumbent_effective_threshold': incumbent_policy.get('threshold', ''),
+            'incumbent_threshold_source': incumbent_policy.get('threshold_source', ''),
             "ticker": ticker,
             "muestras": item.get("muestras", 0),
             "muestras_fit": item.get("muestras_fit", 0),

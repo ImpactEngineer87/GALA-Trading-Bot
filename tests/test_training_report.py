@@ -21,6 +21,11 @@ class TrainingReportTests(unittest.TestCase):
     def test_csv_exposes_training_sources_and_cost_aware_test_evidence(self):
         metrics = {
             "AAPL": {
+                "evaluation_id":"run-1", "training_dataset_sha256":"dataset-hash",
+                "production_gate_passed":False, "shadow_candidate_accepted":True,
+                "shadow_candidate_reason":"better shadow; production requires review",
+                "production_incumbent_policy":{'model_version':'incumbent-sha',
+                    'model_threshold':.79,'threshold':.55,'threshold_source':'MANUAL'},
                 "muestras_fit": 32, "muestras_fit_reales": 32,
                 "muestras_fit_suplementarias": 8,
                 "validation_test_actual_only": True,
@@ -52,6 +57,14 @@ class TrainingReportTests(unittest.TestCase):
         with open(paths["csv"], encoding="utf-8", newline="") as handle:
             rows = {row["ticker"]: row for row in csv.DictReader(handle)}
         self.assertEqual(rows["AAPL"]["muestras_fit_reales"], "32")
+        self.assertEqual(rows['AAPL']['evaluation_id'],'run-1')
+        self.assertEqual(rows['AAPL']['training_dataset_sha256'],'dataset-hash')
+        self.assertEqual(rows['AAPL']['production_gate_passed'],'False')
+        self.assertEqual(rows['AAPL']['shadow_candidate_accepted'],'True')
+        self.assertEqual(rows['AAPL']['incumbent_model_version'],'incumbent-sha')
+        self.assertEqual(rows['AAPL']['incumbent_model_threshold'],'0.79')
+        self.assertEqual(rows['AAPL']['incumbent_effective_threshold'],'0.55')
+        self.assertEqual(rows['AAPL']['incumbent_threshold_source'],'MANUAL')
         self.assertEqual(rows["AAPL"]["muestras_fit_suplementarias"], "8")
         self.assertEqual(rows["AAPL"]["validation_test_actual_only"], "True")
         self.assertEqual(rows["AAPL"]["temporal_integrity_passed"], "True")

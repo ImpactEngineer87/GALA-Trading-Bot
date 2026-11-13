@@ -43,6 +43,9 @@ class LearningTrainingTests(unittest.TestCase):
                 "feedback_path": str(self.root / "feedback.csv"),
                 "modelos_dir": str(self.root / "models"),
                 "reportes_dir": str(self.root / "reports"),
+                "manual_threshold_overrides": {
+                    "state_path": str(self.root/'thresholds.json'),
+                    "audit_path": str(self.root/'thresholds.audit.jsonl')},
                 "automatic_retraining": {"state_path": str(self.root / "state.json")},
             },
             "shadow_mode": {"enabled": True, "modelos_dir": str(self.root / "shadow")},
@@ -212,6 +215,62 @@ class LearningTrainingTests(unittest.TestCase):
         self.assertTrue(metrics["production_gate_passed"])
         self.assertFalse(metrics["activado"])
         self.assertFalse(self.trainer.modelo_disponible("AAPL"))
+
+    def incumbent(self, threshold=.9, version='incumbent-v1'):
+        self.trainer._modelos['AAPL'] = FixedClassifier()
+        self.trainer._umbrales['AAPL'] = threshold
+        self.trainer._production_snapshots['AAPL'] = {'model_version':version}
+
+    def test_incumbent_comparison_uses_the_exact_live_manual_threshold(self):
+        self.incumbent()
+        self.trainer.manual_threshold_overrides.set('AAPL','incumbent-v1',.6,'operator')
+        before=(self.root/'thresholds.json').read_bytes()
+        metrics=self.train()
+        self.assertEqual(metrics['production_incumbent_policy']['threshold'],.6)
+        self.assertEqual(metrics['production_incumbent_policy']['model_threshold'],.9)
+        self.assertEqual(metrics['production_incumbent_policy']['threshold_source'],'MANUAL')
+        self.assertEqual(metrics['incumbent_balanced_accuracy'],100.)
+        self.assertEqual(metrics['economic_production_incumbent']['accepted_trades'],12)
+        self.assertEqual((self.root/'thresholds.json').read_bytes(),before)
+        self.assertFalse(metrics['activado'])
+
+    def test_expired_model_override_cannot_affect_incumbent_benchmark(self):
+        self.incumbent(version='new-incumbent')
+        self.trainer.manual_threshold_overrides.set('AAPL','old-incumbent',.6,'operator')
+        metrics=self.train()
+        self.assertEqual(metrics['production_incumbent_policy']['threshold'],.9)
+        self.assertEqual(metrics['production_incumbent_policy']['threshold_source'],'MODEL')
+        self.assertEqual(metrics['incumbent_balanced_accuracy'],50.)
+        self.assertEqual(metrics['economic_production_incumbent']['accepted_trades'],0)
+
+    def test_unreadable_live_override_cannot_silently_use_original_threshold(self):
+        self.incumbent()
+        (self.root/'thresholds.json').write_text('{corrupted')
+        with self.assertRaises(ValueError):self.train()
+
+    def test_model_pinned_probability_bypass_is_evaluated_without_executing_it(self):
+        from core.model_identity import ManualRealAuthorization
+        self.incumbent()
+        auth=ManualRealAuthorization({'enabled':True,'state_path':str(self.root/'auth.json'),
+            'audit_path':str(self.root/'auth.audit.jsonl')})
+        auth.authorize('AAPL','incumbent-v1','test operator policy','operator',bypass_probability=True)
+        self.trainer.manual_real_authorization=auth
+        audit=(self.root/'auth.audit.jsonl').read_bytes()
+        metrics=self.train()
+        self.assertEqual(metrics['production_incumbent_policy']['threshold'],0.)
+        self.assertEqual(metrics['production_incumbent_policy']['threshold_source'],'MANUAL_PROBABILITY_BYPASS')
+        self.assertEqual(metrics['economic_production_incumbent']['accepted_trades'],24)
+        self.assertEqual((self.root/'auth.audit.jsonl').read_bytes(),audit)
+
+    def test_feedback_read_error_is_visible_and_preserves_the_pending_batch(self):
+        self.trades().to_csv(self.trainer.feedback_path,index=False)
+        with patch('agents.training.pd.read_csv',side_effect=OSError('fixture unreadable')):
+            result=self.trainer._retrain_eligible_batch_impl(['AAPL'],manual_request=True)
+        self.assertIn('TRAINING_FEEDBACK_READ_FAILED',result['AAPL']['error'])
+        state=self.trainer.retraining.snapshot(['AAPL'])[0]
+        self.assertEqual(state['last_result'],'ERROR')
+        self.assertEqual(state['new_observations'],120)
+        self.assertEqual(state['last_attempt_count'],0)
 
     def test_unknown_old_close_time_blocks_production_without_fabrication(self):
         metrics = self.train(self.trades().drop(columns="closed_utc"))

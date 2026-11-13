@@ -224,6 +224,20 @@ class EntrenadorAgentes:
     # INFERENCIA (filtro de veto por ticker)
     # =========================================================
 
+    def _production_threshold_policy(self, ticker, threshold, snapshot):
+        """One model-pinned threshold policy for live inference and evaluation.
+
+        Invalid override state must raise: benchmarking an unknown production
+        policy cannot silently authorize a replacement model.
+        """
+        result = dict(snapshot)
+        override = self.manual_threshold_overrides.active(
+            ticker, result.get('model_version'))
+        result.update(model_threshold=float(threshold),
+            threshold=float(override['threshold']) if override else float(threshold),
+            threshold_source='MANUAL' if override else 'MODEL')
+        return result
+
     def evaluar(
         self,
         decision: DecisionFinal,
@@ -250,17 +264,9 @@ class EntrenadorAgentes:
         # Manual policy affects only future decisions for this exact loaded
         # model version. Read every time so the running engine sees changes.
         try:
-            saved_override = self.manual_threshold_overrides.active(
-                ticker, decision.ai_model_snapshot.get('model_version'))
-            if saved_override:
-                model_threshold = umbral
-                umbral = float(saved_override['threshold'])
-                decision.ai_model_snapshot.update(
-                    model_threshold=model_threshold, threshold=umbral,
-                    threshold_source='MANUAL')
-            else:
-                decision.ai_model_snapshot.update(
-                    threshold=umbral, threshold_source='MODEL')
+            decision.ai_model_snapshot = self._production_threshold_policy(
+                ticker, umbral, decision.ai_model_snapshot)
+            umbral = decision.ai_model_snapshot['threshold']
         except Exception:
             # Invalid or unreadable persisted override: block REAL, never
             # silently fall back to a potentially weaker unknown policy.
@@ -664,8 +670,11 @@ class EntrenadorAgentes:
             return None
         try:
             df = pd.read_csv(self.feedback_path)
-        except Exception:
-            return None
+        except Exception as exc:
+            # Parsing/IO failures are infrastructure errors, not a shortage of
+            # winning/losing examples. The worker records ERROR without
+            # consuming the pending batch so it can be retried safely.
+            raise RuntimeError('TRAINING_FEEDBACK_READ_FAILED') from exc
         df = self._prepare_training_rows(df)
         if "ticker" not in df.columns:
             return None
@@ -790,12 +799,22 @@ class EntrenadorAgentes:
         with self._lock:
             incumbent = self._modelos.get(ticker)
             incumbent_umbral = self._umbrales.get(ticker, self.umbral_meta)
+            incumbent_snapshot = dict(self._production_snapshots.get(ticker, {}))
             shadow_incumbent = self._modelos_shadow.get(ticker)
             shadow_incumbent_umbral = self._umbrales_shadow.get(
                 ticker, self.shadow_default_threshold)
         incumbent_balanced = None
         incumbent_economics = None
+        incumbent_policy = None
         if incumbent is not None:
+            incumbent_policy = self._production_threshold_policy(
+                ticker, incumbent_umbral, incumbent_snapshot)
+            authorization = self.manual_real_authorization.active(
+                ticker, incumbent_snapshot.get('model_version'))
+            if authorization and authorization.get('bypass_probability'):
+                incumbent_policy.update(threshold=0.0,
+                    threshold_source='MANUAL_PROBABILITY_BYPASS')
+            incumbent_umbral = incumbent_policy['threshold']
             try:
                 prob_inc = incumbent.predict_proba(x_te)[:, 1]
                 incumbent_balanced = self._metricas_probabilidades(
@@ -870,6 +889,7 @@ class EntrenadorAgentes:
             "validation_test_actual_only": True,
             "economic_validation": economic_validation,
             "economic_production_incumbent": incumbent_economics,
+            "production_incumbent_policy": incumbent_policy,
             "economic_test": economic_test,
             "economic_gate_passed": not economic_reasons,
             "economic_reasons": list(economic_reasons),
