@@ -302,6 +302,7 @@ class RetrainingLifecycle:
                 # a new classification score with an older profitability result.
                 evaluation_fields = (
                     "evaluation_id", "evaluation_utc", "muestras_fit",
+                    "training_dataset_sha256", "production_incumbent_policy",
                     "muestras_fit_reales", "muestras_fit_suplementarias",
                     "validation_test_actual_only", "economic_test",
                     "economic_gate_passed", "economic_reasons",

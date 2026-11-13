@@ -38,6 +38,21 @@ class RetrainingLifecyclePersistenceTests(unittest.TestCase):
         )
         return writer
 
+    def test_evaluation_keeps_dataset_and_live_policy_proof_without_consuming_closes(self):
+        (self.root/'feedback.csv').write_text('ticker,modo,execution_valid,position_id\n'+
+            ''.join(f'AAPL,REAL,1,position-{i}\n' for i in range(50)),encoding='utf-8')
+        writer=self.make_lifecycle()
+        self.assertEqual(writer.snapshot(['AAPL'])[0]['new_observations'],50)
+        policy={'model_version':'exact-incumbent','model_threshold':.79,
+                'threshold':.55,'threshold_source':'MANUAL'}
+        writer.mark_result('AAPL',total_count=50,accepted=False,consume_batch=False,
+            metrics={'evaluation_id':'review-run','training_dataset_sha256':'dataset-sha',
+                     'production_incumbent_policy':policy})
+        row=self.make_lifecycle().snapshot(['AAPL'])[0]
+        self.assertEqual(row['new_observations'],50)
+        self.assertEqual(row['last_evaluation']['training_dataset_sha256'],'dataset-sha')
+        self.assertEqual(row['last_evaluation']['production_incumbent_policy'],policy)
+
     def test_independent_writers_replace_their_own_complete_temp_files(self):
         writers = [self.make_lifecycle(), self.make_lifecycle()]
         rendezvous = threading.Barrier(2)
