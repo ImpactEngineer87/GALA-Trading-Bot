@@ -10,9 +10,13 @@ not blocked. No broker order was placed or canceled for this work.
 
 All 17 tickers were trained/evaluated in isolation with production activation
 disabled. Accepted SHADOW candidates were published for **NCLH, RCL, TSLA and
-UNH**. All 14 production model/metadata files remained byte-identical. Existing
-REAL routing, quantities, threshold overrides, risk limits, and configuration
-were preserved. Changing a REAL model remains an explicit approval step.
+UNH**. All 14 production model/metadata files remained byte-identical during
+that deployment. Following explicit user approval, **TSLA alone was then
+updated in production at 04:42 Saratov on November 13** (19:42 NY on November
+12), with its approved **52% threshold**. The dashboard's loaded production
+model and effective threshold were verified after reload. Existing REAL
+routing, quantities, threshold overrides, risk limits, training counters and
+configuration were preserved; the engine remains stopped.
 
 ## What was actually happening
 
@@ -103,21 +107,38 @@ the same TEST block, so that artifact was retained. SHADOW acceptance alone does
 not qualify NCLH or RCL for REAL. None of these results changed ticker routing.
 All candidates, including rejected ones, were archived with their metadata.
 
-### TSLA candidate awaiting a production decision
+### TSLA production update completed with explicit approval
 
 Evaluation `62cdc83c9d954badbb4d64a984839d55` uses 43 held-out closes.
-The candidate's validation-selected threshold is **52%**, versus the current
-production threshold of **55%**. On that common TEST block:
+The approved model's validation-selected threshold is **52%**, versus the
+previous production threshold of **55%**. On that common TEST block:
 
 - Candidate: balanced accuracy **55.48%**, 17 accepted trades, estimated net
   **+1.526956 R**, profit factor **1.288242**, maximum drawdown **3.571678 R**.
-- Current production filter: balanced accuracy **46.55%**, estimated net
+- Previous production filter: balanced accuracy **46.55%**, estimated net
   **−2.236330 R**.
 
 R is profit/loss divided by initial per-share risk, after the configured cost
 reserve. These are a small historical holdout, not a forecast or a guarantee.
-The candidate is published in SHADOW. Production promotion requires explicit
-confirmation under `live_trading.model_promotion.require_explicit_confirmation`.
+The user explicitly approved this exact candidate and threshold. It was
+promoted through `core/model_promotion.py:282` using the normal eligibility
+checks, with no gate override. Production activation completed at
+`2026-11-13T00:42:41.657832+00:00`; verification completed at
+`2026-11-13T00:43:02.795548+00:00`.
+
+- Loaded model SHA-256:
+  `76576f9f4a7bf8cf6ddcc7c979bb5cede6a43ec5c342efc5f9cecb70e981e341`.
+- Previous model SHA-256:
+  `17b3f8f1d567b758abe29f00d6761caeb0edb66b769f2643229117d8271def26`.
+- Runtime inference uses PRODUCTION at **52%**, without a manual probability
+  override. The six other REAL models and all SHADOW pairs are unchanged.
+- All 17 tickers retained their training counts. Seven REAL ticker selections,
+  trade ledgers, risk limits and the linked exit policy were preserved.
+- The engine remains stopped. A fresh broker check found **0 positions and
+  0 pending orders**; REAL accounting and daily-loss entry holds were inactive.
+- The previous TSLA pair was archived, and an explicit promotion audit event
+  was written. No broker orders were sent or canceled for this maintenance.
+
 UNH remains PAPER; it was not switched to REAL.
 
 ## Verification and retained evidence
@@ -142,6 +163,10 @@ VPS evidence and backups:
 - Incident evidence: `/opt/gala/backups/ai-review-20261113-bz6_8zoh/`.
 - Deployment backup: `/opt/gala/backups/upgrade-3.3.27-gngdyrke/`.
 - Deployment receipt: `data/upgrade_verification_20261113_3327.json`.
+- TSLA promotion receipt: `data/tsla_model_promotion_20261113.json`.
+- TSLA maintenance backup: `/opt/gala/backups/tsla-production-20261113-bihjfg0y/`.
+- Previous production pair:
+  `data/modelos/archive/TSLA/20261113T004241662072Z_d63a7435/`.
 - Full metrics: `data/reportes/metricas_modelos_20261113T002939Z.json` and `.csv`.
 - Persistent candidates: `data/reportes/candidates/<ticker>/<evaluation_id>/`.
 
